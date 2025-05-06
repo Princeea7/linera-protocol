@@ -1,0 +1,5 @@
+git clone https://github.com/linera-io/linera-protocol.git
+cd linera-protocol
+echo "// Sample change for Linera" >> README.md
+git add README.md
+git commit -m "docs: Update README with sample change for Linera"
