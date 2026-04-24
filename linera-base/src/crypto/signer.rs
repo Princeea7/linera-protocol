@@ -1,18 +1,45 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use async_trait::async_trait;
+/*!
+An interface for cryptographic signers that can be used by the Linera client to sign blocks.
+*/
+
+use std::error::Error as StdError;
+
 pub use in_mem::InMemorySigner;
 
 use super::CryptoHash;
-use crate::{
-    crypto::{AccountPublicKey, AccountSignature},
-    identifiers::AccountOwner,
-};
+use crate::{crypto::AccountSignature, identifiers::AccountOwner};
+
+cfg_if::cfg_if! {
+    if #[cfg(web)] {
+        #[doc(hidden)]
+        pub trait TaskSendable {}
+        impl<T> TaskSendable for T {}
+    } else {
+        #[doc(hidden)]
+        pub trait TaskSendable: Send + Sync {}
+        impl<T: Send + Sync> TaskSendable for T {}
+    }
+}
+
+/// Errors that can be returned from signers.
+pub trait Error: StdError + TaskSendable {}
+impl<T: StdError + TaskSendable> Error for T {}
+
+impl StdError for Box<dyn Error + '_> {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        (**self).source()
+    }
+}
 
 /// A trait for signing keys.
-#[async_trait]
-pub trait Signer: Send + Sync {
+#[cfg_attr(not(web), trait_variant::make(Send))]
+pub trait Signer {
+    /// The type of errors arising from operations on this `Signer`.
+    type Error: Error;
+
     /// Creates a signature for the given `value` using the provided `owner`.
     // DEV: We sign `CryptoHash` type, rather than `&[u8]` to make sure we don't sign
     // things accidentally. See [`CryptoHash::new`] for how the type's name is included
@@ -21,38 +48,10 @@ pub trait Signer: Send + Sync {
         &self,
         owner: &AccountOwner,
         value: &CryptoHash,
-    ) -> Result<AccountSignature, Box<dyn std::error::Error>>;
-
-    /// Returns the public key corresponding to the given `owner`.
-    async fn get_public_key(
-        &self,
-        owner: &AccountOwner,
-    ) -> Result<AccountPublicKey, Box<dyn std::error::Error>>;
+    ) -> Result<AccountSignature, Self::Error>;
 
     /// Returns whether the given `owner` is a known signer.
-    async fn contains_key(&self, owner: &AccountOwner) -> Result<bool, Box<dyn std::error::Error>>;
-}
-
-#[async_trait]
-impl Signer for Box<dyn Signer> {
-    async fn sign(
-        &self,
-        owner: &AccountOwner,
-        value: &CryptoHash,
-    ) -> Result<AccountSignature, Box<dyn std::error::Error>> {
-        (**self).sign(owner, value).await
-    }
-
-    async fn get_public_key(
-        &self,
-        owner: &AccountOwner,
-    ) -> Result<AccountPublicKey, Box<dyn std::error::Error>> {
-        (**self).get_public_key(owner).await
-    }
-
-    async fn contains_key(&self, owner: &AccountOwner) -> Result<bool, Box<dyn std::error::Error>> {
-        (**self).contains_key(owner).await
-    }
+    async fn contains_key(&self, owner: &AccountOwner) -> Result<bool, Self::Error>;
 }
 
 /// In-memory implementation of the [`Signer`] trait.
@@ -62,19 +61,31 @@ mod in_mem {
         sync::{Arc, RwLock},
     };
 
-    use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
 
     #[cfg(with_getrandom)]
-    use crate::crypto::CryptoRng;
+    use crate::crypto::{AccountPublicKey, CryptoRng};
     use crate::{
-        crypto::{AccountPublicKey, AccountSecretKey, AccountSignature, CryptoHash, Signer},
+        crypto::{AccountSecretKey, AccountSignature, CryptoHash, Signer},
         identifiers::AccountOwner,
     };
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum Error {
+        #[error("no key found for the given owner")]
+        NoSuchOwner,
+    }
 
     /// In-memory signer.
     #[derive(Clone)]
     pub struct InMemorySigner(Arc<RwLock<InMemSignerInner>>);
+
+    #[cfg(not(with_getrandom))]
+    impl Default for InMemorySigner {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 
     impl InMemorySigner {
         /// Creates a new [`InMemorySigner`] seeded with `prng_seed`.
@@ -113,6 +124,13 @@ mod in_mem {
             let inner = self.0.read().unwrap();
             inner.keys()
         }
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct Inner {
+        keys: Vec<(AccountOwner, String)>,
+        #[cfg(with_getrandom)]
+        prng_seed: Option<u64>,
     }
 
     /// In-memory signer.
@@ -164,51 +182,34 @@ mod in_mem {
             self.keys
                 .iter()
                 .map(|(owner, secret)| {
-                    (
-                        *owner,
-                        serde_json::to_vec(secret).expect("serialization should not fail"),
-                    )
+                    let bytes = serde_json::to_vec(secret).expect("serialization should not fail");
+                    (*owner, bytes)
                 })
                 .collect()
         }
     }
 
-    #[async_trait]
     impl Signer for InMemorySigner {
+        type Error = Error;
+
         /// Creates a signature for the given `value` using the provided `owner`.
         async fn sign(
             &self,
             owner: &AccountOwner,
             value: &CryptoHash,
-        ) -> Result<AccountSignature, Box<dyn std::error::Error>> {
+        ) -> Result<AccountSignature, Error> {
             let inner = self.0.read().unwrap();
             if let Some(secret) = inner.keys.get(owner) {
                 let signature = secret.sign_prehash(*value);
                 Ok(signature)
             } else {
-                Err("No key found for the given owner".into())
-            }
-        }
-
-        /// Returns the public key corresponding to the given `owner`.
-        async fn get_public_key(
-            &self,
-            owner: &AccountOwner,
-        ) -> Result<AccountPublicKey, Box<dyn std::error::Error>> {
-            let inner = self.0.read().unwrap();
-            match inner.keys.get(owner).map(|s| s.public()) {
-                Some(public) => Ok(public),
-                None => Err("No key found for the given owner".into()),
+                Err(Error::NoSuchOwner)
             }
         }
 
         /// Returns whether the given `owner` is a known signer.
-        async fn contains_key(
-            &self,
-            owner: &AccountOwner,
-        ) -> Result<bool, Box<dyn std::error::Error>> {
-            let inner = self.0.read().unwrap();
-            Ok(inner.keys.contains_key(owner))
+        async fn contains_key(&self, owner: &AccountOwner) -> Result<bool, Error> {
+            Ok(self.0.read().unwrap().keys.contains_key(owner))
         }
     }
 
@@ -260,18 +261,17 @@ mod in_mem {
         where
             S: serde::Serializer,
         {
-            #[derive(Serialize, Debug)]
-            struct Inner<'a> {
-                keys: &'a Vec<(AccountOwner, Vec<u8>)>,
-                #[cfg(with_getrandom)]
-                prng_seed: Option<u64>,
-            }
-
             #[cfg(with_getrandom)]
             let prng_seed = self.rng_state.testing_seed;
 
+            let keys_as_strings = self
+                .keys()
+                .into_iter()
+                .map(|(owner, bytes)| (owner, hex::encode(bytes)))
+                .collect::<Vec<_>>();
+
             let inner = Inner {
-                keys: &self.keys(),
+                keys: keys_as_strings,
                 #[cfg(with_getrandom)]
                 prng_seed,
             };
@@ -285,21 +285,16 @@ mod in_mem {
         where
             D: serde::Deserializer<'de>,
         {
-            #[derive(Deserialize)]
-            struct Inner {
-                keys: Vec<(AccountOwner, Vec<u8>)>,
-                #[cfg(with_getrandom)]
-                prng_seed: Option<u64>,
-            }
-
             let inner = Inner::deserialize(deserializer)?;
 
             let keys = inner
                 .keys
                 .into_iter()
-                .map(|(owner, secret)| {
+                .map(|(owner, secret_hex)| {
+                    let secret_bytes =
+                        hex::decode(&secret_hex).map_err(serde::de::Error::custom)?;
                     let secret =
-                        serde_json::from_slice(&secret).map_err(serde::de::Error::custom)?;
+                        serde_json::from_slice(&secret_bytes).map_err(serde::de::Error::custom)?;
                     Ok((owner, secret))
                 })
                 .collect::<Result<BTreeMap<_, _>, _>>()?;

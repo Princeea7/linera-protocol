@@ -18,16 +18,15 @@ async fn new_view_and_context() -> (
     let description = dummy_chain_description(5);
     let context = OperationContext {
         chain_id: ChainId::from(&description),
-        authenticated_signer: None,
-        authenticated_caller_id: None,
+        authenticated_owner: None,
         height: BlockHeight::from(7),
         round: Some(0),
         timestamp: Default::default(),
     };
     let state = SystemExecutionState {
         description: Some(description),
-        epoch: Some(Epoch(1)),
-        admin_id: Some(dummy_chain_description(0).id()),
+        epoch: Epoch(1),
+        admin_chain_id: Some(dummy_chain_description(0).id()),
         committees: BTreeMap::new(),
         ..SystemExecutionState::default()
     };
@@ -74,14 +73,10 @@ async fn application_message_index() -> anyhow::Result<()> {
         .extra()
         .add_blobs([contract_blob, service_blob])
         .await?;
+    let mut controller = ResourceController::default();
     let new_application = view
         .system
-        .execute_operation(
-            context,
-            operation,
-            &mut txn_tracker,
-            &mut ResourceController::default(),
-        )
+        .execute_operation(context, operation, &mut txn_tracker, &mut controller)
         .await?;
     let id = expected_application_id(&context, &module_id, vec![], vec![], 0);
     assert_eq!(new_application, Some((id, vec![])));
@@ -101,14 +96,10 @@ async fn open_chain_message_index() {
     };
     let mut txn_tracker = TransactionTracker::default();
     let operation = SystemOperation::OpenChain(config.clone());
+    let mut controller = ResourceController::default();
     let new_application = view
         .system
-        .execute_operation(
-            context,
-            operation,
-            &mut txn_tracker,
-            &mut ResourceController::default(),
-        )
+        .execute_operation(context, operation, &mut txn_tracker, &mut controller)
         .await
         .unwrap();
     assert_eq!(new_application, None);

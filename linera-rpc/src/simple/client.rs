@@ -2,13 +2,11 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::future::Future;
-
 use futures::{sink::SinkExt, stream::StreamExt};
 use linera_base::{
     crypto::CryptoHash,
-    data_types::BlobContent,
-    identifiers::{BlobId, ChainId},
+    data_types::{BlobContent, BlockHeight, NetworkDescription},
+    identifiers::{BlobId, ChainId, EventId},
     time::{timer, Duration},
 };
 use linera_chain::{
@@ -21,7 +19,6 @@ use linera_core::{
     data_types::{ChainInfoQuery, ChainInfoResponse},
     node::{CrossChainMessageDelivery, NodeError, NotificationStream, ValidatorNode},
 };
-use linera_storage::NetworkDescription;
 use linera_version::VersionInfo;
 
 use super::{codec, transport::TransportProtocol};
@@ -77,6 +74,13 @@ impl SimpleClient {
 
 impl ValidatorNode for SimpleClient {
     type NotificationStream = NotificationStream;
+
+    fn address(&self) -> String {
+        format!(
+            "{}://{}:{}",
+            self.network.protocol, self.network.host, self.network.port
+        )
+    }
 
     /// Initiates a new block.
     async fn handle_block_proposal(
@@ -145,12 +149,35 @@ impl ValidatorNode for SimpleClient {
         self.query(request).await
     }
 
-    fn subscribe(
-        &self,
-        _chains: Vec<ChainId>,
-    ) -> impl Future<Output = Result<NotificationStream, NodeError>> + Send {
-        let transport = self.network.protocol.to_string();
-        async { Err(NodeError::SubscriptionError { transport }) }
+    async fn subscribe(&self, chains: Vec<ChainId>) -> Result<NotificationStream, NodeError> {
+        let mut stream = self
+            .network
+            .protocol
+            .connect((self.network.host.clone(), self.network.port))
+            .await
+            .map_err(|e| NodeError::ClientIoError {
+                error: e.to_string(),
+            })?;
+        // Send subscription request
+        timer::timeout(
+            self.send_timeout,
+            stream.send(RpcMessage::SubscribeNotifications(chains)),
+        )
+        .await
+        .map_err(|timeout| NodeError::ClientIoError {
+            error: timeout.to_string(),
+        })?
+        .map_err(|e| NodeError::ClientIoError {
+            error: e.to_string(),
+        })?;
+        // Return a stream that reads notifications from the connection
+        let notification_stream = stream.filter_map(|result| async {
+            match result {
+                Ok(RpcMessage::Notification(notification)) => Some(*notification),
+                _ => None,
+            }
+        });
+        Ok(Box::pin(notification_stream) as NotificationStream)
     }
 
     async fn get_version_info(&self) -> Result<VersionInfo, NodeError> {
@@ -223,12 +250,60 @@ impl ValidatorNode for SimpleClient {
         }
     }
 
+    async fn download_certificates_by_heights(
+        &self,
+        chain_id: ChainId,
+        heights: Vec<BlockHeight>,
+    ) -> Result<Vec<ConfirmedBlockCertificate>, NodeError> {
+        let expected_count = heights.len();
+        let certificates: Vec<ConfirmedBlockCertificate> = self
+            .query(RpcMessage::DownloadCertificatesByHeights(
+                chain_id,
+                heights.clone(),
+            ))
+            .await?;
+
+        if certificates.len() < expected_count {
+            return Err(NodeError::MissingCertificatesByHeights { chain_id, heights });
+        }
+        Ok(certificates)
+    }
+
     async fn blob_last_used_by(&self, blob_id: BlobId) -> Result<CryptoHash, NodeError> {
         self.query(RpcMessage::BlobLastUsedBy(Box::new(blob_id)))
             .await
     }
 
+    async fn blob_last_used_by_certificate(
+        &self,
+        blob_id: BlobId,
+    ) -> Result<ConfirmedBlockCertificate, NodeError> {
+        self.query::<ConfirmedBlockCertificate>(RpcMessage::BlobLastUsedByCertificate(Box::new(
+            blob_id,
+        )))
+        .await
+    }
+
     async fn missing_blob_ids(&self, blob_ids: Vec<BlobId>) -> Result<Vec<BlobId>, NodeError> {
         self.query(RpcMessage::MissingBlobIds(blob_ids)).await
+    }
+
+    async fn event_block_heights(
+        &self,
+        event_ids: Vec<EventId>,
+    ) -> Result<Vec<Option<BlockHeight>>, NodeError> {
+        self.query(RpcMessage::EventBlockHeights(event_ids)).await
+    }
+
+    async fn get_shard_info(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<linera_core::data_types::ShardInfo, NodeError> {
+        let rpc_shard_info: crate::message::ShardInfo =
+            self.query(RpcMessage::ShardInfoQuery(chain_id)).await?;
+        Ok(linera_core::data_types::ShardInfo {
+            shard_id: rpc_shard_info.shard_id,
+            total_shards: rpc_shard_info.total_shards,
+        })
     }
 }

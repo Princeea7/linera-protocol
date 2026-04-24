@@ -72,7 +72,7 @@ impl<'input> WitExportGenerator<'input> {
     }
 
     /// Consumes the collected pieces to generate the final code.
-    pub fn generate(mut self) -> TokenStream {
+    pub fn generate(self) -> TokenStream {
         let implementation = self.implementation;
         let wasmer = self.generate_for_wasmer();
         let wasmtime = self.generate_for_wasmtime();
@@ -89,7 +89,7 @@ impl<'input> WitExportGenerator<'input> {
     }
 
     /// Generates the code to export functions using the Wasmer runtime.
-    fn generate_for_wasmer(&mut self) -> Option<TokenStream> {
+    fn generate_for_wasmer(&self) -> TokenStream {
         #[cfg(with_wasmer)]
         {
             let user_data_type = self.user_data_type();
@@ -104,16 +104,16 @@ impl<'input> WitExportGenerator<'input> {
                 function.generate_for_wasmer(&self.namespace, self.type_name, &target_caller_type)
             });
 
-            Some(self.generate_for(export_target, &target_caller_type, exported_functions))
+            self.generate_for(&export_target, &target_caller_type, exported_functions)
         }
         #[cfg(not(with_wasmer))]
         {
-            None
+            TokenStream::new()
         }
     }
 
     /// Generates the code to export functions using the Wasmtime runtime.
-    fn generate_for_wasmtime(&mut self) -> Option<TokenStream> {
+    fn generate_for_wasmtime(&self) -> TokenStream {
         #[cfg(with_wasmtime)]
         {
             let user_data_type = self.user_data_type();
@@ -124,16 +124,16 @@ impl<'input> WitExportGenerator<'input> {
                 function.generate_for_wasmtime(&self.namespace, self.type_name, &target_caller_type)
             });
 
-            Some(self.generate_for(export_target, &target_caller_type, exported_functions))
+            self.generate_for(&export_target, &target_caller_type, exported_functions)
         }
         #[cfg(not(with_wasmtime))]
         {
-            None
+            TokenStream::new()
         }
     }
 
     /// Generates the code to export functions to a mock instance for testing.
-    fn generate_for_mock_instance(&mut self) -> Option<TokenStream> {
+    fn generate_for_mock_instance(&self) -> TokenStream {
         #[cfg(with_testing)]
         {
             let user_data_type = self.user_data_type();
@@ -148,11 +148,11 @@ impl<'input> WitExportGenerator<'input> {
                 )
             });
 
-            Some(self.generate_for(export_target, &target_caller_type, exported_functions))
+            self.generate_for(&export_target, &target_caller_type, exported_functions)
         }
         #[cfg(not(with_testing))]
         {
-            None
+            TokenStream::new()
         }
     }
 
@@ -160,7 +160,7 @@ impl<'input> WitExportGenerator<'input> {
     /// `exported_functions`.
     fn generate_for(
         &self,
-        export_target: TokenStream,
+        export_target: &TokenStream,
         target_caller_type: &Type,
         exported_functions: impl Iterator<Item = TokenStream>,
     ) -> TokenStream {
@@ -222,10 +222,11 @@ impl<'input> WitExportGenerator<'input> {
     fn generate_wit_interface(&self) -> TokenStream {
         let self_type = &self.implementation.self_ty;
         let type_name = self.type_name;
+        let wit_interface_name = self.parameters.interface_name(type_name);
 
         let wit_interface_implementation = wit_interface::generate(
             self.parameters.package_name(),
-            self.parameters.interface_name(type_name),
+            &wit_interface_name,
             &self.functions,
         );
 

@@ -1,11 +1,13 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use async_trait::async_trait;
+use std::sync::Arc;
+
+use futures::lock::Mutex;
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{BlobContent, Timestamp},
-    identifiers::{AccountOwner, BlobId, ChainId},
+    data_types::{BlobContent, BlockHeight, Epoch, NetworkDescription, Timestamp},
+    identifiers::{AccountOwner, BlobId, ChainId, EventId},
 };
 use linera_chain::{
     data_types::BlockProposal,
@@ -16,7 +18,6 @@ use linera_chain::{
 };
 use linera_client::{
     chain_listener::{ChainListenerConfig, ClientContext},
-    wallet::Wallet,
     Error,
 };
 use linera_core::{
@@ -30,15 +31,19 @@ use linera_core::{
 use linera_execution::committee::Committee;
 use linera_sdk::linera_base_types::ValidatorPublicKey;
 use linera_service::node_service::NodeService;
-use linera_storage::{DbStorage, NetworkDescription, Storage};
+use linera_storage::DbStorage;
 use linera_version::VersionInfo;
-use linera_views::memory::MemoryStore;
+use linera_views::memory::MemoryDatabase;
 
 #[derive(Clone)]
 struct DummyValidatorNode;
 
 impl ValidatorNode for DummyValidatorNode {
     type NotificationStream = NotificationStream;
+
+    fn address(&self) -> String {
+        "dummy".to_string()
+    }
 
     async fn handle_block_proposal(
         &self,
@@ -130,11 +135,40 @@ impl ValidatorNode for DummyValidatorNode {
         Err(NodeError::UnexpectedMessage)
     }
 
+    async fn download_certificates_by_heights(
+        &self,
+        _: ChainId,
+        _: Vec<BlockHeight>,
+    ) -> Result<Vec<ConfirmedBlockCertificate>, NodeError> {
+        Err(NodeError::UnexpectedMessage)
+    }
+
     async fn blob_last_used_by(&self, _: BlobId) -> Result<CryptoHash, NodeError> {
         Err(NodeError::UnexpectedMessage)
     }
 
+    async fn blob_last_used_by_certificate(
+        &self,
+        _blob_id: BlobId,
+    ) -> Result<ConfirmedBlockCertificate, NodeError> {
+        Err(NodeError::UnexpectedMessage)
+    }
+
     async fn missing_blob_ids(&self, _: Vec<BlobId>) -> Result<Vec<BlobId>, NodeError> {
+        Err(NodeError::UnexpectedMessage)
+    }
+
+    async fn event_block_heights(
+        &self,
+        _: Vec<EventId>,
+    ) -> Result<Vec<Option<BlockHeight>>, NodeError> {
+        Err(NodeError::UnexpectedMessage)
+    }
+
+    async fn get_shard_info(
+        &self,
+        _: ChainId,
+    ) -> Result<linera_core::data_types::ShardInfo, NodeError> {
         Err(NodeError::UnexpectedMessage)
     }
 }
@@ -164,30 +198,32 @@ impl ValidatorNodeProvider for DummyValidatorNodeProvider {
 )]
 struct Options {}
 
-struct DummyContext<P, S> {
-    _phantom: std::marker::PhantomData<(P, S)>,
-}
+struct DummyContext;
 
-#[async_trait]
-impl<P: ValidatorNodeProvider + Send, S: Storage + Clone + Send + Sync + 'static> ClientContext
-    for DummyContext<P, S>
-{
-    type Environment = linera_core::environment::Impl<S, P>;
+impl ClientContext for DummyContext {
+    type Environment = linera_core::environment::Impl<
+        DbStorage<MemoryDatabase>,
+        DummyValidatorNodeProvider,
+        linera_base::crypto::InMemorySigner,
+        linera_core::wallet::Memory,
+    >;
 
-    fn wallet(&self) -> &Wallet {
+    fn wallet(&self) -> &linera_core::wallet::Memory {
         unimplemented!()
     }
 
-    fn storage(&self) -> &S {
+    fn storage(&self) -> &DbStorage<MemoryDatabase> {
         unimplemented!()
     }
 
-    fn client(&self) -> &linera_core::client::Client<Self::Environment> {
+    fn client(&self) -> &Arc<linera_core::client::Client<Self::Environment>> {
         unimplemented!()
     }
 
-    async fn make_chain_client(&self, _: ChainId) -> Result<ChainClient<Self::Environment>, Error> {
-        unimplemented!()
+    fn timing_sender(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<(u64, linera_core::client::TimingType)>> {
+        None
     }
 
     async fn update_wallet_for_new_chain(
@@ -195,6 +231,7 @@ impl<P: ValidatorNodeProvider + Send, S: Storage + Clone + Send + Sync + 'static
         _: ChainId,
         _: Option<AccountOwner>,
         _: Timestamp,
+        _: Epoch,
     ) -> Result<(), Error> {
         Ok(())
     }
@@ -202,27 +239,25 @@ impl<P: ValidatorNodeProvider + Send, S: Storage + Clone + Send + Sync + 'static
     async fn update_wallet(&mut self, _: &ChainClient<Self::Environment>) -> Result<(), Error> {
         Ok(())
     }
-
-    async fn clients(&self) -> Result<Vec<ChainClient<Self::Environment>>, Error> {
-        Ok(vec![])
-    }
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let _options = <Options as clap::Parser>::parse();
-
-    let config = ChainListenerConfig::default();
-    let context = DummyContext::<DummyValidatorNodeProvider, DbStorage<MemoryStore>> {
-        _phantom: std::marker::PhantomData,
-    };
     let service = NodeService::new(
-        config,
+        ChainListenerConfig::default(),
         std::num::NonZeroU16::new(8080).unwrap(),
+        #[cfg(with_metrics)]
+        std::num::NonZeroU16::new(8081).unwrap(),
         None,
-        context,
-    )
-    .await;
+        Arc::new(Mutex::new(DummyContext)),
+        false, // read-only mode disabled for schema export
+        None,  // no query cache for schema export
+        None,
+        tokio_util::sync::CancellationToken::new(),
+        false, // memory profiling disabled for schema export
+        false, // not paused
+    );
     let schema = service.schema().sdl();
     print!("{}", schema);
     Ok(())

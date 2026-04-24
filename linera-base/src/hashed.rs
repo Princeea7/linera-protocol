@@ -6,13 +6,14 @@
 
 use std::borrow::Cow;
 
+use allocative::Allocative;
 use custom_debug_derive::Debug;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{BcsHashable, CryptoHash};
 
 /// Wrapper type around hashed instance of `T` type.
-#[derive(Debug)]
+#[derive(Debug, Allocative)]
 pub struct Hashed<T> {
     value: T,
     /// Hash of the value (used as key for storage).
@@ -20,19 +21,7 @@ pub struct Hashed<T> {
 }
 
 impl<T> Hashed<T> {
-    /// Creates an instance of [`Hashed`] with the given `hash` value.
-    ///
-    /// Note on usage: This method is unsafe because it allows the caller to create a Hashed
-    /// with a hash that doesn't match the value. This is necessary for the rewrite state when
-    /// signers sign over old `Certificate` type.
-    pub fn unchecked_new(value: T, hash: CryptoHash) -> Self {
-        Self { value, hash }
-    }
-
     /// Creates an instance of [`Hashed`] with the given `value`.
-    ///
-    /// Note: Contrary to its `unchecked_new` counterpart, this method is safe because it
-    /// calculates the hash from the value.
     pub fn new<'de>(value: T) -> Self
     where
         T: BcsHashable<'de>,

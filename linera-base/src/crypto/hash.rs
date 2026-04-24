@@ -8,6 +8,7 @@
 use std::ops::RangeInclusive;
 use std::{borrow::Cow, fmt, io, str::FromStr};
 
+use allocative::{Allocative, Visitor};
 #[cfg(with_testing)]
 use alloy_primitives::FixedBytes;
 use alloy_primitives::{Keccak256, B256};
@@ -30,8 +31,19 @@ use crate::{
 
 /// A Keccak256 value.
 #[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Copy, Hash)]
+#[cfg_attr(
+    web,
+    derive(tsify::Tsify),
+    tsify(from_wasm_abi, into_wasm_abi, type = "string")
+)]
 #[cfg_attr(with_testing, derive(Default))]
 pub struct CryptoHash(B256);
+
+impl Allocative for CryptoHash {
+    fn visit<'a, 'b: 'a>(&self, visitor: &'a mut Visitor<'b>) {
+        visitor.visit_simple_sized::<Self>();
+    }
+}
 
 impl CryptoHash {
     /// Computes a hash.
@@ -135,6 +147,18 @@ impl TryFrom<&[u8]> for CryptoHash {
     }
 }
 
+impl From<CryptoHash> for [u8; 32] {
+    fn from(crypto_hash: CryptoHash) -> Self {
+        crypto_hash.0 .0
+    }
+}
+
+impl From<[u8; 32]> for CryptoHash {
+    fn from(bytes: [u8; 32]) -> Self {
+        CryptoHash(B256::from(bytes))
+    }
+}
+
 impl From<[u64; 4]> for CryptoHash {
     fn from(integers: [u64; 4]) -> Self {
         CryptoHash(crate::crypto::u64_array_to_be_bytes(integers).into())
@@ -156,7 +180,7 @@ impl fmt::Display for CryptoHash {
 
 impl fmt::Debug for CryptoHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(&self.0[..8]))
+        write!(f, "{}", hex::encode(self.0))
     }
 }
 

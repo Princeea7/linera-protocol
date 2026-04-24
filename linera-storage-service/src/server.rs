@@ -7,13 +7,16 @@ use async_lock::RwLock;
 use linera_storage_service::common::{KeyPrefix, MAX_PAYLOAD_SIZE};
 use linera_views::{
     batch::Batch,
-    memory::MemoryStore,
-    store::{CommonStoreConfig, ReadableKeyValueStore, WritableKeyValueStore},
+    memory::{MemoryDatabase, MemoryStoreConfig},
+    store::{KeyValueDatabase, ReadableKeyValueStore, WritableKeyValueStore},
 };
 #[cfg(with_rocksdb)]
 use linera_views::{
-    rocks_db::{PathWithGuard, RocksDbSpawnMode, RocksDbStore, RocksDbStoreConfig},
-    store::AdminKeyValueStore as _,
+    lru_prefix_cache::StorageCacheConfig,
+    rocks_db::{
+        PathWithGuard, RocksDbDatabase, RocksDbSpawnMode, RocksDbStoreConfig,
+        RocksDbStoreInternalConfig,
+    },
 };
 use serde::Serialize;
 use tonic::{transport::Server, Request, Response, Status};
@@ -22,7 +25,7 @@ use tracing_subscriber::fmt::format::FmtSpan;
 
 use crate::key_value_store::{
     statement::Operation,
-    store_processor_server::{StoreProcessor, StoreProcessorServer},
+    storage_service_server::{StorageService, StorageServiceServer},
     KeyValue, OptValue, ReplyContainsKey, ReplyContainsKeys, ReplyExistsNamespace,
     ReplyFindKeyValuesByPrefix, ReplyFindKeysByPrefix, ReplyListAll, ReplyListRootKeys,
     ReplyReadMultiValues, ReplyReadValue, ReplySpecificChunk, RequestContainsKey,
@@ -35,11 +38,11 @@ pub mod key_value_store {
     tonic::include_proto!("key_value_store.v1");
 }
 
-enum ServiceStoreServerInternal {
-    Memory(MemoryStore),
+enum LocalStore {
+    Memory(<MemoryDatabase as KeyValueDatabase>::Store),
     /// The RocksDB key value store
     #[cfg(with_rocksdb)]
-    RocksDb(RocksDbStore),
+    RocksDb(<RocksDbDatabase as KeyValueDatabase>::Store),
 }
 
 #[derive(Default)]
@@ -54,21 +57,21 @@ struct PendingBigReads {
     big_reads: BTreeMap<i64, BigRead>,
 }
 
-struct ServiceStoreServer {
-    store: ServiceStoreServerInternal,
+struct StorageServer {
+    store: LocalStore,
     pending_big_puts: Arc<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>,
     pending_big_reads: Arc<RwLock<PendingBigReads>>,
 }
 
-impl ServiceStoreServer {
+impl StorageServer {
     pub async fn read_value_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Status> {
         match &self.store {
-            ServiceStoreServerInternal::Memory(store) => store
+            LocalStore::Memory(store) => store
                 .read_value_bytes(key)
                 .await
                 .map_err(|e| Status::unknown(format!("Memory error {:?} at read_value_bytes", e))),
             #[cfg(with_rocksdb)]
-            ServiceStoreServerInternal::RocksDb(store) => store
+            LocalStore::RocksDb(store) => store
                 .read_value_bytes(key)
                 .await
                 .map_err(|e| Status::unknown(format!("RocksDB error {:?} at read_value_bytes", e))),
@@ -77,26 +80,26 @@ impl ServiceStoreServer {
 
     pub async fn contains_key(&self, key: &[u8]) -> Result<bool, Status> {
         match &self.store {
-            ServiceStoreServerInternal::Memory(store) => store
+            LocalStore::Memory(store) => store
                 .contains_key(key)
                 .await
                 .map_err(|e| Status::unknown(format!("Memory error {:?} at contains_key", e))),
             #[cfg(with_rocksdb)]
-            ServiceStoreServerInternal::RocksDb(store) => store
+            LocalStore::RocksDb(store) => store
                 .contains_key(key)
                 .await
                 .map_err(|e| Status::unknown(format!("RocksDB error {:?} at contains_key", e))),
         }
     }
 
-    pub async fn contains_keys(&self, keys: Vec<Vec<u8>>) -> Result<Vec<bool>, Status> {
+    pub async fn contains_keys(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, Status> {
         match &self.store {
-            ServiceStoreServerInternal::Memory(store) => store
+            LocalStore::Memory(store) => store
                 .contains_keys(keys)
                 .await
                 .map_err(|e| Status::unknown(format!("Memory error {:?} at contains_keys", e))),
             #[cfg(with_rocksdb)]
-            ServiceStoreServerInternal::RocksDb(store) => store
+            LocalStore::RocksDb(store) => store
                 .contains_keys(keys)
                 .await
                 .map_err(|e| Status::unknown(format!("RocksDB error {:?} at contains_keys", e))),
@@ -105,32 +108,26 @@ impl ServiceStoreServer {
 
     pub async fn read_multi_values_bytes(
         &self,
-        keys: Vec<Vec<u8>>,
+        keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, Status> {
         match &self.store {
-            ServiceStoreServerInternal::Memory(store) => {
-                store.read_multi_values_bytes(keys).await.map_err(|e| {
-                    Status::unknown(format!("Memory error {:?} at read_multi_values_bytes", e))
-                })
-            }
+            LocalStore::Memory(store) => store.read_multi_values_bytes(keys).await.map_err(|e| {
+                Status::unknown(format!("Memory error {:?} at read_multi_values_bytes", e))
+            }),
             #[cfg(with_rocksdb)]
-            ServiceStoreServerInternal::RocksDb(store) => {
-                store.read_multi_values_bytes(keys).await.map_err(|e| {
-                    Status::unknown(format!("RocksDB error {:?} at read_multi_values_bytes", e))
-                })
-            }
+            LocalStore::RocksDb(store) => store.read_multi_values_bytes(keys).await.map_err(|e| {
+                Status::unknown(format!("RocksDB error {:?} at read_multi_values_bytes", e))
+            }),
         }
     }
 
     pub async fn find_keys_by_prefix(&self, key_prefix: &[u8]) -> Result<Vec<Vec<u8>>, Status> {
         match &self.store {
-            ServiceStoreServerInternal::Memory(store) => {
-                store.find_keys_by_prefix(key_prefix).await.map_err(|e| {
-                    Status::unknown(format!("Memory error {:?} at find_keys_by_prefix", e))
-                })
-            }
+            LocalStore::Memory(store) => store.find_keys_by_prefix(key_prefix).await.map_err(|e| {
+                Status::unknown(format!("Memory error {:?} at find_keys_by_prefix", e))
+            }),
             #[cfg(with_rocksdb)]
-            ServiceStoreServerInternal::RocksDb(store) => {
+            LocalStore::RocksDb(store) => {
                 store.find_keys_by_prefix(key_prefix).await.map_err(|e| {
                     Status::unknown(format!("RocksDB error {:?} at find_keys_by_prefix", e))
                 })
@@ -143,14 +140,19 @@ impl ServiceStoreServer {
         key_prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Status> {
         match &self.store {
-            ServiceStoreServerInternal::Memory(store) => store
-                .find_key_values_by_prefix(key_prefix)
-                .await
-                .map_err(|e| {
-                    Status::unknown(format!("Memory error {:?} at find_key_values_by_prefix", e))
-                }),
+            LocalStore::Memory(store) => {
+                store
+                    .find_key_values_by_prefix(key_prefix)
+                    .await
+                    .map_err(|e| {
+                        Status::unknown(format!(
+                            "Memory error {:?} at find_key_values_by_prefix",
+                            e
+                        ))
+                    })
+            }
             #[cfg(with_rocksdb)]
-            ServiceStoreServerInternal::RocksDb(store) => store
+            LocalStore::RocksDb(store) => store
                 .find_key_values_by_prefix(key_prefix)
                 .await
                 .map_err(|e| {
@@ -164,12 +166,12 @@ impl ServiceStoreServer {
 
     pub async fn write_batch(&self, batch: Batch) -> Result<(), Status> {
         match &self.store {
-            ServiceStoreServerInternal::Memory(store) => store
+            LocalStore::Memory(store) => store
                 .write_batch(batch)
                 .await
                 .map_err(|e| Status::unknown(format!("Memory error {:?} at write_batch", e))),
             #[cfg(with_rocksdb)]
-            ServiceStoreServerInternal::RocksDb(store) => store
+            LocalStore::RocksDb(store) => store
                 .write_batch(batch)
                 .await
                 .map_err(|e| Status::unknown(format!("RocksDB error {:?} at write_batch", e))),
@@ -184,7 +186,14 @@ impl ServiceStoreServer {
     pub async fn list_root_keys(&self, namespace: &[u8]) -> Result<Vec<Vec<u8>>, Status> {
         let mut full_key = vec![KeyPrefix::RootKey as u8];
         full_key.extend(namespace);
-        self.find_keys_by_prefix(&full_key).await
+        let bcs_root_keys = self.find_keys_by_prefix(&full_key).await?;
+        let mut root_keys = Vec::new();
+        for bcs_root_key in bcs_root_keys {
+            let root_key = bcs::from_bytes::<Vec<u8>>(&bcs_root_key)
+                .map_err(|e| Status::unknown(format!("Bcs error {e:?} at list_root_keys")))?;
+            root_keys.push(root_key);
+        }
+        Ok(root_keys)
     }
 
     pub async fn delete_all(&self) -> Result<(), Status> {
@@ -248,25 +257,64 @@ impl ServiceStoreServer {
     version = linera_version::VersionInfo::default_clap_str(),
     about = "A server providing storage service",
 )]
-enum ServiceStoreServerOptions {
+enum StorageServerOptions {
     #[command(name = "memory")]
     Memory {
-        #[arg(long = "endpoint")]
+        /// The storage namespace.
+        #[arg(long, default_value = "linera_storage_service")]
+        namespace: String,
+        /// The storage service address.
+        #[arg(long)]
         endpoint: String,
+        /// Preferred buffer size for async streams.
+        #[arg(long, default_value = "10")]
+        max_stream_queries: usize,
     },
 
     #[cfg(with_rocksdb)]
     #[command(name = "rocksdb")]
     RocksDb {
-        #[arg(long = "path")]
-        path: String,
-        #[arg(long = "endpoint")]
+        /// The storage namespace.
+        #[arg(long, default_value = "linera_storage_service")]
+        namespace: String,
+        /// The storage service address.
+        #[arg(long)]
         endpoint: String,
+        /// Path to the rocksdb database.
+        #[arg(long)]
+        path: String,
+        /// Preferred buffer size for async streams.
+        #[arg(long, default_value = "10")]
+        max_stream_queries: usize,
+        /// The maximum size of the cache, in bytes (keys size + value sizes)
+        #[arg(long, default_value = "10000000")]
+        max_cache_size: usize,
+        /// The maximum size of a value entry, in bytes
+        #[arg(long, default_value = "1000000")]
+        max_value_entry_size: usize,
+        /// The maximum size of a find-keys entry, in bytes
+        #[arg(long, default_value = "1000000")]
+        max_find_keys_entry_size: usize,
+        /// The maximum size of a find-key-values entry, in bytes
+        #[arg(long, default_value = "1000000")]
+        max_find_key_values_entry_size: usize,
+        /// The maximum number of entries in the cache.
+        #[arg(long, default_value = "1000")]
+        max_cache_entries: usize,
+        /// The maximum value size of the cache, in bytes
+        #[arg(long, default_value = "10000000")]
+        max_cache_value_size: usize,
+        /// The maximum find_keys_by_prefix size of the cache, in bytes
+        #[arg(long, default_value = "10000000")]
+        max_cache_find_keys_size: usize,
+        /// The maximum find_key_values_by_prefix size of the cache, in bytes
+        #[arg(long, default_value = "10000000")]
+        max_cache_find_key_values_size: usize,
     },
 }
 
 #[tonic::async_trait]
-impl StoreProcessor for ServiceStoreServer {
+impl StorageService for StorageServer {
     #[instrument(target = "store_server", skip_all, err, fields(key_len = ?request.get_ref().key.len()))]
     async fn process_read_value(
         &self,
@@ -315,7 +363,7 @@ impl StoreProcessor for ServiceStoreServer {
     ) -> Result<Response<ReplyContainsKeys>, Status> {
         let request = request.into_inner();
         let RequestContainsKeys { keys } = request;
-        let tests = self.contains_keys(keys).await?;
+        let tests = self.contains_keys(&keys).await?;
         let response = ReplyContainsKeys { tests };
         Ok(Response::new(response))
     }
@@ -327,7 +375,7 @@ impl StoreProcessor for ServiceStoreServer {
     ) -> Result<Response<ReplyReadMultiValues>, Status> {
         let request = request.into_inner();
         let RequestReadMultiValues { keys } = request;
-        let values = self.read_multi_values_bytes(keys.clone()).await?;
+        let values = self.read_multi_values_bytes(&keys).await?;
         let size = values
             .iter()
             .map(|x| match x {
@@ -595,32 +643,73 @@ async fn main() {
         .with_env_filter(env_filter)
         .init();
 
-    let options = <ServiceStoreServerOptions as clap::Parser>::parse();
-    let common_config = CommonStoreConfig::default();
-    let namespace = "linera_storage_service";
+    let options = <StorageServerOptions as clap::Parser>::parse();
     let (store, endpoint) = match options {
-        ServiceStoreServerOptions::Memory { endpoint } => {
-            let store = MemoryStore::new(common_config.max_stream_queries, namespace).unwrap();
-            let store = ServiceStoreServerInternal::Memory(store);
+        StorageServerOptions::Memory {
+            namespace,
+            endpoint,
+            max_stream_queries,
+        } => {
+            let config = MemoryStoreConfig {
+                max_stream_queries,
+                kill_on_drop: false,
+            };
+            let database = MemoryDatabase::maybe_create_and_connect(&config, &namespace)
+                .await
+                .unwrap();
+            let store = database.open_shared(&[]).unwrap();
+            let store = LocalStore::Memory(store);
             (store, endpoint)
         }
+
         #[cfg(with_rocksdb)]
-        ServiceStoreServerOptions::RocksDb { path, endpoint } => {
+        StorageServerOptions::RocksDb {
+            namespace,
+            endpoint,
+            path,
+            max_stream_queries,
+            max_cache_size,
+            max_value_entry_size,
+            max_find_keys_entry_size,
+            max_find_key_values_entry_size,
+            max_cache_entries,
+            max_cache_value_size,
+            max_cache_find_keys_size,
+            max_cache_find_key_values_size,
+        } => {
             let path_buf = path.into();
             let path_with_guard = PathWithGuard::new(path_buf);
-            // The server is run in multi-threaded mode so we can use the block_in_place.
             let spawn_mode = RocksDbSpawnMode::get_spawn_mode_from_runtime();
-            let config = RocksDbStoreConfig::new(spawn_mode, path_with_guard, common_config);
-            let store = RocksDbStore::maybe_create_and_connect(&config, namespace)
+            let inner_config = RocksDbStoreInternalConfig {
+                spawn_mode,
+                path_with_guard,
+                max_stream_queries,
+            };
+            let storage_cache_config = StorageCacheConfig {
+                max_cache_size,
+                max_value_entry_size,
+                max_find_keys_entry_size,
+                max_find_key_values_entry_size,
+                max_cache_entries,
+                max_cache_value_size,
+                max_cache_find_keys_size,
+                max_cache_find_key_values_size,
+            };
+            let config = RocksDbStoreConfig {
+                inner_config,
+                storage_cache_config,
+            };
+            let database = RocksDbDatabase::maybe_create_and_connect(&config, &namespace)
                 .await
                 .expect("store");
-            let store = ServiceStoreServerInternal::RocksDb(store);
+            let store = database.open_shared(&[]).expect("Failed to open store");
+            let store = LocalStore::RocksDb(store);
             (store, endpoint)
         }
     };
     let pending_big_puts = Arc::new(RwLock::new(BTreeMap::default()));
     let pending_big_reads = Arc::new(RwLock::new(PendingBigReads::default()));
-    let store = ServiceStoreServer {
+    let store = StorageServer {
         store,
         pending_big_puts,
         pending_big_reads,
@@ -628,7 +717,7 @@ async fn main() {
     let endpoint = endpoint.parse().unwrap();
     info!("Starting linera_storage_service on endpoint={}", endpoint);
     Server::builder()
-        .add_service(StoreProcessorServer::new(store))
+        .add_service(StorageServiceServer::new(store))
         .serve(endpoint)
         .await
         .expect("a successful running of the server");

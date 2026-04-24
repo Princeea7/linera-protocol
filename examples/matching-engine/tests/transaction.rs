@@ -76,10 +76,7 @@ async fn single_transaction() {
     let mut matching_chain = validator.new_chain().await;
     let admin_account = AccountOwner::from(matching_chain.public_key());
 
-    let fungible_module_id_a = user_chain_a
-        .publish_bytecode_files_in::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>("../fungible")
-        .await;
-    let fungible_module_id_b = user_chain_b
+    let fungible_module_id = user_chain_a
         .publish_bytecode_files_in::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>("../fungible")
         .await;
 
@@ -88,7 +85,7 @@ async fn single_transaction() {
     let params_a = fungible::Parameters::new("A");
     let token_id_a = user_chain_a
         .create_application(
-            fungible_module_id_a,
+            fungible_module_id,
             params_a,
             initial_state_a.build(),
             vec![],
@@ -99,7 +96,7 @@ async fn single_transaction() {
     let params_b = fungible::Parameters::new("B");
     let token_id_b = user_chain_b
         .create_application(
-            fungible_module_id_b,
+            fungible_module_id,
             params_b,
             initial_state_b.build(),
             vec![],
@@ -112,7 +109,7 @@ async fn single_transaction() {
         (owner_a, Some(Amount::from_tokens(10))),
         (owner_b, None),
     ] {
-        let value = fungible::query_account(token_id_a, &user_chain_a, owner).await;
+        let value = user_chain_a.query_account(token_id_a, owner).await;
         assert_eq!(value, amount);
     }
     for (owner, amount) in [
@@ -120,13 +117,15 @@ async fn single_transaction() {
         (owner_a, None),
         (owner_b, Some(Amount::from_tokens(9))),
     ] {
-        let value = fungible::query_account(token_id_b, &user_chain_b, owner).await;
+        let value = user_chain_b.query_account(token_id_b, owner).await;
         assert_eq!(value, amount);
     }
 
     // Creating the matching engine chain
-    let tokens = [token_id_a, token_id_b];
-    let matching_parameter = Parameters { tokens };
+    let matching_parameter = Parameters {
+        tokens: [token_id_a, token_id_b],
+        price_decimals: 2,
+    };
     let matching_id = matching_chain
         .create_application(
             module_id,
@@ -138,18 +137,18 @@ async fn single_transaction() {
 
     // Creating the bid orders
     let mut bid_certificates = Vec::new();
-    for price in [1, 2] {
+    for price in [100, 200] {
         let price = Price { price };
         let order = Order::Insert {
             owner: owner_a,
-            amount: Amount::from_tokens(3),
+            quantity: Amount::from_tokens(3),
             nature: OrderNature::Bid,
             price,
         };
         let operation = Operation::ExecuteOrder { order };
-        let bid_certificate = user_chain_a
+        let (bid_certificate, _) = user_chain_a
             .add_block(|block| {
-                block.with_operation(matching_id, operation);
+                block.with_operation(matching_id, &operation);
             })
             .await;
 
@@ -175,33 +174,27 @@ async fn single_transaction() {
         (owner_a, Some(Amount::ONE)),
         (owner_b, None),
     ] {
-        let value = fungible::query_account(token_id_a, &user_chain_a, owner).await;
+        let value = user_chain_a.query_account(token_id_a, owner).await;
         assert_eq!(value, amount);
     }
     for owner in [admin_account, owner_a, owner_b] {
-        assert_eq!(
-            fungible::query_account(token_id_a, &user_chain_b, owner).await,
-            None
-        );
-        assert_eq!(
-            fungible::query_account(token_id_a, &matching_chain, owner).await,
-            None
-        );
+        assert_eq!(user_chain_b.query_account(token_id_a, owner).await, None);
+        assert_eq!(matching_chain.query_account(token_id_a, owner).await, None);
     }
 
     let mut ask_certificates = Vec::new();
-    for price in [4, 2] {
+    for price in [400, 200] {
         let price = Price { price };
         let order = Order::Insert {
             owner: owner_b,
-            amount: Amount::from_tokens(4),
+            quantity: Amount::from_tokens(4),
             nature: OrderNature::Ask,
             price,
         };
         let operation = Operation::ExecuteOrder { order };
-        let ask_certificate = user_chain_b
+        let (ask_certificate, _) = user_chain_b
             .add_block(|block| {
-                block.with_operation(matching_id, operation);
+                block.with_operation(matching_id, &operation);
             })
             .await;
 
@@ -233,17 +226,11 @@ async fn single_transaction() {
 
     // Checking the balances on chain A
     for (owner, amount) in [(owner_a, Some(Amount::from_tokens(1))), (owner_b, None)] {
-        assert_eq!(
-            fungible::query_account(token_id_a, &user_chain_a, owner).await,
-            amount
-        );
+        assert_eq!(user_chain_a.query_account(token_id_a, owner).await, amount);
     }
     // Checking the balances on chain B
     for (owner, amount) in [(owner_a, None), (owner_b, Some(Amount::from_tokens(1)))] {
-        assert_eq!(
-            fungible::query_account(token_id_b, &user_chain_b, owner).await,
-            amount
-        );
+        assert_eq!(user_chain_b.query_account(token_id_b, owner).await, amount);
     }
 
     // Cancel A's order.
@@ -252,9 +239,9 @@ async fn single_transaction() {
         order_id: order_ids_a[0],
     };
     let operation = Operation::ExecuteOrder { order };
-    let order_certificate = user_chain_a
+    let (order_certificate, _) = user_chain_a
         .add_block(|block| {
-            block.with_operation(matching_id, operation);
+            block.with_operation(matching_id, &operation);
         })
         .await;
     assert_eq!(order_certificate.outgoing_message_count(), 1);
@@ -273,7 +260,7 @@ async fn single_transaction() {
         .await;
     matching_chain
         .add_block(|block| {
-            block.with_operation(matching_id, Operation::CloseChain);
+            block.with_operation(matching_id, &Operation::CloseChain);
         })
         .await;
 
@@ -287,10 +274,7 @@ async fn single_transaction() {
         (owner_a, &user_chain_a, Some(Amount::from_tokens(4))),
         (owner_b, &user_chain_b, Some(Amount::from_tokens(6))),
     ] {
-        assert_eq!(
-            fungible::query_account(token_id_a, user_chain, owner).await,
-            amount
-        );
+        assert_eq!(user_chain.query_account(token_id_a, owner).await, amount);
     }
     for (owner, user_chain, amount) in [
         (owner_a, &matching_chain, None),
@@ -298,9 +282,6 @@ async fn single_transaction() {
         (owner_a, &user_chain_a, Some(Amount::from_tokens(3))),
         (owner_b, &user_chain_b, Some(Amount::from_tokens(6))),
     ] {
-        assert_eq!(
-            fungible::query_account(token_id_b, user_chain, owner).await,
-            amount
-        );
+        assert_eq!(user_chain.query_account(token_id_b, owner).await, amount);
     }
 }

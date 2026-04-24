@@ -149,7 +149,12 @@ pub(crate) async fn graphiql(uri: Uri) -> impl IntoResponse {
     let source = GraphiQLSource::build()
         .endpoint(uri.path())
         .subscription_endpoint("/ws")
-        .finish();
+        .finish()
+        .replace("@17", "@18")
+        .replace(
+            "ReactDOM.render(",
+            "ReactDOM.createRoot(document.getElementById(\"graphiql\")).render(",
+        );
     response::Html(source)
 }
 
@@ -157,8 +162,40 @@ pub fn parse_millis(s: &str) -> Result<Duration, ParseIntError> {
     Ok(Duration::from_millis(s.parse()?))
 }
 
+/// Converts a `Duration` to `Option<Duration>`, treating zero as `None`.
+pub fn non_zero_duration(d: Duration) -> Option<Duration> {
+    if d.is_zero() {
+        None
+    } else {
+        Some(d)
+    }
+}
+
 pub fn parse_millis_delta(s: &str) -> Result<TimeDelta, ParseIntError> {
     Ok(TimeDelta::from_millis(s.parse()?))
+}
+
+pub fn parse_ascii_alphanumeric_string(s: &str) -> Result<String, &'static str> {
+    if s.chars().all(|x| x.is_ascii_alphanumeric()) {
+        Ok(s.to_string())
+    } else {
+        Err("Expecting ASCII alphanumeric characters")
+    }
+}
+
+/// Checks the condition five times with increasing delays. Returns `true` if it is met.
+#[cfg(with_testing)]
+pub async fn eventually<F>(condition: impl Fn() -> F) -> bool
+where
+    F: std::future::Future<Output = bool>,
+{
+    for i in 0..5 {
+        linera_base::time::timer::sleep(linera_base::time::Duration::from_secs(i)).await;
+        if condition().await {
+            return true;
+        }
+    }
+    false
 }
 
 #[test]

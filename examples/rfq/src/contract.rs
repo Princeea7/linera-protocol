@@ -5,11 +5,11 @@
 
 mod state;
 
-use fungible::{Account, FungibleTokenAbi};
+use fungible::{FungibleOperation, FungibleTokenAbi};
 use linera_sdk::{
     linera_base_types::{
-        AccountOwner, Amount, ApplicationPermissions, ChainId, ChainOwnership, TimeoutConfig,
-        WithContractAbi,
+        Account, AccountOwner, Amount, ApplicationPermissions, ChainId, ChainOwnership,
+        TimeoutConfig, WithContractAbi,
     },
     views::{RootView, View},
     Contract, ContractRuntime,
@@ -138,7 +138,7 @@ impl Contract for RfqContract {
 
                 // transfer tokens to the new chain
                 let token_pair = awaiting_tokens.token_pair;
-                let transfer = fungible::Operation::Transfer {
+                let transfer = FungibleOperation::Transfer {
                     owner,
                     amount: awaiting_tokens.amount_offered,
                     target_account: Account {
@@ -191,7 +191,11 @@ impl Contract for RfqContract {
     }
 
     async fn execute_message(&mut self, message: Self::Message) {
-        let request_id = message.request_id(self.get_message_creation_chain_id());
+        let origin_chain_id = self
+            .runtime
+            .message_origin_chain_id()
+            .expect("Getting message origin chain ID should not fail");
+        let request_id = message.request_id(origin_chain_id);
         match message {
             Message::RequestQuote {
                 token_pair, amount, ..
@@ -210,12 +214,11 @@ impl Contract for RfqContract {
                     .update_state_with_quote(quote, quoter_owner);
             }
             Message::QuoteAccepted { request_id } => {
-                let temp_chain_id = self.get_message_creation_chain_id();
                 self.state
                     .request_data(&request_id)
                     .await
                     .expect("Request not found!")
-                    .accept_quote(temp_chain_id);
+                    .accept_quote(origin_chain_id);
             }
             Message::CancelRequest { .. } => {
                 if let Some(temp_chain_id) = self.state.cancel_request(&request_id).await {
@@ -264,7 +267,7 @@ impl Contract for RfqContract {
                         self.runtime.call_application(
                             true,
                             tokens.token_id.with_abi::<fungible::FungibleTokenAbi>(),
-                            &fungible::Operation::Transfer {
+                            &FungibleOperation::Transfer {
                                 owner,
                                 amount: tokens.amount,
                                 target_account: tokens.owner,
@@ -278,7 +281,7 @@ impl Contract for RfqContract {
                         self.runtime.call_application(
                             true,
                             tokens.token_id.with_abi::<fungible::FungibleTokenAbi>(),
-                            &fungible::Operation::Transfer {
+                            &FungibleOperation::Transfer {
                                 owner,
                                 amount: tokens.amount,
                                 target_account: held_tokens.owner,
@@ -289,7 +292,7 @@ impl Contract for RfqContract {
                             held_tokens
                                 .token_id
                                 .with_abi::<fungible::FungibleTokenAbi>(),
-                            &fungible::Operation::Transfer {
+                            &FungibleOperation::Transfer {
                                 owner,
                                 amount: held_tokens.amount,
                                 target_account: tokens.owner,
@@ -306,19 +309,15 @@ impl Contract for RfqContract {
         }
     }
 
-    async fn store(mut self) {
-        self.state.save().await.expect("Failed to save state");
+    async fn store(self) {
+        self.state
+            .save_and_drop()
+            .await
+            .expect("Failed to save state");
     }
 }
 
 impl RfqContract {
-    fn get_message_creation_chain_id(&mut self) -> ChainId {
-        self.runtime
-            .message_id()
-            .expect("Getting message id should not fail")
-            .chain_id
-    }
-
     async fn start_exchange(
         &mut self,
         request_id: RequestId,
@@ -337,7 +336,7 @@ impl RfqContract {
         let temp_chain_id = self.runtime.open_chain(ownership, permissions, fee_budget);
 
         // transfer tokens to the new chain
-        let transfer = fungible::Operation::Transfer {
+        let transfer = FungibleOperation::Transfer {
             owner,
             amount: quote_provided.get_amount(),
             target_account: Account {
@@ -380,7 +379,7 @@ impl RfqContract {
             self.runtime.call_application(
                 true,
                 tokens.token_id.with_abi::<fungible::FungibleTokenAbi>(),
-                &fungible::Operation::Transfer {
+                &FungibleOperation::Transfer {
                     owner,
                     amount: tokens.amount,
                     target_account: tokens.owner,

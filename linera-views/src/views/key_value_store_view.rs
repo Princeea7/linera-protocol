@@ -13,126 +13,125 @@
 //!
 //! Key tags to create the sub-keys of a `KeyValueStoreView` on top of the base key.
 
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
-use std::{collections::BTreeMap, fmt::Debug, mem, ops::Bound::Included, sync::Mutex};
+use std::{collections::BTreeMap, fmt::Debug, ops::Bound::Included, sync::Mutex};
 
-use async_trait::async_trait;
-use linera_base::{data_types::ArithmeticError, ensure};
-use serde::{Deserialize, Serialize};
+use allocative::Allocative;
 #[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{
-        exponential_bucket_latencies, register_histogram_vec, MeasureLatency,
-    },
-    prometheus::HistogramVec,
-};
+use linera_base::prometheus_util::MeasureLatency as _;
+use linera_base::{data_types::ArithmeticError, ensure, visit_allocative_simple};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     batch::{Batch, WriteOperation},
     common::{
-        from_bytes_option, from_bytes_option_or_default, get_interval, get_upper_bound,
+        from_bytes_option, from_bytes_option_or_default, get_key_range_for_prefix, get_upper_bound,
         DeletionSet, HasherOutput, SuffixClosedSetIterator, Update,
     },
     context::Context,
+    hashable_wrapper::WrappedHashableContainerView,
+    historical_hash_wrapper::HistoricallyHashableView,
     map_view::ByteMapView,
-    store::{KeyIterable, KeyValueIterable},
-    views::{ClonableView, HashableView, Hasher, View, ViewError, MIN_VIEW_TAG},
+    store::ReadableKeyValueStore,
+    views::{ClonableView, HashableView, Hasher, ReplaceContext, View, ViewError, MIN_VIEW_TAG},
 };
 
 #[cfg(with_metrics)]
-/// The latency of hash computation
-static KEY_VALUE_STORE_VIEW_HASH_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "key_value_store_view_hash_latency",
-        "KeyValueStoreView hash latency",
-        &[],
-        exponential_bucket_latencies(5.0),
-    )
-});
+mod metrics {
+    use std::sync::LazyLock;
 
-#[cfg(with_metrics)]
-/// The latency of get operation
-static KEY_VALUE_STORE_VIEW_GET_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "key_value_store_view_get_latency",
-        "KeyValueStoreView get latency",
-        &[],
-        exponential_bucket_latencies(5.0),
-    )
-});
+    use linera_base::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+    use prometheus::HistogramVec;
 
-#[cfg(with_metrics)]
-/// The latency of multi get
-static KEY_VALUE_STORE_VIEW_MULTI_GET_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "key_value_store_view_multi_get_latency",
-        "KeyValueStoreView multi get latency",
-        &[],
-        exponential_bucket_latencies(5.0),
-    )
-});
-
-#[cfg(with_metrics)]
-/// The latency of contains key
-static KEY_VALUE_STORE_VIEW_CONTAINS_KEY_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "key_value_store_view_contains_key_latency",
-        "KeyValueStoreView contains key latency",
-        &[],
-        exponential_bucket_latencies(5.0),
-    )
-});
-
-#[cfg(with_metrics)]
-/// The latency of contains keys
-static KEY_VALUE_STORE_VIEW_CONTAINS_KEYS_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "key_value_store_view_contains_keys_latency",
-        "KeyValueStoreView contains keys latency",
-        &[],
-        exponential_bucket_latencies(5.0),
-    )
-});
-
-#[cfg(with_metrics)]
-/// The latency of find keys by prefix operation
-static KEY_VALUE_STORE_VIEW_FIND_KEYS_BY_PREFIX_LATENCY: LazyLock<HistogramVec> =
-    LazyLock::new(|| {
+    /// The latency of hash computation
+    pub static KEY_VALUE_STORE_VIEW_HASH_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
         register_histogram_vec(
-            "key_value_store_view_find_keys_by_prefix_latency",
-            "KeyValueStoreView find keys by prefix latency",
+            "key_value_store_view_hash_latency",
+            "KeyValueStoreView hash latency",
             &[],
             exponential_bucket_latencies(5.0),
         )
     });
 
-#[cfg(with_metrics)]
-/// The latency of find key values by prefix operation
-static KEY_VALUE_STORE_VIEW_FIND_KEY_VALUES_BY_PREFIX_LATENCY: LazyLock<HistogramVec> =
-    LazyLock::new(|| {
+    /// The latency of get operation
+    pub static KEY_VALUE_STORE_VIEW_GET_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
         register_histogram_vec(
-            "key_value_store_view_find_key_values_by_prefix_latency",
-            "KeyValueStoreView find key values by prefix latency",
+            "key_value_store_view_get_latency",
+            "KeyValueStoreView get latency",
             &[],
             exponential_bucket_latencies(5.0),
         )
     });
 
-#[cfg(with_metrics)]
-/// The latency of write batch operation
-static KEY_VALUE_STORE_VIEW_WRITE_BATCH_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "key_value_store_view_write_batch_latency",
-        "KeyValueStoreView write batch latency",
-        &[],
-        exponential_bucket_latencies(5.0),
-    )
-});
+    /// The latency of multi get
+    pub static KEY_VALUE_STORE_VIEW_MULTI_GET_LATENCY: LazyLock<HistogramVec> =
+        LazyLock::new(|| {
+            register_histogram_vec(
+                "key_value_store_view_multi_get_latency",
+                "KeyValueStoreView multi get latency",
+                &[],
+                exponential_bucket_latencies(5.0),
+            )
+        });
+
+    /// The latency of contains key
+    pub static KEY_VALUE_STORE_VIEW_CONTAINS_KEY_LATENCY: LazyLock<HistogramVec> =
+        LazyLock::new(|| {
+            register_histogram_vec(
+                "key_value_store_view_contains_key_latency",
+                "KeyValueStoreView contains key latency",
+                &[],
+                exponential_bucket_latencies(5.0),
+            )
+        });
+
+    /// The latency of contains keys
+    pub static KEY_VALUE_STORE_VIEW_CONTAINS_KEYS_LATENCY: LazyLock<HistogramVec> =
+        LazyLock::new(|| {
+            register_histogram_vec(
+                "key_value_store_view_contains_keys_latency",
+                "KeyValueStoreView contains keys latency",
+                &[],
+                exponential_bucket_latencies(5.0),
+            )
+        });
+
+    /// The latency of find keys by prefix operation
+    pub static KEY_VALUE_STORE_VIEW_FIND_KEYS_BY_PREFIX_LATENCY: LazyLock<HistogramVec> =
+        LazyLock::new(|| {
+            register_histogram_vec(
+                "key_value_store_view_find_keys_by_prefix_latency",
+                "KeyValueStoreView find keys by prefix latency",
+                &[],
+                exponential_bucket_latencies(5.0),
+            )
+        });
+
+    /// The latency of find key values by prefix operation
+    pub static KEY_VALUE_STORE_VIEW_FIND_KEY_VALUES_BY_PREFIX_LATENCY: LazyLock<HistogramVec> =
+        LazyLock::new(|| {
+            register_histogram_vec(
+                "key_value_store_view_find_key_values_by_prefix_latency",
+                "KeyValueStoreView find key values by prefix latency",
+                &[],
+                exponential_bucket_latencies(5.0),
+            )
+        });
+
+    /// The latency of write batch operation
+    pub static KEY_VALUE_STORE_VIEW_WRITE_BATCH_LATENCY: LazyLock<HistogramVec> =
+        LazyLock::new(|| {
+            register_histogram_vec(
+                "key_value_store_view_write_batch_latency",
+                "KeyValueStoreView write batch latency",
+                &[],
+                exponential_bucket_latencies(5.0),
+            )
+        });
+}
 
 #[cfg(with_testing)]
 use {
-    crate::store::{KeyValueStoreError, ReadableKeyValueStore, WithError, WritableKeyValueStore},
+    crate::store::{KeyValueStoreError, WithError, WritableKeyValueStore},
     async_lock::RwLock,
     std::sync::Arc,
     thiserror::Error,
@@ -151,7 +150,7 @@ enum KeyTag {
 }
 
 /// A pair containing the key and value size.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Allocative)]
 pub struct SizeData {
     /// The size of the key
     pub key: u32,
@@ -163,15 +162,6 @@ impl SizeData {
     /// Sums both terms
     pub fn sum(&mut self) -> u32 {
         self.key + self.value
-    }
-
-    /// Sums both terms
-    pub fn sum_i32(&mut self) -> Result<i32, ViewError> {
-        let sum = self
-            .key
-            .checked_add(self.value)
-            .ok_or(ArithmeticError::Overflow)?;
-        Ok(i32::try_from(sum).map_err(|_| ArithmeticError::Overflow)?)
     }
 
     /// Adds a size to `self`
@@ -211,35 +201,65 @@ impl SizeData {
 ///   The no domination is essential here.
 ///
 /// [entry1]: crate::batch::WriteOperation::DeletePrefix
-#[derive(Debug)]
+#[derive(Debug, Allocative)]
+#[allocative(bound = "C")]
 pub struct KeyValueStoreView<C> {
+    /// The view context.
+    #[allocative(skip)]
     context: C,
+    /// Tracks deleted key prefixes.
     deletion_set: DeletionSet,
+    /// Pending changes not yet persisted to storage.
     updates: BTreeMap<Vec<u8>, Update<Vec<u8>>>,
+    /// The total size of keys and values persisted in storage.
     stored_total_size: SizeData,
+    /// The total size of keys and values including pending changes.
     total_size: SizeData,
+    /// Map of key to value size for tracking storage usage.
     sizes: ByteMapView<C, u32>,
+    /// The hash persisted in storage.
+    #[allocative(visit = visit_allocative_simple)]
     stored_hash: Option<HasherOutput>,
+    /// Memoized hash, if any.
+    #[allocative(visit = visit_allocative_simple)]
     hash: Mutex<Option<HasherOutput>>,
 }
 
-#[async_trait]
-impl<C> View<C> for KeyValueStoreView<C>
-where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-{
+impl<C: Context, C2: Context> ReplaceContext<C2> for KeyValueStoreView<C> {
+    type Target = KeyValueStoreView<C2>;
+
+    async fn with_context(
+        &mut self,
+        ctx: impl FnOnce(&Self::Context) -> C2 + Clone,
+    ) -> Self::Target {
+        let hash = *self.hash.lock().unwrap();
+        KeyValueStoreView {
+            context: ctx.clone()(&self.context),
+            deletion_set: self.deletion_set.clone(),
+            updates: self.updates.clone(),
+            stored_total_size: self.stored_total_size,
+            total_size: self.total_size,
+            sizes: self.sizes.with_context(ctx.clone()).await,
+            stored_hash: self.stored_hash,
+            hash: Mutex::new(hash),
+        }
+    }
+}
+
+impl<C: Context> View for KeyValueStoreView<C> {
     const NUM_INIT_KEYS: usize = 2 + ByteMapView::<C, u32>::NUM_INIT_KEYS;
 
-    fn context(&self) -> &C {
-        &self.context
+    type Context = C;
+
+    fn context(&self) -> C {
+        self.context.clone()
     }
 
     fn pre_load(context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
-        let key_hash = context.base_tag(KeyTag::Hash as u8);
-        let key_total_size = context.base_tag(KeyTag::TotalSize as u8);
+        let key_hash = context.base_key().base_tag(KeyTag::Hash as u8);
+        let key_total_size = context.base_key().base_tag(KeyTag::TotalSize as u8);
         let mut v = vec![key_hash, key_total_size];
-        let base_key = context.base_tag(KeyTag::Sizes as u8);
+        let base_key = context.base_key().base_tag(KeyTag::Sizes as u8);
         let context_sizes = context.clone_with_base_key(base_key);
         v.extend(ByteMapView::<C, u32>::pre_load(&context_sizes)?);
         Ok(v)
@@ -249,7 +269,7 @@ where
         let hash = from_bytes_option(values.first().ok_or(ViewError::PostLoadValuesError)?)?;
         let total_size =
             from_bytes_option_or_default(values.get(1).ok_or(ViewError::PostLoadValuesError)?)?;
-        let base_key = context.base_tag(KeyTag::Sizes as u8);
+        let base_key = context.base_key().base_tag(KeyTag::Sizes as u8);
         let context_sizes = context.clone_with_base_key(base_key);
         let sizes = ByteMapView::post_load(
             context_sizes,
@@ -265,12 +285,6 @@ where
             stored_hash: hash,
             hash: Mutex::new(hash),
         })
-    }
-
-    async fn load(context: C) -> Result<Self, ViewError> {
-        let keys = Self::pre_load(&context)?;
-        let values = context.read_multi_values_bytes(keys).await?;
-        Self::post_load(context, &values)
     }
 
     fn rollback(&mut self) {
@@ -298,50 +312,64 @@ where
         self.stored_hash != *hash
     }
 
-    fn flush(&mut self, batch: &mut Batch) -> Result<bool, ViewError> {
+    fn pre_save(&self, batch: &mut Batch) -> Result<bool, ViewError> {
         let mut delete_view = false;
         if self.deletion_set.delete_storage_first {
             delete_view = true;
-            self.stored_total_size = SizeData::default();
-            batch.delete_key_prefix(self.context.base_key());
-            for (index, update) in mem::take(&mut self.updates) {
+            batch.delete_key_prefix(self.context.base_key().bytes.clone());
+            for (index, update) in self.updates.iter() {
                 if let Update::Set(value) = update {
-                    let key = self.context.base_tag_index(KeyTag::Index as u8, &index);
-                    batch.put_key_value_bytes(key, value);
+                    let key = self
+                        .context
+                        .base_key()
+                        .base_tag_index(KeyTag::Index as u8, index);
+                    batch.put_key_value_bytes(key, value.clone());
                     delete_view = false;
                 }
             }
-            self.stored_hash = None
         } else {
-            for index in mem::take(&mut self.deletion_set.deleted_prefixes) {
-                let key = self.context.base_tag_index(KeyTag::Index as u8, &index);
+            for index in self.deletion_set.deleted_prefixes.iter() {
+                let key = self
+                    .context
+                    .base_key()
+                    .base_tag_index(KeyTag::Index as u8, index);
                 batch.delete_key_prefix(key);
             }
-            for (index, update) in mem::take(&mut self.updates) {
-                let key = self.context.base_tag_index(KeyTag::Index as u8, &index);
+            for (index, update) in self.updates.iter() {
+                let key = self
+                    .context
+                    .base_key()
+                    .base_tag_index(KeyTag::Index as u8, index);
                 match update {
                     Update::Removed => batch.delete_key(key),
-                    Update::Set(value) => batch.put_key_value_bytes(key, value),
+                    Update::Set(value) => batch.put_key_value_bytes(key, value.clone()),
                 }
             }
         }
-        self.sizes.flush(batch)?;
-        let hash = *self.hash.get_mut().unwrap();
+        self.sizes.pre_save(batch)?;
+        let hash = *self.hash.lock().unwrap();
         if self.stored_hash != hash {
-            let key = self.context.base_tag(KeyTag::Hash as u8);
+            let key = self.context.base_key().base_tag(KeyTag::Hash as u8);
             match hash {
                 None => batch.delete_key(key),
                 Some(hash) => batch.put_key_value(key, &hash)?,
             }
-            self.stored_hash = hash;
         }
         if self.stored_total_size != self.total_size {
-            let key = self.context.base_tag(KeyTag::TotalSize as u8);
+            let key = self.context.base_key().base_tag(KeyTag::TotalSize as u8);
             batch.put_key_value(key, &self.total_size)?;
-            self.stored_total_size = self.total_size;
         }
-        self.deletion_set.delete_storage_first = false;
         Ok(delete_view)
+    }
+
+    fn post_save(&mut self) {
+        self.deletion_set.delete_storage_first = false;
+        self.deletion_set.deleted_prefixes.clear();
+        self.updates.clear();
+        self.sizes.post_save();
+        let hash = *self.hash.lock().unwrap();
+        self.stored_hash = hash;
+        self.stored_total_size = self.total_size;
     }
 
     fn clear(&mut self) {
@@ -353,11 +381,7 @@ where
     }
 }
 
-impl<C> ClonableView<C> for KeyValueStoreView<C>
-where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-{
+impl<C: Context> ClonableView for KeyValueStoreView<C> {
     fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
         Ok(KeyValueStoreView {
             context: self.context.clone(),
@@ -372,14 +396,10 @@ where
     }
 }
 
-impl<C> KeyValueStoreView<C>
-where
-    C: Send + Context + Sync,
-    ViewError: From<C::Error>,
-{
+impl<C: Context> KeyValueStoreView<C> {
     fn max_key_size(&self) -> usize {
-        let prefix_len = self.context.base_key().len();
-        C::MAX_KEY_SIZE - 1 - prefix_len
+        let prefix_len = self.context.base_key().bytes.len();
+        <C::Store as ReadableKeyValueStore>::MAX_KEY_SIZE - 1 - prefix_len
     }
 
     /// Getting the total sizes that will be used for keys and values when stored
@@ -390,8 +410,9 @@ where
     /// # use linera_views::views::View;
     /// # let context = MemoryContext::new_for_testing(());
     /// let mut view = KeyValueStoreView::load(context).await.unwrap();
+    /// view.insert(vec![0, 1], vec![0, 1, 2, 3, 4]).await.unwrap();
     /// let total_size = view.total_size();
-    /// assert_eq!(total_size, SizeData::default());
+    /// assert_eq!(total_size, SizeData { key: 2, value: 5 });
     /// # })
     /// ```
     pub fn total_size(&self) -> SizeData {
@@ -424,7 +445,7 @@ where
     where
         F: FnMut(&[u8]) -> Result<bool, ViewError> + Send,
     {
-        let key_prefix = self.context.base_tag(KeyTag::Index as u8);
+        let key_prefix = self.context.base_key().base_tag(KeyTag::Index as u8);
         let mut updates = self.updates.iter();
         let mut update = updates.next();
         if !self.deletion_set.delete_storage_first {
@@ -432,26 +453,25 @@ where
                 SuffixClosedSetIterator::new(0, self.deletion_set.deleted_prefixes.iter());
             for index in self
                 .context
+                .store()
                 .find_keys_by_prefix(&key_prefix)
                 .await?
-                .iterator()
             {
-                let index = index?;
                 loop {
                     match update {
-                        Some((key, value)) if key.as_slice() <= index => {
+                        Some((key, value)) if key <= &index => {
                             if let Update::Set(_) = value {
                                 if !f(key)? {
                                     return Ok(());
                                 }
                             }
                             update = updates.next();
-                            if key == index {
+                            if key == &index {
                                 break;
                             }
                         }
                         _ => {
-                            if !suffix_closed_set.find_key(index) && !f(index)? {
+                            if !suffix_closed_set.find_key(&index) && !f(&index)? {
                                 return Ok(());
                             }
                             break;
@@ -528,7 +548,7 @@ where
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool, ViewError> + Send,
     {
-        let key_prefix = self.context.base_tag(KeyTag::Index as u8);
+        let key_prefix = self.context.base_key().base_tag(KeyTag::Index as u8);
         let mut updates = self.updates.iter();
         let mut update = updates.next();
         if !self.deletion_set.delete_storage_first {
@@ -536,26 +556,26 @@ where
                 SuffixClosedSetIterator::new(0, self.deletion_set.deleted_prefixes.iter());
             for entry in self
                 .context
+                .store()
                 .find_key_values_by_prefix(&key_prefix)
                 .await?
-                .iterator()
             {
-                let (index, index_val) = entry?;
+                let (index, index_val) = entry;
                 loop {
                     match update {
-                        Some((key, value)) if key.as_slice() <= index => {
+                        Some((key, value)) if key <= &index => {
                             if let Update::Set(value) = value {
                                 if !f(key, value)? {
                                     return Ok(());
                                 }
                             }
                             update = updates.next();
-                            if key == index {
+                            if key == &index {
                                 break;
                             }
                         }
                         _ => {
-                            if !suffix_closed_set.find_key(index) && !f(index, index_val)? {
+                            if !suffix_closed_set.find_key(&index) && !f(&index, &index_val)? {
                                 return Ok(());
                             }
                             break;
@@ -693,7 +713,7 @@ where
     /// ```
     pub async fn get(&self, index: &[u8]) -> Result<Option<Vec<u8>>, ViewError> {
         #[cfg(with_metrics)]
-        let _latency = KEY_VALUE_STORE_VIEW_GET_LATENCY.measure_latency();
+        let _latency = metrics::KEY_VALUE_STORE_VIEW_GET_LATENCY.measure_latency();
         ensure!(index.len() <= self.max_key_size(), ViewError::KeyTooLong);
         if let Some(update) = self.updates.get(index) {
             let value = match update {
@@ -705,8 +725,11 @@ where
         if self.deletion_set.contains_prefix_of(index) {
             return Ok(None);
         }
-        let key = self.context.base_tag_index(KeyTag::Index as u8, index);
-        Ok(self.context.read_value_bytes(&key).await?)
+        let key = self
+            .context
+            .base_key()
+            .base_tag_index(KeyTag::Index as u8, index);
+        Ok(self.context.store().read_value_bytes(&key).await?)
     }
 
     /// Tests whether the store contains a specific index.
@@ -724,7 +747,7 @@ where
     /// ```
     pub async fn contains_key(&self, index: &[u8]) -> Result<bool, ViewError> {
         #[cfg(with_metrics)]
-        let _latency = KEY_VALUE_STORE_VIEW_CONTAINS_KEY_LATENCY.measure_latency();
+        let _latency = metrics::KEY_VALUE_STORE_VIEW_CONTAINS_KEY_LATENCY.measure_latency();
         ensure!(index.len() <= self.max_key_size(), ViewError::KeyTooLong);
         if let Some(update) = self.updates.get(index) {
             let test = match update {
@@ -736,8 +759,11 @@ where
         if self.deletion_set.contains_prefix_of(index) {
             return Ok(false);
         }
-        let key = self.context.base_tag_index(KeyTag::Index as u8, index);
-        Ok(self.context.contains_key(&key).await?)
+        let key = self
+            .context
+            .base_key()
+            .base_tag_index(KeyTag::Index as u8, index);
+        Ok(self.context.store().contains_key(&key).await?)
     }
 
     /// Tests whether the view contains a range of indices
@@ -750,19 +776,19 @@ where
     /// let mut view = KeyValueStoreView::load(context).await.unwrap();
     /// view.insert(vec![0, 1], vec![42]).await.unwrap();
     /// let keys = vec![vec![0, 1], vec![0, 2]];
-    /// let results = view.contains_keys(keys).await.unwrap();
+    /// let results = view.contains_keys(&keys).await.unwrap();
     /// assert_eq!(results, vec![true, false]);
     /// # })
     /// ```
-    pub async fn contains_keys(&self, indices: Vec<Vec<u8>>) -> Result<Vec<bool>, ViewError> {
+    pub async fn contains_keys(&self, indices: &[Vec<u8>]) -> Result<Vec<bool>, ViewError> {
         #[cfg(with_metrics)]
-        let _latency = KEY_VALUE_STORE_VIEW_CONTAINS_KEYS_LATENCY.measure_latency();
+        let _latency = metrics::KEY_VALUE_STORE_VIEW_CONTAINS_KEYS_LATENCY.measure_latency();
         let mut results = Vec::with_capacity(indices.len());
         let mut missed_indices = Vec::new();
         let mut vector_query = Vec::new();
-        for (i, index) in indices.into_iter().enumerate() {
+        for (i, index) in indices.iter().enumerate() {
             ensure!(index.len() <= self.max_key_size(), ViewError::KeyTooLong);
-            if let Some(update) = self.updates.get(&index) {
+            if let Some(update) = self.updates.get(index) {
                 let value = match update {
                     Update::Removed => false,
                     Update::Set(_) => true,
@@ -770,14 +796,17 @@ where
                 results.push(value);
             } else {
                 results.push(false);
-                if !self.deletion_set.contains_prefix_of(&index) {
+                if !self.deletion_set.contains_prefix_of(index) {
                     missed_indices.push(i);
-                    let key = self.context.base_tag_index(KeyTag::Index as u8, &index);
+                    let key = self
+                        .context
+                        .base_key()
+                        .base_tag_index(KeyTag::Index as u8, index);
                     vector_query.push(key);
                 }
             }
         }
-        let values = self.context.contains_keys(vector_query).await?;
+        let values = self.context.store().contains_keys(&vector_query).await?;
         for (i, value) in missed_indices.into_iter().zip(values) {
             results[i] = value;
         }
@@ -794,23 +823,20 @@ where
     /// let mut view = KeyValueStoreView::load(context).await.unwrap();
     /// view.insert(vec![0, 1], vec![42]).await.unwrap();
     /// assert_eq!(
-    ///     view.multi_get(vec![vec![0, 1], vec![0, 2]]).await.unwrap(),
+    ///     view.multi_get(&[vec![0, 1], vec![0, 2]]).await.unwrap(),
     ///     vec![Some(vec![42]), None]
     /// );
     /// # })
     /// ```
-    pub async fn multi_get(
-        &self,
-        indices: Vec<Vec<u8>>,
-    ) -> Result<Vec<Option<Vec<u8>>>, ViewError> {
+    pub async fn multi_get(&self, indices: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, ViewError> {
         #[cfg(with_metrics)]
-        let _latency = KEY_VALUE_STORE_VIEW_MULTI_GET_LATENCY.measure_latency();
+        let _latency = metrics::KEY_VALUE_STORE_VIEW_MULTI_GET_LATENCY.measure_latency();
         let mut result = Vec::with_capacity(indices.len());
         let mut missed_indices = Vec::new();
         let mut vector_query = Vec::new();
-        for (i, index) in indices.into_iter().enumerate() {
+        for (i, index) in indices.iter().enumerate() {
             ensure!(index.len() <= self.max_key_size(), ViewError::KeyTooLong);
-            if let Some(update) = self.updates.get(&index) {
+            if let Some(update) = self.updates.get(index) {
                 let value = match update {
                     Update::Removed => None,
                     Update::Set(value) => Some(value.clone()),
@@ -818,14 +844,21 @@ where
                 result.push(value);
             } else {
                 result.push(None);
-                if !self.deletion_set.contains_prefix_of(&index) {
+                if !self.deletion_set.contains_prefix_of(index) {
                     missed_indices.push(i);
-                    let key = self.context.base_tag_index(KeyTag::Index as u8, &index);
+                    let key = self
+                        .context
+                        .base_key()
+                        .base_tag_index(KeyTag::Index as u8, index);
                     vector_query.push(key);
                 }
             }
         }
-        let values = self.context.read_multi_values_bytes(vector_query).await?;
+        let values = self
+            .context
+            .store()
+            .read_multi_values_bytes(&vector_query)
+            .await?;
         for (i, value) in missed_indices.into_iter().zip(values) {
             result[i] = value;
         }
@@ -852,7 +885,7 @@ where
     /// ```
     pub async fn write_batch(&mut self, batch: Batch) -> Result<(), ViewError> {
         #[cfg(with_metrics)]
-        let _latency = KEY_VALUE_STORE_VIEW_WRITE_BATCH_LATENCY.measure_latency();
+        let _latency = metrics::KEY_VALUE_STORE_VIEW_WRITE_BATCH_LATENCY.measure_latency();
         *self.hash.get_mut().unwrap() = None;
         let max_key_size = self.max_key_size();
         for operation in batch.operations {
@@ -895,7 +928,7 @@ where
                     ensure!(key_prefix.len() <= max_key_size, ViewError::KeyTooLong);
                     let key_list = self
                         .updates
-                        .range(get_interval(key_prefix.clone()))
+                        .range(get_key_range_for_prefix(key_prefix.clone()))
                         .map(|x| x.0.to_vec())
                         .collect::<Vec<_>>();
                     for key in key_list {
@@ -990,13 +1023,16 @@ where
     /// ```
     pub async fn find_keys_by_prefix(&self, key_prefix: &[u8]) -> Result<Vec<Vec<u8>>, ViewError> {
         #[cfg(with_metrics)]
-        let _latency = KEY_VALUE_STORE_VIEW_FIND_KEYS_BY_PREFIX_LATENCY.measure_latency();
+        let _latency = metrics::KEY_VALUE_STORE_VIEW_FIND_KEYS_BY_PREFIX_LATENCY.measure_latency();
         ensure!(
             key_prefix.len() <= self.max_key_size(),
             ViewError::KeyTooLong
         );
         let len = key_prefix.len();
-        let key_prefix_full = self.context.base_tag_index(KeyTag::Index as u8, key_prefix);
+        let key_prefix_full = self
+            .context
+            .base_key()
+            .base_tag_index(KeyTag::Index as u8, key_prefix);
         let mut keys = Vec::new();
         let key_prefix_upper = get_upper_bound(key_prefix);
         let mut updates = self
@@ -1008,14 +1044,15 @@ where
                 SuffixClosedSetIterator::new(0, self.deletion_set.deleted_prefixes.iter());
             for key in self
                 .context
+                .store()
                 .find_keys_by_prefix(&key_prefix_full)
                 .await?
-                .iterator()
             {
-                let key = key?;
                 loop {
                     match update {
-                        Some((update_key, update_value)) if &update_key[len..] <= key => {
+                        Some((update_key, update_value))
+                            if &update_key[len..] <= key.as_slice() =>
+                        {
                             if let Update::Set(_) = update_value {
                                 keys.push(update_key[len..].to_vec());
                             }
@@ -1026,9 +1063,9 @@ where
                         }
                         _ => {
                             let mut key_with_prefix = key_prefix.to_vec();
-                            key_with_prefix.extend_from_slice(key);
+                            key_with_prefix.extend_from_slice(&key);
                             if !suffix_closed_set.find_key(&key_with_prefix) {
-                                keys.push(key.to_vec());
+                                keys.push(key);
                             }
                             break;
                         }
@@ -1066,13 +1103,17 @@ where
         key_prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ViewError> {
         #[cfg(with_metrics)]
-        let _latency = KEY_VALUE_STORE_VIEW_FIND_KEY_VALUES_BY_PREFIX_LATENCY.measure_latency();
+        let _latency =
+            metrics::KEY_VALUE_STORE_VIEW_FIND_KEY_VALUES_BY_PREFIX_LATENCY.measure_latency();
         ensure!(
             key_prefix.len() <= self.max_key_size(),
             ViewError::KeyTooLong
         );
         let len = key_prefix.len();
-        let key_prefix_full = self.context.base_tag_index(KeyTag::Index as u8, key_prefix);
+        let key_prefix_full = self
+            .context
+            .base_key()
+            .base_tag_index(KeyTag::Index as u8, key_prefix);
         let mut key_values = Vec::new();
         let key_prefix_upper = get_upper_bound(key_prefix);
         let mut updates = self
@@ -1084,11 +1125,11 @@ where
                 SuffixClosedSetIterator::new(0, self.deletion_set.deleted_prefixes.iter());
             for entry in self
                 .context
+                .store()
                 .find_key_values_by_prefix(&key_prefix_full)
                 .await?
-                .into_iterator_owned()
             {
-                let (key, value) = entry?;
+                let (key, value) = entry;
                 loop {
                     match update {
                         Some((update_key, update_value)) if update_key[len..] <= key[..] => {
@@ -1125,7 +1166,7 @@ where
 
     async fn compute_hash(&self) -> Result<<sha3::Sha3_256 as Hasher>::Output, ViewError> {
         #[cfg(with_metrics)]
-        let _hash_latency = KEY_VALUE_STORE_VIEW_HASH_LATENCY.measure_latency();
+        let _hash_latency = metrics::KEY_VALUE_STORE_VIEW_HASH_LATENCY.measure_latency();
         let mut hasher = sha3::Sha3_256::default();
         let mut count = 0u32;
         self.for_each_index_value(|index, value| -> Result<(), ViewError> {
@@ -1140,12 +1181,7 @@ where
     }
 }
 
-#[async_trait]
-impl<C> HashableView<C> for KeyValueStoreView<C>
-where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-{
+impl<C: Context> HashableView for KeyValueStoreView<C> {
     type Hasher = sha3::Sha3_256;
 
     async fn hash_mut(&mut self) -> Result<<Self::Hasher as Hasher>::Output, ViewError> {
@@ -1174,6 +1210,13 @@ where
         }
     }
 }
+
+/// Type wrapping `KeyValueStoreView` while memoizing the hash.
+pub type HashedKeyValueStoreView<C> =
+    WrappedHashableContainerView<C, KeyValueStoreView<C>, HasherOutput>;
+
+/// Wrapper around `KeyValueStoreView` to compute hashes based on the history of changes.
+pub type HistoricallyHashedKeyValueStoreView<C> = HistoricallyHashableView<C, KeyValueStoreView<C>>;
 
 /// A virtual DB client using a `KeyValueStoreView` as a backend (testing only).
 #[cfg(with_testing)]
@@ -1206,17 +1249,15 @@ impl KeyValueStoreError for ViewContainerError {
 }
 
 #[cfg(with_testing)]
-impl<C> ReadableKeyValueStore for ViewContainer<C>
-where
-    C: Context + Sync + Send + Clone,
-    ViewError: From<C::Error>,
-{
-    const MAX_KEY_SIZE: usize = C::MAX_KEY_SIZE;
-    type Keys = Vec<Vec<u8>>;
-    type KeyValues = Vec<(Vec<u8>, Vec<u8>)>;
+impl<C: Context> ReadableKeyValueStore for ViewContainer<C> {
+    const MAX_KEY_SIZE: usize = <C::Store as ReadableKeyValueStore>::MAX_KEY_SIZE;
 
     fn max_stream_queries(&self) -> usize {
         1
+    }
+
+    fn root_key(&self) -> Result<Vec<u8>, ViewContainerError> {
+        Ok(Vec::new())
     }
 
     async fn read_value_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ViewContainerError> {
@@ -1229,14 +1270,14 @@ where
         Ok(view.contains_key(key).await?)
     }
 
-    async fn contains_keys(&self, keys: Vec<Vec<u8>>) -> Result<Vec<bool>, ViewContainerError> {
+    async fn contains_keys(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, ViewContainerError> {
         let view = self.view.read().await;
         Ok(view.contains_keys(keys).await?)
     }
 
     async fn read_multi_values_bytes(
         &self,
-        keys: Vec<Vec<u8>>,
+        keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, ViewContainerError> {
         let view = self.view.read().await;
         Ok(view.multi_get(keys).await?)
@@ -1245,7 +1286,7 @@ where
     async fn find_keys_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::Keys, ViewContainerError> {
+    ) -> Result<Vec<Vec<u8>>, ViewContainerError> {
         let view = self.view.read().await;
         Ok(view.find_keys_by_prefix(key_prefix).await?)
     }
@@ -1253,26 +1294,24 @@ where
     async fn find_key_values_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::KeyValues, ViewContainerError> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ViewContainerError> {
         let view = self.view.read().await;
         Ok(view.find_key_values_by_prefix(key_prefix).await?)
     }
 }
 
 #[cfg(with_testing)]
-impl<C> WritableKeyValueStore for ViewContainer<C>
-where
-    C: Context + Sync + Send + Clone,
-    ViewError: From<C::Error>,
-{
-    const MAX_VALUE_SIZE: usize = C::MAX_VALUE_SIZE;
+impl<C: Context> WritableKeyValueStore for ViewContainer<C> {
+    const MAX_VALUE_SIZE: usize = <C::Store as WritableKeyValueStore>::MAX_VALUE_SIZE;
 
     async fn write_batch(&self, batch: Batch) -> Result<(), ViewContainerError> {
         let mut view = self.view.write().await;
         view.write_batch(batch).await?;
         let mut batch = Batch::new();
-        view.flush(&mut batch)?;
+        view.pre_save(&mut batch)?;
+        view.post_save();
         view.context()
+            .store()
             .write_batch(batch)
             .await
             .map_err(ViewError::from)?;
@@ -1285,11 +1324,7 @@ where
 }
 
 #[cfg(with_testing)]
-impl<C> ViewContainer<C>
-where
-    C: Context + Sync + Send + Clone,
-    ViewError: From<C::Error>,
-{
+impl<C: Context> ViewContainer<C> {
     /// Creates a [`ViewContainer`].
     pub async fn new(context: C) -> Result<Self, ViewError> {
         let view = KeyValueStoreView::load(context).await?;

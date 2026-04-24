@@ -1,21 +1,15 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fmt::Debug, io::Write};
+use std::{fmt::Debug, future::Future, io::Write};
 
-use async_trait::async_trait;
-use linera_base::{
-    crypto::CryptoHash,
-    data_types::ArithmeticError,
-    identifiers::{BlobId, EventId},
-};
+use linera_base::crypto::CryptoHash;
 pub use linera_views_derive::{
     ClonableView, CryptoHashRootView, CryptoHashView, HashableView, RootView, View,
 };
 use serde::Serialize;
-use thiserror::Error;
 
-use crate::{batch::Batch, common::HasherOutput};
+use crate::{batch::Batch, common::HasherOutput, ViewError};
 
 #[cfg(test)]
 #[path = "unit_tests/views.rs"]
@@ -23,6 +17,9 @@ mod tests;
 
 /// The `RegisterView` implements a register for a single value.
 pub mod register_view;
+
+/// The `LazyRegisterView` implements a register for a single value with lazy loading.
+pub mod lazy_register_view;
 
 /// The `LogView` implements a log list that can be pushed.
 pub mod log_view;
@@ -48,30 +45,47 @@ pub mod reentrant_collection_view;
 /// The implementation of a key-value store view.
 pub mod key_value_store_view;
 
-/// Wrapping a view to compute a hash.
+/// Wrapping a view to memoize hashing.
 pub mod hashable_wrapper;
+
+/// Wrapping a view to compute hash based on the history of modifications to the view.
+pub mod historical_hash_wrapper;
 
 /// The minimum value for the view tags. Values in `0..MIN_VIEW_TAG` are used for other purposes.
 pub const MIN_VIEW_TAG: u8 = 1;
 
 /// A view gives exclusive access to read and write the data stored at an underlying
 /// address in storage.
-#[async_trait]
-pub trait View<C>: Sized {
+#[cfg_attr(not(web), trait_variant::make(Send + Sync))]
+pub trait View: Sized {
     /// The number of keys used for the initialization
     const NUM_INIT_KEYS: usize;
 
+    /// The type of context stored in this view
+    type Context: crate::context::Context;
+
     /// Obtains a mutable reference to the internal context.
-    fn context(&self) -> &C;
+    fn context(&self) -> Self::Context;
 
     /// Creates the keys needed for loading the view
-    fn pre_load(context: &C) -> Result<Vec<Vec<u8>>, ViewError>;
+    fn pre_load(context: &Self::Context) -> Result<Vec<Vec<u8>>, ViewError>;
 
     /// Loads a view from the values
-    fn post_load(context: C, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError>;
+    fn post_load(context: Self::Context, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError>;
 
     /// Loads a view
-    async fn load(context: C) -> Result<Self, ViewError>;
+    fn load(context: Self::Context) -> impl Future<Output = Result<Self, ViewError>> {
+        async {
+            if Self::NUM_INIT_KEYS == 0 {
+                Self::post_load(context, &[])
+            } else {
+                use crate::{context::Context, store::ReadableKeyValueStore};
+                let keys = Self::pre_load(&context)?;
+                let values = context.store().read_multi_values_bytes(&keys).await?;
+                Self::post_load(context, &values)
+            }
+        }
+    }
 
     /// Discards all pending changes. After that `flush` should have no effect to storage.
     fn rollback(&mut self);
@@ -83,15 +97,20 @@ pub trait View<C>: Sized {
     /// by a flush then all the relevant data is removed on the storage.
     fn clear(&mut self);
 
-    /// Persists changes to storage. This leaves the view still usable and is essentially neutral to the
-    /// program running. Crash-resistant storage implementations are expected to accumulate the desired
-    /// changes in the `batch` variable first. If the view is dropped without calling `flush`, staged
-    /// changes are simply lost.
+    /// Computes the batch of operations to persist changes to storage without modifying the view.
+    /// Crash-resistant storage implementations accumulate the desired changes in the `batch` variable.
     /// The returned boolean indicates whether the operation removes the view or not.
-    fn flush(&mut self, batch: &mut Batch) -> Result<bool, ViewError>;
+    fn pre_save(&self, batch: &mut Batch) -> Result<bool, ViewError>;
+
+    /// Updates the view state after the batch has been executed in the database.
+    /// This should be called after `pre_save` and after the batch has been successfully written to storage.
+    /// This leaves the view in a clean state with no pending changes.
+    ///
+    /// May panic if `pre_save` was not called right before on `self`.
+    fn post_save(&mut self);
 
     /// Builds a trivial view that is already deleted
-    fn new(context: C) -> Result<Self, ViewError> {
+    fn new(context: Self::Context) -> Result<Self, ViewError> {
         let values = vec![None; Self::NUM_INIT_KEYS];
         let mut view = Self::post_load(context, &values)?;
         view.clear();
@@ -99,86 +118,19 @@ pub trait View<C>: Sized {
     }
 }
 
-/// Main error type for the crate.
-#[derive(Error, Debug)]
-pub enum ViewError {
-    /// BCS serialization error.
-    #[error(transparent)]
-    BcsError(#[from] bcs::Error),
+/// A view which can have its context replaced.
+pub trait ReplaceContext<C: crate::context::Context>: View {
+    /// The type returned after replacing the context.
+    type Target: View<Context = C>;
 
-    /// We failed to acquire an entry in a `CollectionView` or a `ReentrantCollectionView`.
-    #[error("trying to access a collection view or reentrant collection view while some entries are still being accessed")]
-    CannotAcquireCollectionEntry,
-
-    /// Input output error.
-    #[error("I/O error")]
-    IoError(#[from] std::io::Error),
-
-    /// Arithmetic error
-    #[error(transparent)]
-    ArithmeticError(#[from] ArithmeticError),
-
-    /// An error happened while trying to lock.
-    #[error("Failed to lock collection entry: {0:?}")]
-    TryLockError(Vec<u8>),
-
-    /// Tokio errors can happen while joining.
-    #[error("Panic in sub-task: {0}")]
-    TokioJoinError(#[from] tokio::task::JoinError),
-
-    /// Errors within the context can occur and are presented as `ViewError`.
-    #[error("Storage operation error in {backend}: {error}")]
-    StoreError {
-        /// backend can be e.g. RocksDB / DynamoDB / Memory / etc.
-        backend: String,
-        /// error is the specific problem that occurred within that context
-        error: String,
-    },
-
-    /// The key must not be too long
-    #[error("The key must not be too long")]
-    KeyTooLong,
-
-    /// The entry does not exist in memory
-    // FIXME(#148): This belongs to a future `linera_storage::StoreError`.
-    #[error("Entry does not exist in memory: {0}")]
-    NotFound(String),
-
-    /// The database is corrupt: Entries don't have the expected hash.
-    #[error("Inconsistent database entries")]
-    InconsistentEntries,
-
-    /// The database is corrupt: Some entries are missing
-    #[error("Missing database entries")]
-    MissingEntries,
-
-    /// The values are incoherent.
-    #[error("Post load values error")]
-    PostLoadValuesError,
-
-    /// The value is too large for the client
-    #[error("The value is too large for the client")]
-    TooLargeValue,
-
-    /// Some blobs were not found.
-    #[error("Blobs not found: {0:?}")]
-    BlobsNotFound(Vec<BlobId>),
-
-    /// Some events were not found.
-    #[error("Events not found: {0:?}")]
-    EventsNotFound(Vec<EventId>),
-}
-
-impl ViewError {
-    /// Creates a `NotFound` error with the given message and key.
-    pub fn not_found<T: Debug>(msg: &str, key: T) -> ViewError {
-        ViewError::NotFound(format!("{} {:?}", msg, key))
-    }
+    /// Returns a view with a replaced context.
+    async fn with_context(&mut self, ctx: impl FnOnce(&Self::Context) -> C + Clone)
+        -> Self::Target;
 }
 
 /// A view that supports hashing its values.
-#[async_trait]
-pub trait HashableView<C>: View<C> {
+#[cfg_attr(not(web), trait_variant::make(Send))]
+pub trait HashableView: View {
     /// How to compute hashes.
     type Hasher: Hasher;
 
@@ -187,14 +139,10 @@ pub trait HashableView<C>: View<C> {
     /// Implementations do not need to include a type tag. However, the usual precautions
     /// to enforce collision resistance must be applied (e.g. including the length of a
     /// collection of values).
-    async fn hash_mut(&mut self) -> Result<<Self::Hasher as Hasher>::Output, ViewError>;
-
-    /// Computes the hash of the values.
-    ///
-    /// Implementations do not need to include a type tag. However, the usual precautions
-    /// to enforce collision resistance must be applied (e.g. including the length of a
-    /// collection of values).
     async fn hash(&self) -> Result<<Self::Hasher as Hasher>::Output, ViewError>;
+
+    /// Same as `hash` but guaranteed to be wait-free.
+    async fn hash_mut(&mut self) -> Result<<Self::Hasher as Hasher>::Output, ViewError>;
 }
 
 /// The requirement for the hasher type in [`HashableView`].
@@ -227,34 +175,35 @@ impl Hasher for sha3::Sha3_256 {
 }
 
 /// A [`View`] whose staged modifications can be saved in storage.
-#[async_trait]
-pub trait RootView<C>: View<C> {
+#[cfg_attr(not(web), trait_variant::make(Send))]
+pub trait RootView: View {
     /// Saves the root view to the database context
     async fn save(&mut self) -> Result<(), ViewError>;
+
+    /// Saves the root view to the database context and then drops it without calling `post_save`.
+    async fn save_and_drop(self) -> Result<(), ViewError>;
 }
 
 /// A [`View`] that also supports crypto hash
-#[async_trait]
-pub trait CryptoHashView<C>: HashableView<C> {
-    /// Computing the hash and attributing the type to it.
+#[cfg_attr(not(web), trait_variant::make(Send))]
+pub trait CryptoHashView: HashableView {
+    /// Computing the hash and attributing the type to it. May require locking.
     async fn crypto_hash(&self) -> Result<CryptoHash, ViewError>;
 
-    /// Computing the hash and attributing the type to it.
+    /// Same as `crypto_hash` but guaranteed to be wait-free.
     async fn crypto_hash_mut(&mut self) -> Result<CryptoHash, ViewError>;
 }
 
 /// A [`RootView`] that also supports crypto hash
-#[async_trait]
-pub trait CryptoHashRootView<C>: RootView<C> + CryptoHashView<C> {}
+#[cfg_attr(not(web), trait_variant::make(Send))]
+pub trait CryptoHashRootView: RootView + CryptoHashView {}
 
-/// A [`ClonableView`] supports being shared (unsafely) by cloning it.
+/// A view that can be shared (unsafely) by cloning it.
 ///
-/// Sharing is unsafe because by having two view instances for the same data, they may have invalid
-/// state if both are used for writing.
-///
-/// Sharing the view is guaranteed to not cause data races if only one of the shared view instances
-/// is used for writing at any given point in time.
-pub trait ClonableView<C>: View<C> {
+/// Note: Calling `flush` on any of the shared views will break the other views. Therefore,
+/// cloning views is only safe if `flush` only ever happens after all the copies but one
+/// have been dropped.
+pub trait ClonableView: View {
     /// Creates a clone of this view, sharing the underlying storage context but prone to
     /// data races which can corrupt the view state.
     fn clone_unchecked(&mut self) -> Result<Self, ViewError>;

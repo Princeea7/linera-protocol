@@ -1,6 +1,6 @@
-# <img src="https://github.com/linera-io/linera-protocol/assets/1105398/fe08c941-93af-4114-bb83-bcc0eaec95f9" width="250" height="90" />
+# <img src="https://github.com/linera-io/linera-protocol/assets/1105398/fe08c941-93af-4114-bb83-bcc0eaec95f9" width="250" height="85" />
 
-[![License](https://img.shields.io/badge/license-Apache-green.svg)](LICENSE)
+[![License](https://img.shields.io/github/license/linera-io/linera-protocol)](LICENSE)
 [![Build Status for Docker](https://github.com/linera-io/linera-protocol/actions/workflows/docker-compose.yml/badge.svg)](https://github.com/linera-io/linera-protocol/actions/workflows/docker-compose.yml)
 [![Build Status for Rust](https://github.com/linera-io/linera-protocol/actions/workflows/rust.yml/badge.svg)](https://github.com/linera-io/linera-protocol/actions/workflows/rust.yml)
 [![Build Status for Documentation](https://github.com/linera-io/linera-protocol/actions/workflows/documentation.yml/badge.svg)](https://github.com/linera-io/linera-protocol/actions/workflows/documentation.yml)
@@ -10,7 +10,9 @@
 <!-- [![Build Status for Kubernetes](https://github.com/linera-io/linera-protocol/actions/workflows/kubernetes.yml/badge.svg)](https://github.com/linera-io/linera-protocol/actions/workflows/kubernetes.yml) -->
 
 [Linera](https://linera.io) is a decentralized blockchain infrastructure designed for highly scalable,
-low-latency Web3 applications.
+secure, low-latency Web3 applications.
+
+## Documentation
 
 Visit our [developer page](https://linera.dev) and read our
 [whitepaper](https://linera.io/whitepaper) to learn more about the Linera protocol.
@@ -62,6 +64,9 @@ from low to high levels in the dependency graph)
 
 * [`examples`](./examples) Examples of Linera applications written in Rust.
 
+## Prerequisites
+
+See [`INSTALL.md`](./INSTALL.md) for software requirements to develop in this repo.
 
 ## Quickstart with the Linera CLI tool
 
@@ -87,8 +92,17 @@ FAUCET_URL=http://localhost:8080
 # If you're using a testnet, start here and run this instead:
 #   LINERA_TMP_DIR=$(mktemp -d)
 #   FAUCET_URL=https://faucet.testnet-XXX.linera.net  # for some value XXX
+```
 
-# Set the path of the future wallet.
+Enable logs for user applications:
+
+```bash
+export LINERA_APPLICATION_LOGS=true
+```
+
+Set the path of the future wallet:
+
+```bash
 export LINERA_WALLET="$LINERA_TMP_DIR/wallet.json"
 export LINERA_KEYSTORE="$LINERA_TMP_DIR/keystore.json"
 export LINERA_STORAGE="rocksdb:$LINERA_TMP_DIR/client.db"
@@ -100,9 +114,9 @@ linera wallet init --faucet $FAUCET_URL
 INFO1=($(linera wallet request-chain --faucet $FAUCET_URL))
 INFO2=($(linera wallet request-chain --faucet $FAUCET_URL))
 CHAIN1="${INFO1[0]}"
-ACCOUNT1="${INFO1[2]}"
+ACCOUNT1="${INFO1[1]}"
 CHAIN2="${INFO2[0]}"
-ACCOUNT2="${INFO2[2]}"
+ACCOUNT2="${INFO2[1]}"
 
 # Show the different chains tracked by the wallet.
 linera wallet show
@@ -120,13 +134,25 @@ linera query-balance "$CHAIN1"
 linera query-balance "$CHAIN2"
 
 # Now let's fund the user balances.
-linera transfer 5 --from "$CHAIN1" --to "$CHAIN1:$ACCOUNT1"
-linera transfer 2 --from "$CHAIN1:$ACCOUNT1" --to "$CHAIN2:$ACCOUNT2"
+linera transfer 5 --from "$CHAIN1" --to "$ACCOUNT1@$CHAIN1"
+linera transfer 2 --from "$ACCOUNT1@$CHAIN1" --to "$ACCOUNT2@$CHAIN2"
 
 # Query user balances again.
-linera query-balance "$CHAIN1:$ACCOUNT1"
-linera query-balance "$CHAIN2:$ACCOUNT2"
+linera query-balance "$ACCOUNT1@$CHAIN1"
+linera query-balance "$ACCOUNT2@$CHAIN2"
 ```
 
 More complex examples may be found in our [developer manual](https://linera.dev) as well
 as the [example applications](./examples) in this repository.
+
+## Contributing
+
+We welcome contributions from the community! If you'd like to contribute to the Linera protocol:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+For detailed guidelines, see our [contribution guide](./CONTRIBUTING.md).

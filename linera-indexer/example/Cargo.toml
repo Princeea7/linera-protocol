@@ -11,9 +11,11 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 default = ["rocksdb"]
-benchmark = ["linera-base/test", "linera-indexer/benchmark"]
 rocksdb = ["linera-indexer/rocksdb", "linera-indexer-plugins/rocksdb"]
 dynamodb = ["linera-indexer/dynamodb", "linera-indexer-plugins/dynamodb"]
 scylladb = ["linera-indexer/scylladb", "linera-indexer-plugins/scylladb"]
@@ -26,9 +28,12 @@ wasmtime = ["linera-indexer-plugins/wasmtime"]
 test = ["linera-service/test"]
 
 [dependencies]
+clap.workspace = true
 linera-indexer.workspace = true
 linera-indexer-plugins.workspace = true
+linera-version.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [dev-dependencies]
@@ -49,3 +54,7 @@ tracing.workspace = true
 [[bin]]
 name = "linera-indexer"
 path = "src/main.rs"
+
+[[bin]]
+name = "linera-indexer-grpc"
+path = "src/grpc_main.rs"

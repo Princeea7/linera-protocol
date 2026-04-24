@@ -4,17 +4,18 @@
 //! Core identifiers used by the Linera protocol.
 
 use std::{
-    fmt::{self, Display},
+    fmt,
     hash::{Hash, Hasher},
     marker::PhantomData,
-    str::FromStr,
 };
 
+use allocative::Allocative;
 #[cfg(with_revm)]
 use alloy_primitives::{Address, B256};
 use anyhow::{anyhow, Context};
-use async_graphql::SimpleObject;
+use async_graphql::{InputObject, SimpleObject};
 use custom_debug_derive::Debug;
+use derive_more::{Display, FromStr};
 use linera_witty::{WitLoad, WitStore, WitType};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -24,14 +25,22 @@ use crate::{
         AccountPublicKey, CryptoError, CryptoHash, Ed25519PublicKey, EvmPublicKey,
         Secp256k1PublicKey,
     },
-    data_types::{BlobContent, BlockHeight, ChainDescription},
+    data_types::{BlobContent, ChainDescription},
     doc_scalar, hex_debug,
     vm::VmRuntime,
 };
 
 /// An account owner.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, WitLoad, WitStore, WitType)]
+#[derive(
+    Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, WitLoad, WitStore, WitType, Allocative,
+)]
 #[cfg_attr(with_testing, derive(test_strategy::Arbitrary))]
+// TODO(#5166) we can be more specific here
+#[cfg_attr(
+    web,
+    derive(tsify::Tsify),
+    tsify(from_wasm_abi, into_wasm_abi, type = "string")
+)]
 pub enum AccountOwner {
     /// Short addresses reserved for the protocol.
     Reserved(u8),
@@ -39,6 +48,16 @@ pub enum AccountOwner {
     Address32(CryptoHash),
     /// 20-byte account EVM-compatible address.
     Address20([u8; 20]),
+}
+
+impl fmt::Debug for AccountOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reserved(byte) => f.debug_tuple("Reserved").field(byte).finish(),
+            Self::Address32(hash) => write!(f, "Address32({:?})", hash),
+            Self::Address20(bytes) => write!(f, "Address20({})", hex::encode(bytes)),
+        }
+    }
 }
 
 impl AccountOwner {
@@ -49,6 +68,48 @@ impl AccountOwner {
     pub fn is_chain(&self) -> bool {
         self == &AccountOwner::CHAIN
     }
+
+    /// The size of the `AccountOwner`.
+    pub fn size(&self) -> u32 {
+        match self {
+            AccountOwner::Reserved(_) => 1,
+            AccountOwner::Address32(_) => 32,
+            AccountOwner::Address20(_) => 20,
+        }
+    }
+
+    /// Gets the EVM address if possible
+    #[cfg(with_revm)]
+    pub fn to_evm_address(&self) -> Option<Address> {
+        match self {
+            AccountOwner::Address20(address) => Some(Address::from(address)),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(with_revm)]
+impl From<Address> for AccountOwner {
+    fn from(address: Address) -> Self {
+        let address = address.into_array();
+        AccountOwner::Address20(address)
+    }
+}
+
+impl From<[u8; 32]> for AccountOwner {
+    /// Converts a 32-byte array to an `AccountOwner`.
+    ///
+    /// If the first 12 bytes are zero, the remaining 20 bytes are treated as an
+    /// EVM-compatible `Address20`. Otherwise, the full 32 bytes become an `Address32`.
+    fn from(bytes: [u8; 32]) -> Self {
+        if bytes[..12].iter().all(|&b| b == 0) {
+            let mut addr = [0u8; 20];
+            addr.copy_from_slice(&bytes[12..]);
+            AccountOwner::Address20(addr)
+        } else {
+            AccountOwner::Address32(CryptoHash::from(bytes))
+        }
+    }
 }
 
 #[cfg(with_testing)]
@@ -58,14 +119,29 @@ impl From<CryptoHash> for AccountOwner {
     }
 }
 
-/// A system account.
+/// An account.
 #[derive(
-    Debug, PartialEq, Eq, Hash, Copy, Clone, Serialize, Deserialize, WitLoad, WitStore, WitType,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Copy,
+    Clone,
+    Serialize,
+    Deserialize,
+    WitLoad,
+    WitStore,
+    WitType,
+    SimpleObject,
+    InputObject,
+    Allocative,
 )]
+#[graphql(name = "AccountOutput", input_name = "Account")]
+#[cfg_attr(web, derive(tsify::Tsify), tsify(from_wasm_abi, into_wasm_abi))]
 pub struct Account {
     /// The chain of the account.
     pub chain_id: ChainId,
-    /// The owner of the account, or `None` for the chain balance.
+    /// The owner of the account.
     pub owner: AccountOwner,
 }
 
@@ -82,33 +158,58 @@ impl Account {
             owner: AccountOwner::CHAIN,
         }
     }
-}
 
-impl Display for Account {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.chain_id, self.owner)
+    /// An address used exclusively for tests
+    #[cfg(with_testing)]
+    pub fn burn_address(chain_id: ChainId) -> Self {
+        let hash = CryptoHash::test_hash("burn");
+        Account {
+            chain_id,
+            owner: hash.into(),
+        }
     }
 }
 
-impl FromStr for Account {
+impl fmt::Display for Account {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.owner, self.chain_id)
+    }
+}
+
+impl std::str::FromStr for Account {
     type Err = anyhow::Error;
 
     fn from_str(string: &str) -> Result<Self, Self::Err> {
-        let mut parts = string.splitn(2, ':');
-
-        let chain_id = parts
-            .next()
-            .context(
-                "Expecting an account formatted as `chain-id` or `chain-id:owner-type:address`",
-            )?
-            .parse()?;
-
-        if let Some(owner_string) = parts.next() {
+        if let Some((owner_string, chain_string)) = string.rsplit_once('@') {
             let owner = owner_string.parse::<AccountOwner>()?;
+            let chain_id = chain_string.parse()?;
             Ok(Account::new(chain_id, owner))
         } else {
+            let chain_id = string
+                .parse()
+                .context("Expecting an account formatted as `chain-id` or `owner@chain-id`")?;
             Ok(Account::chain(chain_id))
         }
+    }
+}
+
+/// A pair of owner and spender accounts for managing allowances.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Allocative)]
+pub struct OwnerSpender {
+    /// Account to withdraw from
+    pub owner: AccountOwner,
+    /// Account to do the withdrawing
+    pub spender: AccountOwner,
+}
+
+impl OwnerSpender {
+    /// Creates a new `OwnerSpender` pair.
+    /// Panics if owner and spender are the same.
+    pub fn new(owner: AccountOwner, spender: AccountOwner) -> Self {
+        if owner == spender {
+            panic!("owner should be different from spender");
+        }
+        Self { owner, spender }
     }
 }
 
@@ -127,9 +228,11 @@ impl FromStr for Account {
     WitLoad,
     WitStore,
     WitType,
+    Allocative,
 )]
 #[cfg_attr(with_testing, derive(test_strategy::Arbitrary))]
 #[cfg_attr(with_testing, derive(Default))]
+#[cfg_attr(web, derive(tsify::Tsify), tsify(from_wasm_abi, into_wasm_abi))]
 pub struct ChainId(pub CryptoHash);
 
 /// The type of the blob.
@@ -149,6 +252,7 @@ pub struct ChainId(pub CryptoHash);
     WitStore,
     WitLoad,
     Default,
+    Allocative,
 )]
 #[cfg_attr(with_testing, derive(test_strategy::Arbitrary))]
 pub enum BlobType {
@@ -169,13 +273,28 @@ pub enum BlobType {
     ChainDescription,
 }
 
-impl Display for BlobType {
+impl BlobType {
+    /// Returns whether the blob is of [`BlobType::Committee`] variant.
+    pub fn is_committee_blob(&self) -> bool {
+        match self {
+            BlobType::Data
+            | BlobType::ContractBytecode
+            | BlobType::ServiceBytecode
+            | BlobType::EvmBytecode
+            | BlobType::ApplicationDescription
+            | BlobType::ChainDescription => false,
+            BlobType::Committee => true,
+        }
+    }
+}
+
+impl fmt::Display for BlobType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
     }
 }
 
-impl FromStr for BlobType {
+impl std::str::FromStr for BlobType {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -185,7 +304,9 @@ impl FromStr for BlobType {
 }
 
 /// A content-addressed blob ID i.e. the hash of the `BlobContent`.
-#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Copy, Hash, Debug, WitType, WitStore, WitLoad)]
+#[derive(
+    Eq, PartialEq, Ord, PartialOrd, Clone, Copy, Hash, Debug, WitType, WitStore, WitLoad, Allocative,
+)]
 #[cfg_attr(with_testing, derive(test_strategy::Arbitrary, Default))]
 pub struct BlobId {
     /// The type of the blob.
@@ -201,14 +322,14 @@ impl BlobId {
     }
 }
 
-impl Display for BlobId {
+impl fmt::Display for BlobId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.blob_type, self.hash)?;
         Ok(())
     }
 }
 
-impl FromStr for BlobId {
+impl std::str::FromStr for BlobId {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -264,41 +385,33 @@ impl<'a> Deserialize<'a> for BlobId {
     }
 }
 
-/// The index of a message in a chain.
+/// Hash of a data blob.
 #[derive(
-    Eq,
-    PartialEq,
-    Ord,
-    PartialOrd,
-    Copy,
-    Clone,
-    Hash,
-    Debug,
-    Serialize,
-    Deserialize,
-    WitLoad,
-    WitStore,
-    WitType,
+    Eq, Hash, PartialEq, Debug, Serialize, Deserialize, Clone, Copy, WitType, WitLoad, WitStore,
 )]
-#[cfg_attr(with_testing, derive(Default, test_strategy::Arbitrary))]
-pub struct MessageId {
-    /// The chain ID that created the message.
-    pub chain_id: ChainId,
-    /// The height of the block that created the message.
-    pub height: BlockHeight,
-    /// The index of the message inside the block.
-    pub index: u32,
+pub struct DataBlobHash(pub CryptoHash);
+
+impl From<DataBlobHash> for BlobId {
+    fn from(hash: DataBlobHash) -> BlobId {
+        BlobId::new(hash.0, BlobType::Data)
+    }
 }
 
+// TODO(#5166) we can be more specific here (and also more generic)
+#[cfg_attr(web, wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section))]
+const _: &str = "export type ApplicationId = string;";
+
 /// A unique identifier for a user application from a blob.
-#[derive(Debug, WitLoad, WitStore, WitType)]
+#[derive(Debug, WitLoad, WitStore, WitType, Allocative)]
 #[cfg_attr(with_testing, derive(Default, test_strategy::Arbitrary))]
+#[allocative(bound = "A")]
 pub struct ApplicationId<A = ()> {
     /// The hash of the `ApplicationDescription` this refers to.
     pub application_description_hash: CryptoHash,
     #[witty(skip)]
     #[debug(skip)]
-    _phantom: PhantomData<A>,
+    #[allocative(skip)]
+    phantom: PhantomData<A>,
 }
 
 /// A unique identifier for an application.
@@ -316,7 +429,9 @@ pub struct ApplicationId<A = ()> {
     WitLoad,
     WitStore,
     WitType,
+    Allocative,
 )]
+#[cfg_attr(web, derive(tsify::Tsify), tsify(from_wasm_abi, into_wasm_abi))]
 pub enum GenericApplicationId {
     /// The system application.
     System,
@@ -324,20 +439,41 @@ pub enum GenericApplicationId {
     User(ApplicationId),
 }
 
-impl GenericApplicationId {
-    /// Returns the `ApplicationId`, or `None` if it is `System`.
-    pub fn user_application_id(&self) -> Option<&ApplicationId> {
-        if let GenericApplicationId::User(app_id) = self {
-            Some(app_id)
-        } else {
-            None
+impl fmt::Display for GenericApplicationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GenericApplicationId::System => Display::fmt("System", f),
+            GenericApplicationId::User(application_id) => {
+                Display::fmt("User:", f)?;
+                Display::fmt(&application_id, f)
+            }
         }
+    }
+}
+
+impl std::str::FromStr for GenericApplicationId {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "System" {
+            return Ok(GenericApplicationId::System);
+        }
+        if let Some(result) = s.strip_prefix("User:") {
+            let application_id = ApplicationId::from_str(result)?;
+            return Ok(GenericApplicationId::User(application_id));
+        }
+        Err(anyhow!("Invalid parsing of GenericApplicationId"))
     }
 }
 
 impl<A> From<ApplicationId<A>> for AccountOwner {
     fn from(app_id: ApplicationId<A>) -> Self {
-        AccountOwner::Address32(app_id.application_description_hash)
+        if app_id.is_evm() {
+            let hash_bytes = app_id.application_description_hash.as_bytes();
+            AccountOwner::Address20(hash_bytes[..20].try_into().unwrap())
+        } else {
+            AccountOwner::Address32(app_id.application_description_hash)
+        }
     }
 }
 
@@ -376,7 +512,7 @@ impl From<EvmPublicKey> for AccountOwner {
 }
 
 /// A unique identifier for a module.
-#[derive(Debug, WitLoad, WitStore, WitType)]
+#[derive(Debug, WitLoad, WitStore, WitType, Allocative)]
 #[cfg_attr(with_testing, derive(Default, test_strategy::Arbitrary))]
 pub struct ModuleId<Abi = (), Parameters = (), InstantiationArgument = ()> {
     /// The hash of the blob containing the contract bytecode.
@@ -387,7 +523,7 @@ pub struct ModuleId<Abi = (), Parameters = (), InstantiationArgument = ()> {
     pub vm_runtime: VmRuntime,
     #[witty(skip)]
     #[debug(skip)]
-    _phantom: PhantomData<(Abi, Parameters, InstantiationArgument)>,
+    phantom: PhantomData<(Abi, Parameters, InstantiationArgument)>,
 }
 
 /// The name of an event stream.
@@ -404,6 +540,7 @@ pub struct ModuleId<Abi = (), Parameters = (), InstantiationArgument = ()> {
     WitLoad,
     WitStore,
     WitType,
+    Allocative,
 )]
 pub struct StreamName(
     #[serde(with = "serde_bytes")]
@@ -420,6 +557,21 @@ where
     }
 }
 
+impl fmt::Display for StreamName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&hex::encode(&self.0), f)
+    }
+}
+
+impl std::str::FromStr for StreamName {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let vec = hex::decode(s)?;
+        Ok(StreamName(vec))
+    }
+}
+
 /// An event stream ID.
 #[derive(
     Clone,
@@ -429,18 +581,60 @@ where
     Ord,
     PartialEq,
     PartialOrd,
-    Serialize,
-    Deserialize,
     WitLoad,
     WitStore,
     WitType,
     SimpleObject,
+    InputObject,
+    Allocative,
 )]
+#[graphql(input_name = "StreamIdInput")]
 pub struct StreamId {
     /// The application that can add events to this stream.
     pub application_id: GenericApplicationId,
     /// The name of this stream: an application can have multiple streams with different names.
     pub stream_name: StreamName,
+}
+
+impl serde::Serialize for StreamId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_string())
+        } else {
+            use serde::ser::SerializeStruct;
+            let mut state = serializer.serialize_struct("StreamId", 2)?;
+            state.serialize_field("application_id", &self.application_id)?;
+            state.serialize_field("stream_name", &self.stream_name)?;
+            state.end()
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StreamId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            Self::from_str(&s).map_err(serde::de::Error::custom)
+        } else {
+            #[derive(serde::Deserialize)]
+            #[serde(rename = "StreamId")]
+            struct StreamIdHelper {
+                application_id: GenericApplicationId,
+                stream_name: StreamName,
+            }
+            let helper = StreamIdHelper::deserialize(deserializer)?;
+            Ok(StreamId {
+                application_id: helper.application_id,
+                stream_name: helper.stream_name,
+            })
+        }
+    }
 }
 
 impl StreamId {
@@ -449,6 +643,56 @@ impl StreamId {
         StreamId {
             application_id: GenericApplicationId::System,
             stream_name: name.into(),
+        }
+    }
+}
+
+/// The result of an `events_from_index`.
+#[derive(
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Clone,
+    Hash,
+    Serialize,
+    Deserialize,
+    WitLoad,
+    WitStore,
+    WitType,
+    SimpleObject,
+)]
+pub struct IndexAndEvent {
+    /// The index of the found event.
+    pub index: u32,
+    /// The event being returned.
+    pub event: Vec<u8>,
+}
+
+impl fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.application_id, f)?;
+        Display::fmt(":", f)?;
+        Display::fmt(&self.stream_name, f)
+    }
+}
+
+impl std::str::FromStr for StreamId {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts = s.rsplit_once(":");
+        if let Some((part0, part1)) = parts {
+            let application_id =
+                GenericApplicationId::from_str(part0).context("Invalid GenericApplicationId!")?;
+            let stream_name = StreamName::from_str(part1).context("Invalid StreamName!")?;
+            Ok(StreamId {
+                application_id,
+                stream_name,
+            })
+        } else {
+            Err(anyhow!("Invalid blob ID: {}", s))
         }
     }
 }
@@ -466,6 +710,7 @@ impl StreamId {
     WitStore,
     WitType,
     SimpleObject,
+    Allocative,
 )]
 pub struct EventId {
     /// The ID of the chain that generated this event.
@@ -474,6 +719,12 @@ pub struct EventId {
     pub stream_id: StreamId,
     /// The event index, i.e. the number of events in the stream before this one.
     pub index: u32,
+}
+
+impl fmt::Display for EventId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}:{}", self.chain_id, self.stream_id, self.index)
+    }
 }
 
 impl StreamName {
@@ -505,7 +756,7 @@ impl<Abi, Parameters, InstantiationArgument> PartialEq
             contract_blob_hash,
             service_blob_hash,
             vm_runtime,
-            _phantom,
+            phantom: _,
         } = other;
         self.contract_blob_hash == *contract_blob_hash
             && self.service_blob_hash == *service_blob_hash
@@ -534,7 +785,7 @@ impl<Abi, Parameters, InstantiationArgument> Ord
             contract_blob_hash,
             service_blob_hash,
             vm_runtime,
-            _phantom,
+            phantom: _,
         } = other;
         (
             self.contract_blob_hash,
@@ -553,7 +804,7 @@ impl<Abi, Parameters, InstantiationArgument> Hash
             contract_blob_hash: contract_blob_id,
             service_blob_hash: service_blob_id,
             vm_runtime: vm_runtime_id,
-            _phantom,
+            phantom: _,
         } = self;
         contract_blob_id.hash(state);
         service_blob_id.hash(state);
@@ -607,7 +858,7 @@ impl<'de, Abi, Parameters, InstantiationArgument> Deserialize<'de>
                 contract_blob_hash: serializable_module_id.contract_blob_hash,
                 service_blob_hash: serializable_module_id.service_blob_hash,
                 vm_runtime: serializable_module_id.vm_runtime,
-                _phantom: PhantomData,
+                phantom: PhantomData,
             })
         } else {
             let serializable_module_id = SerializableModuleId::deserialize(deserializer)?;
@@ -615,7 +866,7 @@ impl<'de, Abi, Parameters, InstantiationArgument> Deserialize<'de>
                 contract_blob_hash: serializable_module_id.contract_blob_hash,
                 service_blob_hash: serializable_module_id.service_blob_hash,
                 vm_runtime: serializable_module_id.vm_runtime,
-                _phantom: PhantomData,
+                phantom: PhantomData,
             })
         }
     }
@@ -632,7 +883,7 @@ impl ModuleId {
             contract_blob_hash,
             service_blob_hash,
             vm_runtime,
-            _phantom: PhantomData,
+            phantom: PhantomData,
         }
     }
 
@@ -644,7 +895,7 @@ impl ModuleId {
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
             vm_runtime: self.vm_runtime,
-            _phantom: PhantomData,
+            phantom: PhantomData,
         }
     }
 
@@ -683,17 +934,7 @@ impl<Abi, Parameters, InstantiationArgument> ModuleId<Abi, Parameters, Instantia
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
             vm_runtime: self.vm_runtime,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Leaves just the ABI of a module ID (if any).
-    pub fn just_abi(self) -> ModuleId<Abi> {
-        ModuleId {
-            contract_blob_hash: self.contract_blob_hash,
-            service_blob_hash: self.service_blob_hash,
-            vm_runtime: self.vm_runtime,
-            _phantom: PhantomData,
+            phantom: PhantomData,
         }
     }
 }
@@ -775,13 +1016,13 @@ impl<'de, A> Deserialize<'de> for ApplicationId<A> {
                 bcs::from_bytes(&application_id_bytes).map_err(serde::de::Error::custom)?;
             Ok(ApplicationId {
                 application_description_hash: application_id.application_description_hash,
-                _phantom: PhantomData,
+                phantom: PhantomData,
             })
         } else {
             let value = SerializableApplicationId::deserialize(deserializer)?;
             Ok(ApplicationId {
                 application_description_hash: value.application_description_hash,
-                _phantom: PhantomData,
+                phantom: PhantomData,
             })
         }
     }
@@ -792,7 +1033,7 @@ impl ApplicationId {
     pub fn new(application_description_hash: CryptoHash) -> Self {
         ApplicationId {
             application_description_hash,
-            _phantom: PhantomData,
+            phantom: PhantomData,
         }
     }
 
@@ -809,7 +1050,7 @@ impl ApplicationId {
     pub fn with_abi<A>(self) -> ApplicationId<A> {
         ApplicationId {
             application_description_hash: self.application_description_hash,
-            _phantom: PhantomData,
+            phantom: PhantomData,
         }
     }
 }
@@ -819,7 +1060,27 @@ impl<A> ApplicationId<A> {
     pub fn forget_abi(self) -> ApplicationId {
         ApplicationId {
             application_description_hash: self.application_description_hash,
-            _phantom: PhantomData,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<A> ApplicationId<A> {
+    /// Returns whether the `ApplicationId` is the one of an EVM application.
+    pub fn is_evm(&self) -> bool {
+        let bytes = self.application_description_hash.as_bytes();
+        bytes.0[20..] == [0; 12]
+    }
+}
+
+#[cfg(with_revm)]
+impl From<Address> for ApplicationId {
+    fn from(address: Address) -> ApplicationId {
+        let mut arr = [0_u8; 32];
+        arr[..20].copy_from_slice(address.as_slice());
+        ApplicationId {
+            application_description_hash: arr.into(),
+            phantom: PhantomData,
         }
     }
 }
@@ -879,7 +1140,7 @@ impl<'de> Deserialize<'de> for AccountOwner {
     }
 }
 
-impl Display for AccountOwner {
+impl fmt::Display for AccountOwner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AccountOwner::Reserved(value) => {
@@ -893,7 +1154,7 @@ impl Display for AccountOwner {
     }
 }
 
-impl FromStr for AccountOwner {
+impl std::str::FromStr for AccountOwner {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -905,7 +1166,7 @@ impl FromStr for AccountOwner {
             } else if s.len() == 40 {
                 let address = hex::decode(s)?;
                 if address.len() != 20 {
-                    anyhow::bail!("Invalid address length: {}", s);
+                    anyhow::bail!("Invalid address length: {s}");
                 }
                 let address = <[u8; 20]>::try_from(address.as_slice()).unwrap();
                 return Ok(AccountOwner::Address20(address));
@@ -918,17 +1179,17 @@ impl FromStr for AccountOwner {
                 }
             }
         }
-        anyhow::bail!("Invalid address value: {}", s);
+        anyhow::bail!("Invalid address value: {s}");
     }
 }
 
-impl Display for ChainId {
+impl fmt::Display for ChainId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Display::fmt(&self.0, f)
     }
 }
 
-impl FromStr for ChainId {
+impl std::str::FromStr for ChainId {
     type Err = CryptoError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -965,6 +1226,7 @@ impl From<ChainDescription> for ChainId {
 }
 
 bcs_scalar!(ApplicationId, "A unique identifier for a user application");
+doc_scalar!(DataBlobHash, "Hash of a Data Blob");
 doc_scalar!(
     GenericApplicationId,
     "A unique identifier for a user application or for the system application"
@@ -976,15 +1238,18 @@ doc_scalar!(
     ChainDescription."
 );
 doc_scalar!(StreamName, "The name of an event stream");
-bcs_scalar!(MessageId, "The index of a message in a chain");
+
 doc_scalar!(
     AccountOwner,
     "A unique identifier for a user or an application."
 );
-doc_scalar!(Account, "An account");
 doc_scalar!(
     BlobId,
     "A content-addressed blob ID i.e. the hash of the `BlobContent`"
+);
+bcs_scalar!(
+    OwnerSpender,
+    "A pair of owner and spender accounts for managing allowances"
 );
 
 #[cfg(test)]
@@ -996,6 +1261,7 @@ mod tests {
     use super::{AccountOwner, BlobType};
     use crate::{
         data_types::{Amount, ChainDescription, ChainOrigin, Epoch, InitialChainConfig, Timestamp},
+        identifiers::{ApplicationId, CryptoHash, GenericApplicationId, StreamId, StreamName},
         ownership::ChainOwnership,
     };
 
@@ -1004,11 +1270,11 @@ mod tests {
     fn chain_id_computing() {
         let example_chain_origin = ChainOrigin::Root(0);
         let example_chain_config = InitialChainConfig {
-            admin_id: None,
             epoch: Epoch::ZERO,
             ownership: ChainOwnership::single(AccountOwner::Reserved(0)),
             balance: Amount::ZERO,
-            committees: [(Epoch::ZERO, vec![])].into_iter().collect(),
+            min_active_epoch: Epoch::ZERO,
+            max_active_epoch: Epoch::ZERO,
             application_permissions: Default::default(),
         };
         let description = ChainDescription::new(
@@ -1018,7 +1284,7 @@ mod tests {
         );
         assert_eq!(
             description.id().to_string(),
-            "f8c2f02adc0ac763ffd74a32d02aa37490d869605c356a2da55e1d09e7d253bf"
+            "76e3a8c7b2449e6bc238642ac68b4311a809cb57328bea0a1ef9122f08a0053d"
         );
     }
 
@@ -1034,6 +1300,7 @@ mod tests {
     #[test]
     fn addresses() {
         assert_eq!(&AccountOwner::Reserved(0).to_string(), "0x00");
+        assert_eq!(AccountOwner::from_str("0x00").unwrap(), AccountOwner::CHAIN);
 
         let address = AccountOwner::from_str("0x10").unwrap();
         assert_eq!(address, AccountOwner::Reserved(16));
@@ -1062,5 +1329,81 @@ mod tests {
             "5487b70625ce71f7ee29154ad32aefa1c526cb483bdb783dea2e1d17bc497844"
         )
         .is_err());
+    }
+
+    #[test]
+    fn accounts() {
+        use super::{Account, ChainId};
+
+        const CHAIN: &str = "76e3a8c7b2449e6bc238642ac68b4311a809cb57328bea0a1ef9122f08a0053d";
+        const OWNER: &str = "0x5487b70625ce71f7ee29154ad32aefa1c526cb483bdb783dea2e1d17bc497844";
+
+        let chain_id = ChainId::from_str(CHAIN).unwrap();
+        let owner = AccountOwner::from_str(OWNER).unwrap();
+
+        // Chain-only account.
+        let account = Account::from_str(CHAIN).unwrap();
+        assert_eq!(
+            account,
+            Account::from_str(&format!("0x00@{CHAIN}")).unwrap()
+        );
+        assert_eq!(account, Account::chain(chain_id));
+        assert_eq!(account.to_string(), format!("0x00@{CHAIN}"));
+
+        // Account with owner.
+        let account = Account::from_str(&format!("{OWNER}@{CHAIN}")).unwrap();
+        assert_eq!(account, Account::new(chain_id, owner));
+        assert_eq!(account.to_string(), format!("{OWNER}@{CHAIN}"));
+    }
+
+    #[test]
+    fn stream_name() {
+        let vec = vec![32, 54, 120, 234];
+        let stream_name1 = StreamName(vec);
+        let stream_name2 = StreamName::from_str(&format!("{stream_name1}")).unwrap();
+        assert_eq!(stream_name1, stream_name2);
+    }
+
+    fn test_generic_application_id(application_id: GenericApplicationId) {
+        let application_id2 = GenericApplicationId::from_str(&format!("{application_id}")).unwrap();
+        assert_eq!(application_id, application_id2);
+    }
+
+    #[test]
+    fn generic_application_id() {
+        test_generic_application_id(GenericApplicationId::System);
+        let hash = CryptoHash::test_hash("test case");
+        let application_id = ApplicationId::new(hash);
+        test_generic_application_id(GenericApplicationId::User(application_id));
+    }
+
+    #[test]
+    fn stream_id() {
+        let hash = CryptoHash::test_hash("test case");
+        let application_id = ApplicationId::new(hash);
+        let application_id = GenericApplicationId::User(application_id);
+        let vec = vec![32, 54, 120, 234];
+        let stream_name = StreamName(vec);
+
+        let stream_id1 = StreamId {
+            application_id,
+            stream_name,
+        };
+        let stream_id2 = StreamId::from_str(&format!("{stream_id1}")).unwrap();
+        assert_eq!(stream_id1, stream_id2);
+    }
+
+    #[cfg(with_revm)]
+    #[test]
+    fn test_address_account_owner() {
+        use alloy_primitives::Address;
+        let mut vec = Vec::new();
+        for i in 0..20 {
+            vec.push(i as u8);
+        }
+        let address1 = Address::from_slice(&vec);
+        let account_owner = AccountOwner::from(address1);
+        let address2 = account_owner.to_evm_address().unwrap();
+        assert_eq!(address1, address2);
     }
 }

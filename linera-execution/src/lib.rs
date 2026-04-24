@@ -4,12 +4,11 @@
 //! This module manages the execution of the system application and the user applications in a
 //! Linera chain.
 
-#![deny(clippy::large_futures)]
-
 pub mod committee;
 pub mod evm;
 mod execution;
-mod execution_state_actor;
+pub mod execution_state_actor;
+#[cfg(with_graphql)]
 mod graphql;
 mod policy;
 mod resources;
@@ -21,12 +20,12 @@ mod transaction_tracker;
 mod util;
 mod wasm;
 
-use std::{any::Any, fmt, str::FromStr, sync::Arc};
+use std::{any::Any, collections::BTreeMap, fmt, ops::RangeInclusive, str::FromStr, sync::Arc};
 
+use allocative::Allocative;
 use async_graphql::SimpleObject;
 use async_trait::async_trait;
 use custom_debug_derive::Debug;
-use dashmap::DashMap;
 use derive_more::Display;
 #[cfg(web)]
 use js_sys::wasm_bindgen::JsValue;
@@ -35,24 +34,29 @@ use linera_base::{
     crypto::{BcsHashable, CryptoHash},
     data_types::{
         Amount, ApplicationDescription, ApplicationPermissions, ArithmeticError, Blob, BlockHeight,
-        DecompressionError, Epoch, SendMessageRequest, StreamUpdate, Timestamp,
+        Bytecode, DecompressionError, Epoch, NetworkDescription, SendMessageRequest, StreamUpdate,
+        Timestamp,
     },
-    doc_scalar, hex_debug, http,
+    doc_scalar, ensure, hex_debug, http,
     identifiers::{
-        Account, AccountOwner, ApplicationId, BlobId, BlobType, ChainId, EventId,
-        GenericApplicationId, MessageId, ModuleId, StreamName,
+        Account, AccountOwner, ApplicationId, BlobId, BlobType, ChainId, DataBlobHash, EventId,
+        GenericApplicationId, ModuleId, StreamId, StreamName,
     },
     ownership::ChainOwnership,
-    task,
+    vm::VmRuntime,
 };
-use linera_views::{batch::Batch, views::ViewError};
+use linera_views::{batch::Batch, ViewError};
 use serde::{Deserialize, Serialize};
 use system::AdminOperation;
 use thiserror::Error;
+pub use web_thread_pool::Pool as ThreadPool;
+use web_thread_select as web_thread;
 
 #[cfg(with_revm)]
 use crate::evm::EvmExecutionError;
-use crate::runtime::ContractSyncRuntime;
+use crate::system::{EpochEventData, EPOCH_STREAM_NAME};
+#[cfg(with_testing)]
+use crate::test_utils::dummy_chain_description;
 #[cfg(all(with_testing, with_wasm_runtime))]
 pub use crate::wasm::test as wasm_test;
 #[cfg(with_wasm_runtime)]
@@ -61,10 +65,11 @@ pub use crate::wasm::{
     ServiceRuntimeApi, WasmContractModule, WasmExecutionError, WasmServiceModule,
 };
 pub use crate::{
+    committee::{Committee, SharedCommittees},
     execution::{ExecutionStateView, ServiceRuntimeEndpoint},
-    execution_state_actor::ExecutionRequest,
+    execution_state_actor::{ExecutionRequest, ExecutionStateActor},
     policy::ResourceControlPolicy,
-    resources::{ResourceController, ResourceTracker},
+    resources::{BalanceHolder, ResourceController, ResourceTracker},
     runtime::{
         ContractSyncRuntimeHandle, ServiceRuntimeRequest, ServiceSyncRuntime,
         ServiceSyncRuntimeHandle,
@@ -75,9 +80,10 @@ pub use crate::{
     transaction_tracker::{TransactionOutcome, TransactionTracker},
 };
 
-/// The `linera.sol` library code to be included in solidity smart
+/// The `Linera.sol` library code to be included in solidity smart
 /// contracts using Linera features.
-pub const LINERA_SOL: &str = include_str!("../solidity/linera.sol");
+pub const LINERA_SOL: &str = include_str!("../solidity/Linera.sol");
+pub const LINERA_TYPES_SOL: &str = include_str!("../solidity/LineraTypes.sol");
 
 /// The maximum length of a stream name.
 const MAX_STREAM_NAME_LEN: usize = 64;
@@ -97,7 +103,7 @@ pub type UserContractInstance = Box<dyn UserContract>;
 pub type UserServiceInstance = Box<dyn UserService>;
 
 /// A factory trait to obtain a [`UserContract`] from a [`UserContractModule`]
-pub trait UserContractModule: dyn_clone::DynClone + Any + task::Post + Send + Sync {
+pub trait UserContractModule: dyn_clone::DynClone + Any + web_thread::Post + Send + Sync {
     fn instantiate(
         &self,
         runtime: ContractSyncRuntimeHandle,
@@ -113,7 +119,7 @@ impl<T: UserContractModule + Send + Sync + 'static> From<T> for UserContractCode
 dyn_clone::clone_trait_object!(UserContractModule);
 
 /// A factory trait to obtain a [`UserService`] from a [`UserServiceModule`]
-pub trait UserServiceModule: dyn_clone::DynClone + Any + task::Post + Send + Sync {
+pub trait UserServiceModule: dyn_clone::DynClone + Any + web_thread::Post + Send + Sync {
     fn instantiate(
         &self,
         runtime: ServiceSyncRuntimeHandle,
@@ -146,49 +152,87 @@ impl UserContractCode {
     }
 }
 
+pub struct JsVec<T>(pub Vec<T>);
+
 #[cfg(web)]
 const _: () = {
     // TODO(#2775): add a vtable pointer into the JsValue rather than assuming the
     // implementor
 
-    impl From<UserContractCode> for JsValue {
-        fn from(code: UserContractCode) -> JsValue {
-            let module: WasmContractModule = *(code.0 as Box<dyn Any>)
-                .downcast()
-                .expect("we only support Wasm modules on the Web for now");
-            module.into()
+    impl web_thread::AsJs for UserContractCode {
+        fn to_js(&self) -> Result<JsValue, JsValue> {
+            ((&*self.0) as &dyn Any)
+                .downcast_ref::<WasmContractModule>()
+                .expect("we only support Wasm modules on the Web for now")
+                .to_js()
+        }
+
+        fn from_js(value: JsValue) -> Result<Self, JsValue> {
+            WasmContractModule::from_js(value).map(Into::into)
         }
     }
 
-    impl From<UserServiceCode> for JsValue {
-        fn from(code: UserServiceCode) -> JsValue {
-            let module: WasmServiceModule = *(code.0 as Box<dyn Any>)
-                .downcast()
-                .expect("we only support Wasm modules on the Web for now");
-            module.into()
+    impl web_thread::Post for UserContractCode {
+        fn transferables(&self) -> js_sys::Array {
+            self.0.transferables()
         }
     }
 
-    impl TryFrom<JsValue> for UserContractCode {
-        type Error = JsValue;
-        fn try_from(value: JsValue) -> Result<Self, JsValue> {
-            WasmContractModule::try_from(value).map(Into::into)
+    impl web_thread::AsJs for UserServiceCode {
+        fn to_js(&self) -> Result<JsValue, JsValue> {
+            ((&*self.0) as &dyn Any)
+                .downcast_ref::<WasmServiceModule>()
+                .expect("we only support Wasm modules on the Web for now")
+                .to_js()
+        }
+
+        fn from_js(value: JsValue) -> Result<Self, JsValue> {
+            WasmServiceModule::from_js(value).map(Into::into)
         }
     }
 
-    impl TryFrom<JsValue> for UserServiceCode {
-        type Error = JsValue;
-        fn try_from(value: JsValue) -> Result<Self, JsValue> {
-            WasmServiceModule::try_from(value).map(Into::into)
+    impl web_thread::Post for UserServiceCode {
+        fn transferables(&self) -> js_sys::Array {
+            self.0.transferables()
+        }
+    }
+
+    impl<T: web_thread::AsJs> web_thread::AsJs for JsVec<T> {
+        fn to_js(&self) -> Result<JsValue, JsValue> {
+            let array = self
+                .0
+                .iter()
+                .map(T::to_js)
+                .collect::<Result<js_sys::Array, _>>()?;
+            Ok(array.into())
+        }
+
+        fn from_js(value: JsValue) -> Result<Self, JsValue> {
+            let array = js_sys::Array::from(&value);
+            let v = array
+                .into_iter()
+                .map(T::from_js)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(JsVec(v))
+        }
+    }
+
+    impl<T: web_thread::Post> web_thread::Post for JsVec<T> {
+        fn transferables(&self) -> js_sys::Array {
+            let mut array = js_sys::Array::new();
+            for x in &self.0 {
+                array = array.concat(&x.transferables());
+            }
+            array
         }
     }
 };
 
 /// A type for errors happening during execution.
-#[derive(Error, Debug)]
+#[derive(Error, Debug, strum::IntoStaticStr)]
 pub enum ExecutionError {
     #[error(transparent)]
-    ViewError(ViewError),
+    ViewError(#[from] ViewError),
     #[error(transparent)]
     ArithmeticError(#[from] ArithmeticError),
     #[error("User application reported an error: {0}")]
@@ -214,8 +258,6 @@ pub enum ExecutionError {
         caller_id: Box<ApplicationId>,
         callee_id: Box<ApplicationId>,
     },
-    #[error("Attempt to write to storage from a contract")]
-    ServiceWriteAttempt,
     #[error("Failed to load bytecode from storage {0:?}")]
     ApplicationBytecodeNotFound(Box<ApplicationDescription>),
     // TODO(#2927): support dynamic loading of modules on the Web
@@ -226,8 +268,8 @@ pub enum ExecutionError {
     ExcessiveRead,
     #[error("Excessive number of bytes written to storage")]
     ExcessiveWrite,
-    #[error("Block execution required too much fuel")]
-    MaximumFuelExceeded,
+    #[error("Block execution required too much fuel for VM {0}")]
+    MaximumFuelExceeded(VmRuntime),
     #[error("Services running as oracles in block took longer than allowed")]
     MaximumServiceOracleExecutionTimeExceeded,
     #[error("Service running as an oracle produced a response that's too large")]
@@ -238,10 +280,6 @@ pub enum ExecutionError {
     HttpResponseSizeLimitExceeded { limit: u64, size: u64 },
     #[error("Runtime failed to respond to application")]
     MissingRuntimeResponse,
-    #[error("Module ID {0:?} is invalid")]
-    InvalidModuleId(ModuleId),
-    #[error("AccountOwner is None")]
-    OwnerIsNone,
     #[error("Application is not authorized to perform system operations on this chain: {0:}")]
     UnauthorizedApplication(ApplicationId),
     #[error("Failed to make network reqwest: {0}")]
@@ -256,6 +294,8 @@ pub enum ExecutionError {
     BcsError(#[from] bcs::Error),
     #[error("Recorded response for oracle query has the wrong type")]
     OracleResponseMismatch,
+    #[error("Service oracle query tried to create operations: {0:?}")]
+    ServiceOracleQueryOperations(Vec<Operation>),
     #[error("Assertion failed: local time {local_time} is not earlier than {timestamp}")]
     AssertBefore {
         timestamp: Timestamp,
@@ -272,77 +312,160 @@ pub enum ExecutionError {
     UnauthorizedHttpRequest(reqwest::Url),
     #[error("Attempt to perform an HTTP request to an invalid URL")]
     InvalidUrlForHttpRequest(#[from] url::ParseError),
-    #[error("Failed to send contract code to worker thread: {0:?}")]
-    ContractModuleSend(#[from] linera_base::task::SendError<UserContractCode>),
-    #[error("Failed to send service code to worker thread: {0:?}")]
-    ServiceModuleSend(#[from] linera_base::task::SendError<UserServiceCode>),
+    #[error("Worker thread failure: {0:?}")]
+    Thread(#[from] web_thread::Error),
+    #[error("The chain being queried is not active {0}")]
+    InactiveChain(ChainId),
     #[error("Blobs not found: {0:?}")]
     BlobsNotFound(Vec<BlobId>),
+    #[error("Events not found: {0:?}")]
+    EventsNotFound(Vec<EventId>),
 
     #[error("Invalid HTTP header name used for HTTP request")]
     InvalidHeaderName(#[from] reqwest::header::InvalidHeaderName),
     #[error("Invalid HTTP header value used for HTTP request")]
     InvalidHeaderValue(#[from] reqwest::header::InvalidHeaderValue),
 
-    #[error("Invalid admin ID in new chain: {0}")]
-    InvalidNewChainAdminId(ChainId),
-    #[error("Invalid committees")]
-    InvalidCommittees,
+    #[error("No NetworkDescription found in storage")]
+    NoNetworkDescriptionFound,
     #[error("{epoch:?} is not recognized by chain {chain_id:}")]
     InvalidEpoch { chain_id: ChainId, epoch: Epoch },
     #[error("Transfer must have positive amount")]
     IncorrectTransferAmount,
-    #[error("Transfer from owned account must be authenticated by the right signer")]
+    #[error("Transfer from owned account must be authenticated by the right owner")]
     UnauthenticatedTransferOwner,
     #[error("The transferred amount must not exceed the balance of the current account {account}: {balance}")]
-    InsufficientFunding {
+    InsufficientBalance {
         balance: Amount,
         account: AccountOwner,
     },
-    #[error("Required execution fees exceeded the total funding available: {balance}")]
-    InsufficientFundingForFees { balance: Amount },
+    #[error("Required execution fees exceeded the total funding available. Fees {fees}, available balance: {balance}")]
+    FeesExceedFunding { fees: Amount, balance: Amount },
     #[error("Claim must have positive amount")]
     IncorrectClaimAmount,
-    #[error("Claim must be authenticated by the right signer")]
+    #[error("Claim must be authenticated by the right owner")]
     UnauthenticatedClaimOwner,
+    #[error("The transferred amount must not exceed the allowance for spender {spender} from owner {owner}: {allowance}")]
+    InsufficientAllowance {
+        allowance: Amount,
+        owner: AccountOwner,
+        spender: AccountOwner,
+    },
     #[error("Admin operations are only allowed on the admin chain.")]
     AdminOperationOnNonAdminChain,
     #[error("Failed to create new committee: expected {expected}, but got {provided}")]
     InvalidCommitteeEpoch { expected: Epoch, provided: Epoch },
     #[error("Failed to remove committee")]
     InvalidCommitteeRemoval,
-    #[error("Amount overflow")]
-    AmountOverflow,
-    #[error("Amount underflow")]
-    AmountUnderflow,
-    #[error("Chain balance overflow")]
-    BalanceOverflow,
-    #[error("Chain balance underflow")]
-    BalanceUnderflow,
-    #[error("Cannot decrease the chain's timestamp")]
-    TicksOutOfOrder,
-    #[error("Application {0:?} is not registered by the chain")]
-    UnknownApplicationId(Box<ApplicationId>),
-    #[error("Chain is not active yet.")]
-    InactiveChain,
     #[error("No recorded response for oracle query")]
     MissingOracleResponse,
     #[error("process_streams was not called for all stream updates")]
     UnprocessedStreams,
     #[error("Internal error: {0}")]
     InternalError(&'static str),
-    #[error("UpdateStreams contains an unknown event")]
-    EventNotFound(EventId),
     #[error("UpdateStreams is outdated")]
     OutdatedUpdateStreams,
 }
 
-impl From<ViewError> for ExecutionError {
-    fn from(error: ViewError) -> Self {
-        match error {
-            ViewError::BlobsNotFound(blob_ids) => ExecutionError::BlobsNotFound(blob_ids),
-            error => ExecutionError::ViewError(error),
+impl ExecutionError {
+    /// Returns whether this error is caused by an issue in the local node.
+    ///
+    /// Returns `false` whenever the error could be caused by a bad message from a peer.
+    pub fn is_local(&self) -> bool {
+        match self {
+            ExecutionError::ArithmeticError(_)
+            | ExecutionError::UserError(_)
+            | ExecutionError::DecompressionError(_)
+            | ExecutionError::InvalidPromise
+            | ExecutionError::CrossApplicationCallInFinalize { .. }
+            | ExecutionError::ReentrantCall(_)
+            | ExecutionError::ApplicationBytecodeNotFound(_)
+            | ExecutionError::UnsupportedDynamicApplicationLoad(_)
+            | ExecutionError::ExcessiveRead
+            | ExecutionError::ExcessiveWrite
+            | ExecutionError::MaximumFuelExceeded(_)
+            | ExecutionError::MaximumServiceOracleExecutionTimeExceeded
+            | ExecutionError::ServiceOracleResponseTooLarge
+            | ExecutionError::BlockTooLarge
+            | ExecutionError::HttpResponseSizeLimitExceeded { .. }
+            | ExecutionError::UnauthorizedApplication(_)
+            | ExecutionError::UnexpectedOracleResponse
+            | ExecutionError::JsonError(_)
+            | ExecutionError::BcsError(_)
+            | ExecutionError::OracleResponseMismatch
+            | ExecutionError::ServiceOracleQueryOperations(_)
+            | ExecutionError::AssertBefore { .. }
+            | ExecutionError::StreamNameTooLong
+            | ExecutionError::BlobTooLarge
+            | ExecutionError::BytecodeTooLarge
+            | ExecutionError::UnauthorizedHttpRequest(_)
+            | ExecutionError::InvalidUrlForHttpRequest(_)
+            | ExecutionError::InactiveChain(_)
+            | ExecutionError::BlobsNotFound(_)
+            | ExecutionError::EventsNotFound(_)
+            | ExecutionError::InvalidHeaderName(_)
+            | ExecutionError::InvalidHeaderValue(_)
+            | ExecutionError::InvalidEpoch { .. }
+            | ExecutionError::IncorrectTransferAmount
+            | ExecutionError::UnauthenticatedTransferOwner
+            | ExecutionError::InsufficientBalance { .. }
+            | ExecutionError::FeesExceedFunding { .. }
+            | ExecutionError::IncorrectClaimAmount
+            | ExecutionError::UnauthenticatedClaimOwner
+            | ExecutionError::InsufficientAllowance { .. }
+            | ExecutionError::AdminOperationOnNonAdminChain
+            | ExecutionError::InvalidCommitteeEpoch { .. }
+            | ExecutionError::InvalidCommitteeRemoval
+            | ExecutionError::MissingOracleResponse
+            | ExecutionError::UnprocessedStreams
+            | ExecutionError::OutdatedUpdateStreams
+            | ExecutionError::ViewError(ViewError::NotFound(_)) => false,
+            #[cfg(with_wasm_runtime)]
+            ExecutionError::WasmError(_) => false,
+            #[cfg(with_revm)]
+            ExecutionError::EvmError(..) => false,
+            ExecutionError::MissingRuntimeResponse
+            | ExecutionError::ViewError(_)
+            | ExecutionError::ReqwestError(_)
+            | ExecutionError::Thread(_)
+            | ExecutionError::NoNetworkDescriptionFound
+            | ExecutionError::InternalError(_)
+            | ExecutionError::IoError(_) => true,
         }
+    }
+
+    /// Returns the qualified error variant name for the `error_type` metric label,
+    /// e.g. `"ExecutionError::BlobsNotFound"`.
+    pub fn error_type(&self) -> String {
+        let variant: &'static str = self.into();
+        format!("ExecutionError::{variant}")
+    }
+
+    /// Returns whether this error is caused by a per-block limit being exceeded.
+    ///
+    /// These are errors that might succeed in a later block if the limit was only exceeded
+    /// due to accumulated transactions. Per-transaction or per-call limits are not included.
+    pub fn is_limit_error(&self) -> bool {
+        matches!(
+            self,
+            ExecutionError::ExcessiveRead
+                | ExecutionError::ExcessiveWrite
+                | ExecutionError::MaximumFuelExceeded(_)
+                | ExecutionError::MaximumServiceOracleExecutionTimeExceeded
+                | ExecutionError::BlockTooLarge
+        )
+    }
+
+    /// Returns whether this is a transient error that may resolve after syncing.
+    ///
+    /// Transient errors like missing blobs or events might succeed after the node syncs
+    /// with the network. These errors should fail the block entirely (not reject the message)
+    /// so the block can be retried later.
+    pub fn is_transient_error(&self) -> bool {
+        matches!(
+            self,
+            ExecutionError::BlobsNotFound(_) | ExecutionError::EventsNotFound(_)
+        )
     }
 }
 
@@ -371,8 +494,20 @@ pub trait UserService {
 }
 
 /// Configuration options for the execution runtime available to applications.
-#[derive(Clone, Copy, Default)]
-pub struct ExecutionRuntimeConfig {}
+#[derive(Clone, Copy)]
+pub struct ExecutionRuntimeConfig {
+    /// Whether contract log messages should be output.
+    /// This is typically enabled for clients but disabled for validators.
+    pub allow_application_logs: bool,
+}
+
+impl Default for ExecutionRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            allow_application_logs: true,
+        }
+    }
+}
 
 /// Requirements for the `extra` field in our state views (and notably the
 /// [`ExecutionStateView`]).
@@ -381,25 +516,91 @@ pub struct ExecutionRuntimeConfig {}
 pub trait ExecutionRuntimeContext {
     fn chain_id(&self) -> ChainId;
 
+    fn thread_pool(&self) -> &Arc<ThreadPool>;
+
     fn execution_runtime_config(&self) -> ExecutionRuntimeConfig;
 
-    fn user_contracts(&self) -> &Arc<DashMap<ApplicationId, UserContractCode>>;
+    fn user_contracts(&self) -> &Arc<papaya::HashMap<ApplicationId, UserContractCode>>;
 
-    fn user_services(&self) -> &Arc<DashMap<ApplicationId, UserServiceCode>>;
+    fn user_services(&self) -> &Arc<papaya::HashMap<ApplicationId, UserServiceCode>>;
 
     async fn get_user_contract(
         &self,
         description: &ApplicationDescription,
+        txn_tracker: &TransactionTracker,
     ) -> Result<UserContractCode, ExecutionError>;
 
     async fn get_user_service(
         &self,
         description: &ApplicationDescription,
+        txn_tracker: &TransactionTracker,
     ) -> Result<UserServiceCode, ExecutionError>;
 
-    async fn get_blob(&self, blob_id: BlobId) -> Result<Blob, ViewError>;
+    async fn get_blob(&self, blob_id: BlobId) -> Result<Option<Arc<Blob>>, ViewError>;
 
-    async fn get_event(&self, event_id: EventId) -> Result<Vec<u8>, ViewError>;
+    async fn get_event(&self, event_id: EventId) -> Result<Option<Arc<Vec<u8>>>, ViewError>;
+
+    async fn get_network_description(&self) -> Result<Option<NetworkDescription>, ViewError>;
+
+    /// Returns the committee whose serialized form hashes to `hash`. Returns
+    /// `ExecutionError::BlobsNotFound` if the committee blob is missing from
+    /// storage.
+    ///
+    /// Implementations should cache results in a process-wide
+    /// [`SharedCommittees`] map so that repeated lookups are cheap across
+    /// chains.
+    async fn get_or_load_committee_by_hash(
+        &self,
+        hash: CryptoHash,
+    ) -> Result<Arc<Committee>, ExecutionError>;
+
+    /// Returns the committee blob hashes for the epochs in the given range.
+    async fn get_committee_hashes(
+        &self,
+        epoch_range: RangeInclusive<Epoch>,
+    ) -> Result<BTreeMap<Epoch, CryptoHash>, ExecutionError> {
+        let net_description = self
+            .get_network_description()
+            .await?
+            .ok_or(ExecutionError::NoNetworkDescriptionFound)?;
+        let committee_hashes = futures::future::join_all(
+            (epoch_range.start().0..=epoch_range.end().0).map(|epoch| async move {
+                if epoch == 0 {
+                    // Genesis epoch is stored in NetworkDescription.
+                    Ok((Epoch(epoch), net_description.genesis_committee_blob_hash))
+                } else {
+                    let event_id = EventId {
+                        chain_id: net_description.admin_chain_id,
+                        stream_id: StreamId::system(EPOCH_STREAM_NAME),
+                        index: epoch,
+                    };
+                    let event = self
+                        .get_event(event_id.clone())
+                        .await?
+                        .ok_or_else(|| ExecutionError::EventsNotFound(vec![event_id]))?;
+                    let event_data: EpochEventData = bcs::from_bytes(&event)?;
+                    Ok((Epoch(epoch), event_data.blob_hash))
+                }
+            }),
+        )
+        .await;
+        let missing_events = committee_hashes
+            .iter()
+            .filter_map(|result| {
+                if let Err(ExecutionError::EventsNotFound(event_ids)) = result {
+                    return Some(event_ids);
+                }
+                None
+            })
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        ensure!(
+            missing_events.is_empty(),
+            ExecutionError::EventsNotFound(missing_events)
+        );
+        committee_hashes.into_iter().collect()
+    }
 
     async fn contains_blob(&self, blob_id: BlobId) -> Result<bool, ViewError>;
 
@@ -422,13 +623,9 @@ pub trait ExecutionRuntimeContext {
 pub struct OperationContext {
     /// The current chain ID.
     pub chain_id: ChainId,
-    /// The authenticated signer of the operation, if any.
+    /// The authenticated owner of the operation, if any.
     #[debug(skip_if = Option::is_none)]
-    pub authenticated_signer: Option<AccountOwner>,
-    /// `None` if this is the transaction entrypoint or the caller doesn't want this particular
-    /// call to be authenticated (e.g. for safety reasons).
-    #[debug(skip_if = Option::is_none)]
-    pub authenticated_caller_id: Option<ApplicationId>,
+    pub authenticated_owner: Option<AccountOwner>,
     /// The current block height.
     pub height: BlockHeight,
     /// The consensus round number, if this is a block that gets validated in a multi-leader round.
@@ -441,11 +638,13 @@ pub struct OperationContext {
 pub struct MessageContext {
     /// The current chain ID.
     pub chain_id: ChainId,
+    /// The chain ID where the message originated from.
+    pub origin: ChainId,
     /// Whether the message was rejected by the original receiver and is now bouncing back.
     pub is_bouncing: bool,
-    /// The authenticated signer of the operation that created the message, if any.
+    /// The authenticated owner of the operation that created the message, if any.
     #[debug(skip_if = Option::is_none)]
-    pub authenticated_signer: Option<AccountOwner>,
+    pub authenticated_owner: Option<AccountOwner>,
     /// Where to send a refund for the unused part of each grant after execution, if any.
     #[debug(skip_if = Option::is_none)]
     pub refund_grant_to: Option<Account>,
@@ -455,9 +654,6 @@ pub struct MessageContext {
     pub round: Option<u32>,
     /// The timestamp of the block executing the message.
     pub timestamp: Timestamp,
-    /// The ID of the message (based on the operation height and index in the remote
-    /// certificate).
-    pub message_id: MessageId,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -498,9 +694,9 @@ impl From<OperationContext> for ProcessStreamsContext {
 pub struct FinalizeContext {
     /// The current chain ID.
     pub chain_id: ChainId,
-    /// The authenticated signer of the operation, if any.
+    /// The authenticated owner of the operation, if any.
     #[debug(skip_if = Option::is_none)]
-    pub authenticated_signer: Option<AccountOwner>,
+    pub authenticated_owner: Option<AccountOwner>,
     /// The current block height.
     pub height: BlockHeight,
     /// The consensus round number, if this is a block that gets validated in a multi-leader round.
@@ -538,6 +734,12 @@ pub trait BaseRuntime {
     /// The current application creator's chain ID.
     fn application_creator_chain_id(&mut self) -> Result<ChainId, ExecutionError>;
 
+    /// Returns the description of the given application.
+    fn read_application_description(
+        &mut self,
+        application_id: ApplicationId,
+    ) -> Result<ApplicationDescription, ExecutionError>;
+
     /// The current application parameters.
     fn application_parameters(&mut self) -> Result<Vec<u8>, ExecutionError>;
 
@@ -556,8 +758,23 @@ pub trait BaseRuntime {
     /// Reads balance owners.
     fn read_balance_owners(&mut self) -> Result<Vec<AccountOwner>, ExecutionError>;
 
+    /// Reads the allowance for a given owner-spender pair.
+    fn read_allowance(
+        &mut self,
+        owner: AccountOwner,
+        spender: AccountOwner,
+    ) -> Result<Amount, ExecutionError>;
+
+    /// Reads all allowances.
+    fn read_allowances(
+        &mut self,
+    ) -> Result<Vec<(AccountOwner, AccountOwner, Amount)>, ExecutionError>;
+
     /// Reads the current ownership configuration for this chain.
     fn chain_ownership(&mut self) -> Result<ChainOwnership, ExecutionError>;
+
+    /// Reads the current application permissions for this chain.
+    fn application_permissions(&mut self) -> Result<ApplicationPermissions, ExecutionError>;
 
     /// Tests whether a key exists in the key-value store
     #[cfg(feature = "test")]
@@ -682,10 +899,25 @@ pub trait BaseRuntime {
     fn assert_before(&mut self, timestamp: Timestamp) -> Result<(), ExecutionError>;
 
     /// Reads a data blob specified by a given hash.
-    fn read_data_blob(&mut self, hash: &CryptoHash) -> Result<Vec<u8>, ExecutionError>;
+    fn read_data_blob(&mut self, hash: DataBlobHash) -> Result<Vec<u8>, ExecutionError>;
 
     /// Asserts the existence of a data blob with the given hash.
-    fn assert_data_blob_exists(&mut self, hash: &CryptoHash) -> Result<(), ExecutionError>;
+    fn assert_data_blob_exists(&mut self, hash: DataBlobHash) -> Result<(), ExecutionError>;
+
+    /// Returns true if the corresponding contract uses a zero amount of storage.
+    fn has_empty_storage(&mut self, application: ApplicationId) -> Result<bool, ExecutionError>;
+
+    /// Returns the maximum blob size from the `ResourceControlPolicy`.
+    fn maximum_blob_size(&mut self) -> Result<u64, ExecutionError>;
+
+    /// Returns whether contract log messages should be output.
+    /// This is typically enabled for clients but disabled for validators.
+    fn allow_application_logs(&mut self) -> Result<bool, ExecutionError>;
+
+    /// Sends a log message (used for forwarding logs from web workers to the main thread).
+    /// This is a fire-and-forget operation - errors are silently ignored.
+    #[cfg(web)]
+    fn send_log(&mut self, message: String, level: tracing::log::Level);
 }
 
 pub trait ServiceRuntime: BaseRuntime {
@@ -704,25 +936,28 @@ pub trait ServiceRuntime: BaseRuntime {
 }
 
 pub trait ContractRuntime: BaseRuntime {
-    /// The authenticated signer for this execution, if there is one.
-    fn authenticated_signer(&mut self) -> Result<Option<AccountOwner>, ExecutionError>;
-
-    /// The current message ID, if there is one.
-    fn message_id(&mut self) -> Result<Option<MessageId>, ExecutionError>;
+    /// The authenticated owner for this execution, if there is one.
+    fn authenticated_owner(&mut self) -> Result<Option<AccountOwner>, ExecutionError>;
 
     /// If the current message (if there is one) was rejected by its destination and is now
     /// bouncing back.
     fn message_is_bouncing(&mut self) -> Result<Option<bool>, ExecutionError>;
 
+    /// The chain ID where the current message originated from, if there is one.
+    fn message_origin_chain_id(&mut self) -> Result<Option<ChainId>, ExecutionError>;
+
     /// The optional authenticated caller application ID, if it was provided and if there is one
     /// based on the execution context.
     fn authenticated_caller_id(&mut self) -> Result<Option<ApplicationId>, ExecutionError>;
 
+    /// Returns the maximum gas fuel per block.
+    fn maximum_fuel_per_block(&mut self, vm_runtime: VmRuntime) -> Result<u64, ExecutionError>;
+
     /// Returns the amount of execution fuel remaining before execution is aborted.
-    fn remaining_fuel(&mut self) -> Result<u64, ExecutionError>;
+    fn remaining_fuel(&mut self, vm_runtime: VmRuntime) -> Result<u64, ExecutionError>;
 
     /// Consumes some of the execution fuel.
-    fn consume_fuel(&mut self, fuel: u64) -> Result<(), ExecutionError>;
+    fn consume_fuel(&mut self, fuel: u64, vm_runtime: VmRuntime) -> Result<(), ExecutionError>;
 
     /// Schedules a message to be sent.
     fn send_message(&mut self, message: SendMessageRequest<Vec<u8>>) -> Result<(), ExecutionError>;
@@ -739,6 +974,23 @@ pub trait ContractRuntime: BaseRuntime {
     fn claim(
         &mut self,
         source: Account,
+        destination: Account,
+        amount: Amount,
+    ) -> Result<(), ExecutionError>;
+
+    /// Approves spender to withdraw amount from owner's account.
+    fn approve(
+        &mut self,
+        owner: AccountOwner,
+        spender: AccountOwner,
+        amount: Amount,
+    ) -> Result<(), ExecutionError>;
+
+    /// Transfers amount from owner to destination using spender's allowance.
+    fn transfer_from(
+        &mut self,
+        owner: AccountOwner,
+        spender: AccountOwner,
         destination: Account,
         amount: Amount,
     ) -> Result<(), ExecutionError>;
@@ -799,6 +1051,9 @@ pub trait ContractRuntime: BaseRuntime {
     /// Closes the current chain.
     fn close_chain(&mut self) -> Result<(), ExecutionError>;
 
+    /// Changes the ownership of the current chain.
+    fn change_ownership(&mut self, ownership: ChainOwnership) -> Result<(), ExecutionError>;
+
     /// Changes the application permissions on the current chain.
     fn change_application_permissions(
         &mut self,
@@ -814,7 +1069,22 @@ pub trait ContractRuntime: BaseRuntime {
         required_application_ids: Vec<ApplicationId>,
     ) -> Result<ApplicationId, ExecutionError>;
 
-    /// Returns the round in which this block was validated.
+    /// Returns the next application index, which is equal to the number of
+    /// new applications created so far in this block.
+    fn peek_application_index(&mut self) -> Result<u32, ExecutionError>;
+
+    /// Creates a new data blob and returns its hash.
+    fn create_data_blob(&mut self, bytes: Vec<u8>) -> Result<DataBlobHash, ExecutionError>;
+
+    /// Publishes a module with contract and service bytecode and returns the module ID.
+    fn publish_module(
+        &mut self,
+        contract: Bytecode,
+        service: Bytecode,
+        vm_runtime: VmRuntime,
+    ) -> Result<ModuleId, ExecutionError>;
+
+    /// Returns the multi-leader round in which this block was validated.
     fn validation_round(&mut self) -> Result<Option<u32>, ExecutionError>;
 
     /// Writes a batch of changes.
@@ -822,7 +1092,9 @@ pub trait ContractRuntime: BaseRuntime {
 }
 
 /// An operation to be executed in a block.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Allocative, strum::AsRefStr,
+)]
 pub enum Operation {
     /// A system operation.
     System(Box<SystemOperation>),
@@ -838,7 +1110,9 @@ pub enum Operation {
 impl BcsHashable<'_> for Operation {}
 
 /// A message to be sent and possibly executed in the receiver's block.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Allocative, strum::AsRefStr,
+)]
 pub enum Message {
     /// A system message.
     System(SystemMessage),
@@ -914,7 +1188,7 @@ pub enum QueryResponse {
 }
 
 /// The kind of outgoing message being sent.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Copy)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Copy, Allocative)]
 pub enum MessageKind {
     /// The message can be skipped or rejected. No receipt is requested.
     Simple,
@@ -928,14 +1202,25 @@ pub enum MessageKind {
     Bouncing,
 }
 
+impl Display for MessageKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MessageKind::Simple => write!(f, "Simple"),
+            MessageKind::Protected => write!(f, "Protected"),
+            MessageKind::Tracked => write!(f, "Tracked"),
+            MessageKind::Bouncing => write!(f, "Bouncing"),
+        }
+    }
+}
+
 /// A posted message together with routing information.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject, Allocative)]
 pub struct OutgoingMessage {
     /// The destination of the message.
     pub destination: ChainId,
     /// The user authentication carried by the message, if any.
     #[debug(skip_if = Option::is_none)]
-    pub authenticated_signer: Option<AccountOwner>,
+    pub authenticated_owner: Option<AccountOwner>,
     /// A grant to pay for the message execution.
     #[debug(skip_if = Amount::is_zero)]
     pub grant: Amount,
@@ -951,11 +1236,11 @@ pub struct OutgoingMessage {
 impl BcsHashable<'_> for OutgoingMessage {}
 
 impl OutgoingMessage {
-    /// Creates a new simple outgoing message with no grant and no authenticated signer.
+    /// Creates a new simple outgoing message with no grant and no authenticated owner.
     pub fn new(recipient: ChainId, message: impl Into<Message>) -> Self {
         OutgoingMessage {
             destination: recipient,
-            authenticated_signer: None,
+            authenticated_owner: None,
             grant: Amount::ZERO,
             refund_grant_to: None,
             kind: MessageKind::Simple,
@@ -969,18 +1254,18 @@ impl OutgoingMessage {
         self
     }
 
-    /// Returns the same message, with the specified authenticated signer.
-    pub fn with_authenticated_signer(mut self, authenticated_signer: Option<AccountOwner>) -> Self {
-        self.authenticated_signer = authenticated_signer;
+    /// Returns the same message, with the specified authenticated owner.
+    pub fn with_authenticated_owner(mut self, authenticated_owner: Option<AccountOwner>) -> Self {
+        self.authenticated_owner = authenticated_owner;
         self
     }
 }
 
 impl OperationContext {
     /// Returns an account for the refund.
-    /// Returns `None` if there is no authenticated signer of the [`OperationContext`].
+    /// Returns `None` if there is no authenticated owner of the [`OperationContext`].
     fn refund_grant_to(&self) -> Option<Account> {
-        self.authenticated_signer.map(|owner| Account {
+        self.authenticated_owner.map(|owner| Account {
             chain_id: self.chain_id,
             owner,
         })
@@ -991,11 +1276,12 @@ impl OperationContext {
 #[derive(Clone)]
 pub struct TestExecutionRuntimeContext {
     chain_id: ChainId,
+    thread_pool: Arc<ThreadPool>,
     execution_runtime_config: ExecutionRuntimeConfig,
-    user_contracts: Arc<DashMap<ApplicationId, UserContractCode>>,
-    user_services: Arc<DashMap<ApplicationId, UserServiceCode>>,
-    blobs: Arc<DashMap<BlobId, Blob>>,
-    events: Arc<DashMap<EventId, Vec<u8>>>,
+    user_contracts: Arc<papaya::HashMap<ApplicationId, UserContractCode>>,
+    user_services: Arc<papaya::HashMap<ApplicationId, UserServiceCode>>,
+    blobs: Arc<papaya::HashMap<BlobId, Blob>>,
+    events: Arc<papaya::HashMap<EventId, Vec<u8>>>,
 }
 
 #[cfg(with_testing)]
@@ -1003,6 +1289,7 @@ impl TestExecutionRuntimeContext {
     pub fn new(chain_id: ChainId, execution_runtime_config: ExecutionRuntimeConfig) -> Self {
         Self {
             chain_id,
+            thread_pool: Arc::new(ThreadPool::new(20)),
             execution_runtime_config,
             user_contracts: Arc::default(),
             user_services: Arc::default(),
@@ -1020,25 +1307,30 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
         self.chain_id
     }
 
+    fn thread_pool(&self) -> &Arc<ThreadPool> {
+        &self.thread_pool
+    }
+
     fn execution_runtime_config(&self) -> ExecutionRuntimeConfig {
         self.execution_runtime_config
     }
 
-    fn user_contracts(&self) -> &Arc<DashMap<ApplicationId, UserContractCode>> {
+    fn user_contracts(&self) -> &Arc<papaya::HashMap<ApplicationId, UserContractCode>> {
         &self.user_contracts
     }
 
-    fn user_services(&self) -> &Arc<DashMap<ApplicationId, UserServiceCode>> {
+    fn user_services(&self) -> &Arc<papaya::HashMap<ApplicationId, UserServiceCode>> {
         &self.user_services
     }
 
     async fn get_user_contract(
         &self,
         description: &ApplicationDescription,
+        _txn_tracker: &TransactionTracker,
     ) -> Result<UserContractCode, ExecutionError> {
-        let application_id = description.into();
-        Ok(self
-            .user_contracts()
+        let application_id: ApplicationId = description.into();
+        let pinned = self.user_contracts().pin();
+        Ok(pinned
             .get(&application_id)
             .ok_or_else(|| {
                 ExecutionError::ApplicationBytecodeNotFound(Box::new(description.clone()))
@@ -1049,10 +1341,11 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
     async fn get_user_service(
         &self,
         description: &ApplicationDescription,
+        _txn_tracker: &TransactionTracker,
     ) -> Result<UserServiceCode, ExecutionError> {
-        let application_id = description.into();
-        Ok(self
-            .user_services()
+        let application_id: ApplicationId = description.into();
+        let pinned = self.user_services().pin();
+        Ok(pinned
             .get(&application_id)
             .ok_or_else(|| {
                 ExecutionError::ApplicationBytecodeNotFound(Box::new(description.clone()))
@@ -1060,28 +1353,53 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
             .clone())
     }
 
-    async fn get_blob(&self, blob_id: BlobId) -> Result<Blob, ViewError> {
-        Ok(self
-            .blobs
-            .get(&blob_id)
-            .ok_or_else(|| ViewError::BlobsNotFound(vec![blob_id]))?
-            .clone())
+    async fn get_blob(&self, blob_id: BlobId) -> Result<Option<Arc<Blob>>, ViewError> {
+        Ok(self.blobs.pin().get(&blob_id).cloned().map(Arc::new))
     }
 
-    async fn get_event(&self, event_id: EventId) -> Result<Vec<u8>, ViewError> {
-        Ok(self
-            .events
-            .get(&event_id)
-            .ok_or_else(|| ViewError::EventsNotFound(vec![event_id]))?
-            .clone())
+    async fn get_event(&self, event_id: EventId) -> Result<Option<Arc<Vec<u8>>>, ViewError> {
+        Ok(self.events.pin().get(&event_id).cloned().map(Arc::new))
+    }
+
+    async fn get_network_description(&self) -> Result<Option<NetworkDescription>, ViewError> {
+        let pinned = self.blobs.pin();
+        let genesis_committee_blob_hash = pinned
+            .iter()
+            .find(|(_, blob)| blob.content().blob_type() == BlobType::Committee)
+            .map_or_else(
+                || CryptoHash::test_hash("genesis committee"),
+                |(_, blob)| blob.id().hash,
+            );
+        Ok(Some(NetworkDescription {
+            admin_chain_id: dummy_chain_description(0).id(),
+            genesis_config_hash: CryptoHash::test_hash("genesis config"),
+            genesis_timestamp: Timestamp::from(0),
+            genesis_committee_blob_hash,
+            name: "dummy network description".to_string(),
+        }))
+    }
+
+    async fn get_or_load_committee_by_hash(
+        &self,
+        hash: CryptoHash,
+    ) -> Result<Arc<Committee>, ExecutionError> {
+        let blob_id = BlobId::new(hash, BlobType::Committee);
+        let blob = self
+            .blobs
+            .pin()
+            .get(&blob_id)
+            .cloned()
+            .ok_or(ExecutionError::BlobsNotFound(vec![blob_id]))?;
+        let committee: Committee = bcs::from_bytes(blob.bytes())?;
+        Ok(Arc::new(committee))
     }
 
     async fn contains_blob(&self, blob_id: BlobId) -> Result<bool, ViewError> {
-        Ok(self.blobs.contains_key(&blob_id))
+        Ok(self.blobs.pin().contains_key(&blob_id))
     }
 
     async fn contains_event(&self, event_id: EventId) -> Result<bool, ViewError> {
-        Ok(self.events.contains_key(&event_id))
+        Ok(self.events.pin().contains_key(&event_id))
     }
 
     #[cfg(with_testing)]
@@ -1089,8 +1407,9 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
         &self,
         blobs: impl IntoIterator<Item = Blob> + Send,
     ) -> Result<(), ViewError> {
+        let pinned = self.blobs.pin();
         for blob in blobs {
-            self.blobs.insert(blob.id(), blob);
+            pinned.insert(blob.id(), blob);
         }
 
         Ok(())
@@ -1101,8 +1420,9 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
         &self,
         events: impl IntoIterator<Item = (EventId, Vec<u8>)> + Send,
     ) -> Result<(), ViewError> {
+        let pinned = self.events.pin();
         for (event_id, bytes) in events {
-            self.events.insert(event_id, bytes);
+            pinned.insert(event_id, bytes);
         }
 
         Ok(())
@@ -1273,14 +1593,16 @@ impl From<Vec<u8>> for QueryResponse {
 /// The state of a blob of binary data.
 #[derive(Eq, PartialEq, Debug, Hash, Clone, Serialize, Deserialize)]
 pub struct BlobState {
-    /// Hash of the last `Certificate` that published or used this blob.
-    pub last_used_by: CryptoHash,
+    /// Hash of the last `Certificate` that published or used this blob. If empty, the
+    /// blob is known to be published by a confirmed certificate but we may not have fully
+    /// processed this certificate just yet.
+    pub last_used_by: Option<CryptoHash>,
     /// The `ChainId` of the chain that published the change
     pub chain_id: ChainId,
     /// The `BlockHeight` of the chain that published the change
     pub block_height: BlockHeight,
-    /// Epoch of the `last_used_by` certificate.
-    pub epoch: Epoch,
+    /// Epoch of the `last_used_by` certificate (if any).
+    pub epoch: Option<Epoch>,
 }
 
 /// The runtime to use for running the application.

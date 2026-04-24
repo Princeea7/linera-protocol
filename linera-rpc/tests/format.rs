@@ -3,20 +3,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use linera_base::{
-    crypto::{AccountPublicKey, AccountSignature, TestString},
+    crypto::{AccountPublicKey, AccountSignature, CryptoHash, TestString},
     data_types::{BlobContent, ChainDescription, ChainOrigin, OracleResponse, Round},
-    identifiers::{AccountOwner, BlobType, GenericApplicationId},
+    identifiers::{Account, AccountOwner, BlobType, GenericApplicationId},
     ownership::ChainOwnership,
     vm::VmRuntime,
 };
 use linera_chain::{
-    data_types::MessageAction,
+    data_types::{MessageAction, OriginalProposal, Transaction},
     manager::{ChainManagerInfo, LockingBlock},
     types::{Certificate, CertificateKind, ConfirmedBlock, Timeout, ValidatedBlock},
 };
-use linera_core::{data_types::CrossChainRequest, node::NodeError};
+use linera_core::{data_types::CrossChainRequest, node::NodeError, worker::Reason};
 use linera_execution::{
-    system::{AdminOperation, Recipient, SystemMessage, SystemOperation},
+    system::{AdminOperation, SystemMessage, SystemOperation},
     Message, MessageKind, Operation,
 };
 use linera_rpc::RpcMessage;
@@ -47,7 +47,7 @@ fn get_registry() -> Result<Registry> {
         let evm_public_key = evm_secret_key.public();
         tracer.trace_value(&mut samples, &evm_public_key)?;
         let evm_signature = linera_base::crypto::EvmSignature::new(
-            &TestString::new("signature".to_string()),
+            CryptoHash::new(&TestString::new("signature".to_string())),
             &evm_secret_key,
         );
         tracer.trace_value(&mut samples, &evm_signature)?;
@@ -57,12 +57,14 @@ fn get_registry() -> Result<Registry> {
     tracer.trace_type::<AccountSignature>(&samples)?;
     tracer.trace_type::<Round>(&samples)?;
     tracer.trace_type::<OracleResponse>(&samples)?;
-    tracer.trace_type::<Recipient>(&samples)?;
+    tracer.trace_type::<Account>(&samples)?;
     tracer.trace_type::<SystemOperation>(&samples)?;
     tracer.trace_type::<AdminOperation>(&samples)?;
     tracer.trace_type::<SystemMessage>(&samples)?;
     tracer.trace_type::<Operation>(&samples)?;
     tracer.trace_type::<Message>(&samples)?;
+    tracer.trace_type::<Transaction>(&samples)?;
+    tracer.trace_type::<OriginalProposal>(&samples)?;
     tracer.trace_type::<VmRuntime>(&samples)?;
     tracer.trace_type::<MessageAction>(&samples)?;
     tracer.trace_type::<MessageKind>(&samples)?;
@@ -79,6 +81,7 @@ fn get_registry() -> Result<Registry> {
     tracer.trace_type::<ChainManagerInfo>(&samples)?;
     tracer.trace_type::<CrossChainRequest>(&samples)?;
     tracer.trace_type::<NodeError>(&samples)?;
+    tracer.trace_type::<Reason>(&samples)?;
     tracer.trace_type::<RpcMessage>(&samples)?;
     tracer.trace_type::<BlobType>(&samples)?;
     tracer.trace_type::<BlobContent>(&samples)?;

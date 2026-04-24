@@ -17,55 +17,77 @@
 //! [class3]: map_view::CustomMapView
 
 #[cfg(with_metrics)]
-use std::sync::LazyLock;
+use linera_base::prometheus_util::MeasureLatency as _;
 
 #[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{
-        exponential_bucket_latencies, register_histogram_vec, MeasureLatency,
-    },
-    prometheus::HistogramVec,
-};
+mod metrics {
+    use std::sync::LazyLock;
 
-#[cfg(with_metrics)]
-/// The runtime of hash computation
-static MAP_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "map_view_hash_runtime",
-        "MapView hash runtime",
-        &[],
-        exponential_bucket_latencies(5.0),
-    )
-});
+    use linera_base::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+    use prometheus::HistogramVec;
+
+    /// The runtime of hash computation
+    pub static MAP_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "map_view_hash_runtime",
+            "MapView hash runtime",
+            &[],
+            exponential_bucket_latencies(5.0),
+        )
+    });
+}
 
 use std::{
     borrow::{Borrow, Cow},
     collections::{btree_map::Entry, BTreeMap},
     marker::PhantomData,
-    mem,
 };
 
-use async_trait::async_trait;
+use allocative::Allocative;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     batch::Batch,
     common::{
-        from_bytes_option, get_interval, CustomSerialize, DeletionSet, HasherOutput,
+        from_bytes_option, get_key_range_for_prefix, CustomSerialize, DeletionSet, HasherOutput,
         SuffixClosedSetIterator, Update,
     },
-    context::Context,
+    context::{BaseKey, Context},
     hashable_wrapper::WrappedHashableContainerView,
-    store::{KeyIterable, KeyValueIterable},
-    views::{ClonableView, HashableView, Hasher, View, ViewError},
+    historical_hash_wrapper::HistoricallyHashableView,
+    store::ReadableKeyValueStore as _,
+    views::{ClonableView, HashableView, Hasher, ReplaceContext, View, ViewError},
 };
 
 /// A view that supports inserting and removing values indexed by `Vec<u8>`.
-#[derive(Debug)]
+#[derive(Debug, Allocative)]
+#[allocative(bound = "C, V: Allocative")]
 pub struct ByteMapView<C, V> {
+    /// The view context.
+    #[allocative(skip)]
     context: C,
+    /// Tracks deleted key prefixes.
     deletion_set: DeletionSet,
+    /// Pending changes not yet persisted to storage.
     updates: BTreeMap<Vec<u8>, Update<V>>,
+}
+
+impl<C: Context, C2: Context, V> ReplaceContext<C2> for ByteMapView<C, V>
+where
+    V: Send + Sync + Serialize + Clone,
+{
+    type Target = ByteMapView<C2, V>;
+
+    async fn with_context(
+        &mut self,
+        ctx: impl FnOnce(&Self::Context) -> C2 + Clone,
+    ) -> Self::Target {
+        ByteMapView {
+            context: ctx(&self.context),
+            deletion_set: self.deletion_set.clone(),
+            updates: self.updates.clone(),
+        }
+    }
 }
 
 /// Whether we have a value or its serialization.
@@ -102,17 +124,17 @@ where
     }
 }
 
-#[async_trait]
-impl<C, V> View<C> for ByteMapView<C, V>
+impl<C, V> View for ByteMapView<C, V>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     V: Send + Sync + Serialize,
 {
     const NUM_INIT_KEYS: usize = 0;
 
-    fn context(&self) -> &C {
-        &self.context
+    type Context = C;
+
+    fn context(&self) -> C {
+        self.context.clone()
     }
 
     fn pre_load(_context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
@@ -127,10 +149,6 @@ where
         })
     }
 
-    async fn load(context: C) -> Result<Self, ViewError> {
-        Self::post_load(context, &[])
-    }
-
     fn rollback(&mut self) {
         self.updates.clear();
         self.deletion_set.rollback();
@@ -140,33 +158,38 @@ where
         self.deletion_set.has_pending_changes() || !self.updates.is_empty()
     }
 
-    fn flush(&mut self, batch: &mut Batch) -> Result<bool, ViewError> {
+    fn pre_save(&self, batch: &mut Batch) -> Result<bool, ViewError> {
         let mut delete_view = false;
         if self.deletion_set.delete_storage_first {
             delete_view = true;
-            batch.delete_key_prefix(self.context.base_key());
-            for (index, update) in mem::take(&mut self.updates) {
+            batch.delete_key_prefix(self.context.base_key().bytes.clone());
+            for (index, update) in &self.updates {
                 if let Update::Set(value) = update {
-                    let key = self.context.base_index(&index);
-                    batch.put_key_value(key, &value)?;
+                    let key = self.context.base_key().base_index(index);
+                    batch.put_key_value(key, value)?;
                     delete_view = false;
                 }
             }
         } else {
-            for index in mem::take(&mut self.deletion_set.deleted_prefixes) {
-                let key = self.context.base_index(&index);
+            for index in &self.deletion_set.deleted_prefixes {
+                let key = self.context.base_key().base_index(index);
                 batch.delete_key_prefix(key);
             }
-            for (index, update) in mem::take(&mut self.updates) {
-                let key = self.context.base_index(&index);
+            for (index, update) in &self.updates {
+                let key = self.context.base_key().base_index(index);
                 match update {
                     Update::Removed => batch.delete_key(key),
-                    Update::Set(value) => batch.put_key_value(key, &value)?,
+                    Update::Set(value) => batch.put_key_value(key, value)?,
                 }
             }
         }
-        self.deletion_set.delete_storage_first = false;
         Ok(delete_view)
+    }
+
+    fn post_save(&mut self) {
+        self.updates.clear();
+        self.deletion_set.delete_storage_first = false;
+        self.deletion_set.deleted_prefixes.clear();
     }
 
     fn clear(&mut self) {
@@ -175,11 +198,9 @@ where
     }
 }
 
-impl<C, V> ClonableView<C> for ByteMapView<C, V>
+impl<C: Clone, V: Clone> ClonableView for ByteMapView<C, V>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    V: Clone + Send + Sync + Serialize,
+    Self: View,
 {
     fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
         Ok(ByteMapView {
@@ -193,7 +214,6 @@ where
 impl<C, V> ByteMapView<C, V>
 where
     C: Context,
-    ViewError: From<C::Error>,
 {
     /// Inserts or resets the value of a key of the map.
     /// ```rust
@@ -249,7 +269,7 @@ where
     pub fn remove_by_prefix(&mut self, key_prefix: Vec<u8>) {
         let key_list = self
             .updates
-            .range(get_interval(key_prefix.clone()))
+            .range(get_key_range_for_prefix(key_prefix.clone()))
             .map(|x| x.0.to_vec())
             .collect::<Vec<_>>();
         for key in key_list {
@@ -287,15 +307,14 @@ where
         if self.deletion_set.contains_prefix_of(short_key) {
             return Ok(false);
         }
-        let key = self.context.base_index(short_key);
-        Ok(self.context.contains_key(&key).await?)
+        let key = self.context.base_key().base_index(short_key);
+        Ok(self.context.store().contains_key(&key).await?)
     }
 }
 
 impl<C, V> ByteMapView<C, V>
 where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     V: Clone + DeserializeOwned + 'static,
 {
     /// Reads the value at the given position, if any.
@@ -321,8 +340,8 @@ where
         if self.deletion_set.contains_prefix_of(short_key) {
             return Ok(None);
         }
-        let key = self.context.base_index(short_key);
-        Ok(self.context.read_value(&key).await?)
+        let key = self.context.base_key().base_index(short_key);
+        Ok(self.context.store().read_value(&key).await?)
     }
 
     /// Reads the values at the given positions, if any.
@@ -350,15 +369,49 @@ where
                 }
             } else if !self.deletion_set.contains_prefix_of(&short_key) {
                 missed_indices.push(i);
-                let key = self.context.base_index(&short_key);
+                let key = self.context.base_key().base_index(&short_key);
                 vector_query.push(key);
             }
         }
-        let values = self.context.read_multi_values_bytes(vector_query).await?;
+        let values = self
+            .context
+            .store()
+            .read_multi_values_bytes(&vector_query)
+            .await?;
         for (i, value) in missed_indices.into_iter().zip(values) {
             results[i] = from_bytes_option(&value)?;
         }
         Ok(results)
+    }
+
+    /// Reads the key-value pairs at the given positions, if any.
+    /// ```rust
+    /// # tokio_test::block_on(async {
+    /// # use linera_views::context::MemoryContext;
+    /// # use linera_views::map_view::ByteMapView;
+    /// # use linera_views::views::View;
+    /// # let context = MemoryContext::new_for_testing(());
+    /// let mut map = ByteMapView::load(context).await.unwrap();
+    /// map.insert(vec![0, 1], String::from("Hello"));
+    /// let pairs = map
+    ///     .multi_get_pairs(vec![vec![0, 1], vec![0, 2]])
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(
+    ///     pairs,
+    ///     vec![
+    ///         (vec![0, 1], Some(String::from("Hello"))),
+    ///         (vec![0, 2], None)
+    ///     ]
+    /// );
+    /// # })
+    /// ```
+    pub async fn multi_get_pairs(
+        &self,
+        short_keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<(Vec<u8>, Option<V>)>, ViewError> {
+        let values = self.multi_get(short_keys.clone()).await?;
+        Ok(short_keys.into_iter().zip(values).collect())
     }
 
     /// Obtains a mutable reference to a value at a given position if available.
@@ -382,8 +435,8 @@ where
                 if self.deletion_set.contains_prefix_of(short_key) {
                     None
                 } else {
-                    let key = self.context.base_index(short_key);
-                    let value = self.context.read_value(&key).await?;
+                    let key = self.context.base_key().base_index(short_key);
+                    let value = self.context.store().read_value(&key).await?;
                     value.map(|value| e.insert(Update::Set(value)))
                 }
             }
@@ -399,7 +452,6 @@ where
 impl<C, V> ByteMapView<C, V>
 where
     C: Context,
-    ViewError: From<C::Error>,
     V: Clone + Serialize + DeserializeOwned + 'static,
 {
     /// Applies the function f on each index (aka key) which has the assigned prefix.
@@ -434,32 +486,31 @@ where
         F: FnMut(&[u8]) -> Result<bool, ViewError> + Send,
     {
         let prefix_len = prefix.len();
-        let mut updates = self.updates.range(get_interval(prefix.clone()));
+        let mut updates = self.updates.range(get_key_range_for_prefix(prefix.clone()));
         let mut update = updates.next();
         if !self.deletion_set.contains_prefix_of(&prefix) {
             let iter = self
                 .deletion_set
                 .deleted_prefixes
-                .range(get_interval(prefix.clone()));
+                .range(get_key_range_for_prefix(prefix.clone()));
             let mut suffix_closed_set = SuffixClosedSetIterator::new(prefix_len, iter);
-            let base = self.context.base_index(&prefix);
-            for index in self.context.find_keys_by_prefix(&base).await?.iterator() {
-                let index = index?;
+            let base = self.context.base_key().base_index(&prefix);
+            for index in self.context.store().find_keys_by_prefix(&base).await? {
                 loop {
                     match update {
-                        Some((key, value)) if &key[prefix_len..] <= index => {
+                        Some((key, value)) if &key[prefix_len..] <= index.as_slice() => {
                             if let Update::Set(_) = value {
                                 if !f(&key[prefix_len..])? {
                                     return Ok(());
                                 }
                             }
                             update = updates.next();
-                            if &key[prefix_len..] == index {
+                            if key[prefix_len..] == index {
                                 break;
                             }
                         }
                         _ => {
-                            if !suffix_closed_set.find_key(index) && !f(index)? {
+                            if !suffix_closed_set.find_key(&index) && !f(&index)? {
                                 return Ok(());
                             }
                             break;
@@ -594,10 +645,10 @@ where
     /// map.insert(vec![0, 1], String::from("Hello"));
     /// map.insert(vec![1, 2], String::from("Bonjour"));
     /// map.insert(vec![2, 2], String::from("Hallo"));
-    /// assert_eq!(map.count().await.unwrap(), 3);
+    /// assert_eq!(map.iterative_count().await.unwrap(), 3);
     /// # })
     /// ```
-    pub async fn count(&self) -> Result<usize, ViewError> {
+    pub async fn iterative_count(&self) -> Result<usize, ViewError> {
         let mut count = 0;
         let prefix = Vec::new();
         self.for_each_key(
@@ -626,22 +677,21 @@ where
         F: FnMut(&[u8], ValueOrBytes<'a, V>) -> Result<bool, ViewError> + Send,
     {
         let prefix_len = prefix.len();
-        let mut updates = self.updates.range(get_interval(prefix.clone()));
+        let mut updates = self.updates.range(get_key_range_for_prefix(prefix.clone()));
         let mut update = updates.next();
         if !self.deletion_set.contains_prefix_of(&prefix) {
             let iter = self
                 .deletion_set
                 .deleted_prefixes
-                .range(get_interval(prefix.clone()));
+                .range(get_key_range_for_prefix(prefix.clone()));
             let mut suffix_closed_set = SuffixClosedSetIterator::new(prefix_len, iter);
-            let base = self.context.base_index(&prefix);
-            for entry in self
+            let base = self.context.base_key().base_index(&prefix);
+            for (index, bytes) in self
                 .context
+                .store()
                 .find_key_values_by_prefix(&base)
                 .await?
-                .into_iterator_owned()
             {
-                let (index, bytes) = entry?;
                 loop {
                     match update {
                         Some((key, value)) if key[prefix_len..] <= *index => {
@@ -796,7 +846,6 @@ where
 impl<C, V> ByteMapView<C, V>
 where
     C: Context,
-    ViewError: From<C::Error>,
     V: Clone + Send + Serialize + DeserializeOwned + 'static,
 {
     /// Returns the list of keys and values of the map matching a prefix
@@ -858,8 +907,7 @@ where
 
 impl<C, V> ByteMapView<C, V>
 where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     V: Default + DeserializeOwned + 'static,
 {
     /// Obtains a mutable reference to a value at a given position.
@@ -885,8 +933,13 @@ where
                 e.insert(Update::Set(V::default()))
             }
             Entry::Vacant(e) => {
-                let key = self.context.base_index(short_key);
-                let value = self.context.read_value(&key).await?.unwrap_or_default();
+                let key = self.context.base_key().base_index(short_key);
+                let value = self
+                    .context
+                    .store()
+                    .read_value(&key)
+                    .await?
+                    .unwrap_or_default();
                 e.insert(Update::Set(value))
             }
             Entry::Occupied(entry) => {
@@ -901,17 +954,15 @@ where
             }
         };
         let Update::Set(value) = update else {
-            unreachable!()
+            unreachable!("ByteMapView::get_mut_or_default: update entry is Update::Removed but every match arm above must insert Update::Set")
         };
         Ok(value)
     }
 }
 
-#[async_trait]
-impl<C, V> HashableView<C> for ByteMapView<C, V>
+impl<C, V> HashableView for ByteMapView<C, V>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     V: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
 {
     type Hasher = sha3::Sha3_256;
@@ -922,7 +973,7 @@ where
 
     async fn hash(&self) -> Result<<Self::Hasher as Hasher>::Output, ViewError> {
         #[cfg(with_metrics)]
-        let _hash_latency = MAP_VIEW_HASH_RUNTIME.measure_latency();
+        let _hash_latency = metrics::MAP_VIEW_HASH_RUNTIME.measure_latency();
         let mut hasher = sha3::Sha3_256::default();
         let mut count = 0u32;
         let prefix = Vec::new();
@@ -944,23 +995,47 @@ where
 
 /// A `View` that has a type for keys. The ordering of the entries
 /// is determined by the serialization of the context.
-#[derive(Debug)]
+#[derive(Debug, Allocative)]
+#[allocative(bound = "C, I, V: Allocative")]
 pub struct MapView<C, I, V> {
+    /// The underlying map storing entries with serialized keys.
     map: ByteMapView<C, V>,
+    /// Phantom data for the key type.
+    #[allocative(skip)]
     _phantom: PhantomData<I>,
 }
 
-#[async_trait]
-impl<C, I, V> View<C> for MapView<C, I, V>
+impl<C, C2, I, V> ReplaceContext<C2> for MapView<C, I, V>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    I: Sync,
+    C: Context,
+    C2: Context,
+    I: Send + Sync,
+    V: Send + Sync + Serialize + Clone,
+{
+    type Target = MapView<C2, I, V>;
+
+    async fn with_context(
+        &mut self,
+        ctx: impl FnOnce(&Self::Context) -> C2 + Clone,
+    ) -> Self::Target {
+        MapView {
+            map: self.map.with_context(ctx).await,
+            _phantom: self._phantom,
+        }
+    }
+}
+
+impl<C, I, V> View for MapView<C, I, V>
+where
+    C: Context,
+    I: Send + Sync,
     V: Send + Sync + Serialize,
 {
     const NUM_INIT_KEYS: usize = ByteMapView::<C, V>::NUM_INIT_KEYS;
 
-    fn context(&self) -> &C {
+    type Context = C;
+
+    fn context(&self) -> C {
         self.map.context()
     }
 
@@ -976,10 +1051,6 @@ where
         })
     }
 
-    async fn load(context: C) -> Result<Self, ViewError> {
-        Self::post_load(context, &[])
-    }
-
     fn rollback(&mut self) {
         self.map.rollback()
     }
@@ -988,8 +1059,12 @@ where
         self.map.has_pending_changes().await
     }
 
-    fn flush(&mut self, batch: &mut Batch) -> Result<bool, ViewError> {
-        self.map.flush(batch)
+    fn pre_save(&self, batch: &mut Batch) -> Result<bool, ViewError> {
+        self.map.pre_save(batch)
+    }
+
+    fn post_save(&mut self) {
+        self.map.post_save()
     }
 
     fn clear(&mut self) {
@@ -997,12 +1072,10 @@ where
     }
 }
 
-impl<C, I, V> ClonableView<C> for MapView<C, I, V>
+impl<C, I, V: Clone> ClonableView for MapView<C, I, V>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    I: Sync,
-    V: Clone + Send + Sync + Serialize,
+    Self: View,
+    ByteMapView<C, V>: ClonableView,
 {
     fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
         Ok(MapView {
@@ -1014,8 +1087,7 @@ where
 
 impl<C, I, V> MapView<C, I, V>
 where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     I: Serialize,
 {
     /// Inserts or resets a value at an index.
@@ -1038,7 +1110,7 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.map.insert(short_key, value);
         Ok(())
     }
@@ -1060,7 +1132,7 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.map.remove(short_key);
         Ok(())
     }
@@ -1088,15 +1160,14 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.map.contains_key(&short_key).await
     }
 }
 
 impl<C, I, V> MapView<C, I, V>
 where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     I: Serialize,
     V: Clone + DeserializeOwned + 'static,
 {
@@ -1121,8 +1192,81 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.map.get(&short_key).await
+    }
+
+    /// Reads values at given positions, if any.
+    /// ```rust
+    /// # tokio_test::block_on(async {
+    /// # use linera_views::context::MemoryContext;
+    /// # use linera_views::map_view::MapView;
+    /// # use linera_views::views::View;
+    /// # let context = MemoryContext::new_for_testing(());
+    /// let mut map: MapView<_, u32, _> = MapView::load(context).await.unwrap();
+    /// map.insert(&(37 as u32), String::from("Hello"));
+    /// map.insert(&(49 as u32), String::from("Bonjour"));
+    /// assert_eq!(
+    ///     map.multi_get(&[37 as u32, 49 as u32, 64 as u32])
+    ///         .await
+    ///         .unwrap(),
+    ///     [
+    ///         Some(String::from("Hello")),
+    ///         Some(String::from("Bonjour")),
+    ///         None
+    ///     ]
+    /// );
+    /// assert_eq!(map.get(&(34 as u32)).await.unwrap(), None);
+    /// # })
+    /// ```
+    pub async fn multi_get<'a, Q>(
+        &self,
+        indices: impl IntoIterator<Item = &'a Q>,
+    ) -> Result<Vec<Option<V>>, ViewError>
+    where
+        I: Borrow<Q>,
+        Q: Serialize + 'a,
+    {
+        let short_keys = indices
+            .into_iter()
+            .map(|index| BaseKey::derive_short_key(index))
+            .collect::<Result<_, _>>()?;
+        self.map.multi_get(short_keys).await
+    }
+
+    /// Reads the index-value pairs at the given positions, if any.
+    /// ```rust
+    /// # tokio_test::block_on(async {
+    /// # use linera_views::context::MemoryContext;
+    /// # use linera_views::map_view::MapView;
+    /// # use linera_views::views::View;
+    /// # let context = MemoryContext::new_for_testing(());
+    /// let mut map: MapView<_, u32, _> = MapView::load(context).await.unwrap();
+    /// map.insert(&(37 as u32), String::from("Hello"));
+    /// map.insert(&(49 as u32), String::from("Bonjour"));
+    /// assert_eq!(
+    ///     map.multi_get_pairs([37 as u32, 49 as u32, 64 as u32])
+    ///         .await
+    ///         .unwrap(),
+    ///     vec![
+    ///         (37 as u32, Some(String::from("Hello"))),
+    ///         (49 as u32, Some(String::from("Bonjour"))),
+    ///         (64 as u32, None)
+    ///     ]
+    /// );
+    /// # })
+    /// ```
+    pub async fn multi_get_pairs<Q>(
+        &self,
+        indices: impl IntoIterator<Item = Q>,
+    ) -> Result<Vec<(Q, Option<V>)>, ViewError>
+    where
+        I: Borrow<Q>,
+        Q: Serialize + Clone,
+    {
+        let indices_vec = indices.into_iter().collect::<Vec<Q>>();
+        let values = self.multi_get(indices_vec.iter()).await?;
+        Ok(indices_vec.into_iter().zip(values).collect())
     }
 
     /// Obtains a mutable reference to a value at a given position if available
@@ -1148,15 +1292,14 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.map.get_mut(&short_key).await
     }
 }
 
 impl<C, I, V> MapView<C, I, V>
 where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     I: Send + DeserializeOwned,
     V: Clone + Sync + Serialize + DeserializeOwned + 'static,
 {
@@ -1213,7 +1356,7 @@ where
         self.map
             .for_each_key_while(
                 |key| {
-                    let index = C::deserialize_value(key)?;
+                    let index = BaseKey::deserialize_value(key)?;
                     f(index)
                 },
                 prefix,
@@ -1250,7 +1393,7 @@ where
         self.map
             .for_each_key(
                 |key| {
-                    let index = C::deserialize_value(key)?;
+                    let index = BaseKey::deserialize_value(key)?;
                     f(index)
                 },
                 prefix,
@@ -1290,7 +1433,7 @@ where
         self.map
             .for_each_key_value_while(
                 |key, value| {
-                    let index = C::deserialize_value(key)?;
+                    let index = BaseKey::deserialize_value(key)?;
                     f(index, value)
                 },
                 prefix,
@@ -1327,7 +1470,7 @@ where
         self.map
             .for_each_key_value(
                 |key, value| {
-                    let index = C::deserialize_value(key)?;
+                    let index = BaseKey::deserialize_value(key)?;
                     f(index, value)
                 },
                 prefix,
@@ -1339,8 +1482,7 @@ where
 
 impl<C, I, V> MapView<C, I, V>
 where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     I: Send + DeserializeOwned,
     V: Clone + Sync + Send + Serialize + DeserializeOwned + 'static,
 {
@@ -1381,18 +1523,17 @@ where
     /// let mut map: MapView<_, String, _> = MapView::load(context).await.unwrap();
     /// map.insert("Italian", String::from("Ciao"));
     /// map.insert("French", String::from("Bonjour"));
-    /// assert_eq!(map.count().await.unwrap(), 2);
+    /// assert_eq!(map.iterative_count().await.unwrap(), 2);
     /// # })
     /// ```
-    pub async fn count(&self) -> Result<usize, ViewError> {
-        self.map.count().await
+    pub async fn iterative_count(&self) -> Result<usize, ViewError> {
+        self.map.iterative_count().await
     }
 }
 
 impl<C, I, V> MapView<C, I, V>
 where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     I: Serialize,
     V: Default + DeserializeOwned + 'static,
 {
@@ -1414,20 +1555,17 @@ where
         I: Borrow<Q>,
         Q: Sync + Send + Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.map.get_mut_or_default(&short_key).await
     }
 }
 
-#[async_trait]
-impl<C, I, V> HashableView<C> for MapView<C, I, V>
+impl<C, I, V> HashableView for MapView<C, I, V>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    I: Send + Sync + Serialize + DeserializeOwned,
-    V: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    Self: View,
+    ByteMapView<C, V>: HashableView,
 {
-    type Hasher = sha3::Sha3_256;
+    type Hasher = <ByteMapView<C, V> as HashableView>::Hasher;
 
     async fn hash_mut(&mut self) -> Result<<Self::Hasher as Hasher>::Output, ViewError> {
         self.map.hash_mut().await
@@ -1439,23 +1577,27 @@ where
 }
 
 /// A map view that uses custom serialization
-#[derive(Debug)]
+#[derive(Debug, Allocative)]
+#[allocative(bound = "C, I, V: Allocative")]
 pub struct CustomMapView<C, I, V> {
+    /// The underlying map storing entries with custom-serialized keys.
     map: ByteMapView<C, V>,
+    /// Phantom data for the key type.
+    #[allocative(skip)]
     _phantom: PhantomData<I>,
 }
 
-#[async_trait]
-impl<C, I, V> View<C> for CustomMapView<C, I, V>
+impl<C, I, V> View for CustomMapView<C, I, V>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    I: Send + Sync + CustomSerialize,
-    V: Clone + Send + Sync + Serialize,
+    C: Context,
+    I: CustomSerialize + Send + Sync,
+    V: Serialize + Clone + Send + Sync,
 {
     const NUM_INIT_KEYS: usize = ByteMapView::<C, V>::NUM_INIT_KEYS;
 
-    fn context(&self) -> &C {
+    type Context = C;
+
+    fn context(&self) -> C {
         self.map.context()
     }
 
@@ -1471,10 +1613,6 @@ where
         })
     }
 
-    async fn load(context: C) -> Result<Self, ViewError> {
-        Self::post_load(context, &[])
-    }
-
     fn rollback(&mut self) {
         self.map.rollback()
     }
@@ -1483,8 +1621,12 @@ where
         self.map.has_pending_changes().await
     }
 
-    fn flush(&mut self, batch: &mut Batch) -> Result<bool, ViewError> {
-        self.map.flush(batch)
+    fn pre_save(&self, batch: &mut Batch) -> Result<bool, ViewError> {
+        self.map.pre_save(batch)
+    }
+
+    fn post_save(&mut self) {
+        self.map.post_save()
     }
 
     fn clear(&mut self) {
@@ -1492,12 +1634,10 @@ where
     }
 }
 
-impl<C, I, V> ClonableView<C> for CustomMapView<C, I, V>
+impl<C, I, V> ClonableView for CustomMapView<C, I, V>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    I: Send + Sync + CustomSerialize,
-    V: Clone + Send + Sync + Serialize,
+    Self: View,
+    ByteMapView<C, V>: ClonableView,
 {
     fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
         Ok(CustomMapView {
@@ -1507,20 +1647,15 @@ where
     }
 }
 
-impl<C, I, V> CustomMapView<C, I, V>
-where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
-    I: CustomSerialize,
-{
-    /// Insert or resets a value.
+impl<C: Context, I: CustomSerialize, V> CustomMapView<C, I, V> {
+    /// Inserts or resets a value.
     /// ```rust
     /// # tokio_test::block_on(async {
     /// # use linera_views::context::MemoryContext;
-    /// # use linera_views::map_view::MapView;
+    /// # use linera_views::map_view::CustomMapView;
     /// # use linera_views::views::View;
     /// # let context = MemoryContext::new_for_testing(());
-    /// let mut map: MapView<_, u128, _> = MapView::load(context).await.unwrap();
+    /// let mut map: CustomMapView<_, u128, _> = CustomMapView::load(context).await.unwrap();
     /// map.insert(&(24 as u128), String::from("Hello"));
     /// assert_eq!(
     ///     map.get(&(24 as u128)).await.unwrap(),
@@ -1531,7 +1666,7 @@ where
     pub fn insert<Q>(&mut self, index: &Q, value: V) -> Result<(), ViewError>
     where
         I: Borrow<Q>,
-        Q: Serialize + CustomSerialize,
+        Q: CustomSerialize,
     {
         let short_key = index.to_custom_bytes()?;
         self.map.insert(short_key, value);
@@ -1542,10 +1677,11 @@ where
     /// ```rust
     /// # tokio_test::block_on(async {
     /// # use linera_views::context::MemoryContext;
-    /// # use linera_views::map_view::MapView;
+    /// # use linera_views::map_view::CustomMapView;
     /// # use linera_views::views::View;
     /// # let context = MemoryContext::new_for_testing(());
-    /// let mut map = MapView::<_, u128, String>::load(context).await.unwrap();
+    /// let mut map = CustomMapView::<_, u128, _>::load(context).await.unwrap();
+    /// map.insert(&(37 as u128), String::from("Hello"));
     /// map.remove(&(37 as u128));
     /// assert_eq!(map.get(&(37 as u128)).await.unwrap(), None);
     /// # })
@@ -1553,7 +1689,7 @@ where
     pub fn remove<Q>(&mut self, index: &Q) -> Result<(), ViewError>
     where
         I: Borrow<Q>,
-        Q: Serialize + CustomSerialize,
+        Q: CustomSerialize,
     {
         let short_key = index.to_custom_bytes()?;
         self.map.remove(short_key);
@@ -1569,29 +1705,28 @@ where
     /// ```rust
     /// # tokio_test::block_on(async {
     /// # use linera_views::context::MemoryContext;
-    /// # use linera_views::map_view::MapView;
+    /// # use linera_views::map_view::CustomMapView;
     /// # use linera_views::views::View;
     /// # let context = MemoryContext::new_for_testing(());
-    /// let mut map = MapView::<_, u128, String>::load(context).await.unwrap();
-    /// map.insert(&(37 as u128), String::from("Hello"));
-    /// assert!(map.contains_key(&(37 as u128)).await.unwrap());
-    /// assert!(!map.contains_key(&(34 as u128)).await.unwrap());
+    /// let mut map = CustomMapView::<_, u128, _>::load(context).await.unwrap();
+    /// map.insert(&(24 as u128), String::from("Hello"));
+    /// assert!(map.contains_key(&(24 as u128)).await.unwrap());
+    /// assert!(!map.contains_key(&(23 as u128)).await.unwrap());
     /// # })
     /// ```
     pub async fn contains_key<Q>(&self, index: &Q) -> Result<bool, ViewError>
     where
         I: Borrow<Q>,
-        Q: Serialize + ?Sized,
+        Q: CustomSerialize,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = index.to_custom_bytes()?;
         self.map.contains_key(&short_key).await
     }
 }
 
 impl<C, I, V> CustomMapView<C, I, V>
 where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     I: CustomSerialize,
     V: Clone + DeserializeOwned + 'static,
 {
@@ -1602,8 +1737,7 @@ where
     /// # use linera_views::map_view::CustomMapView;
     /// # use linera_views::views::View;
     /// # let context = MemoryContext::new_for_testing(());
-    /// let mut map: CustomMapView<MemoryContext<()>, u128, String> =
-    ///     CustomMapView::load(context).await.unwrap();
+    /// let mut map = CustomMapView::<_, u128, _>::load(context).await.unwrap();
     /// map.insert(&(34 as u128), String::from("Hello"));
     /// assert_eq!(
     ///     map.get(&(34 as u128)).await.unwrap(),
@@ -1620,6 +1754,74 @@ where
         self.map.get(&short_key).await
     }
 
+    /// Read values at several positions, if any.
+    /// ```rust
+    /// # tokio_test::block_on(async {
+    /// # use linera_views::context::MemoryContext;
+    /// # use linera_views::map_view::CustomMapView;
+    /// # use linera_views::views::View;
+    /// # let context = MemoryContext::new_for_testing(());
+    /// let mut map = CustomMapView::<_, u128, _>::load(context).await.unwrap();
+    /// map.insert(&(34 as u128), String::from("Hello"));
+    /// map.insert(&(12 as u128), String::from("Hi"));
+    /// assert_eq!(
+    ///     map.multi_get(&[34 as u128, 12 as u128, 89 as u128])
+    ///         .await
+    ///         .unwrap(),
+    ///     [Some(String::from("Hello")), Some(String::from("Hi")), None]
+    /// );
+    /// # })
+    /// ```
+    pub async fn multi_get<'a, Q>(
+        &self,
+        indices: impl IntoIterator<Item = &'a Q>,
+    ) -> Result<Vec<Option<V>>, ViewError>
+    where
+        I: Borrow<Q>,
+        Q: CustomSerialize + 'a,
+    {
+        let short_keys = indices
+            .into_iter()
+            .map(|index| index.to_custom_bytes())
+            .collect::<Result<_, _>>()?;
+        self.map.multi_get(short_keys).await
+    }
+
+    /// Read index-value pairs at several positions, if any.
+    /// ```rust
+    /// # tokio_test::block_on(async {
+    /// # use linera_views::context::MemoryContext;
+    /// # use linera_views::map_view::CustomMapView;
+    /// # use linera_views::views::View;
+    /// # let context = MemoryContext::new_for_testing(());
+    /// let mut map = CustomMapView::<_, u128, _>::load(context).await.unwrap();
+    /// map.insert(&(34 as u128), String::from("Hello"));
+    /// map.insert(&(12 as u128), String::from("Hi"));
+    /// assert_eq!(
+    ///     map.multi_get_pairs([34 as u128, 12 as u128, 89 as u128])
+    ///         .await
+    ///         .unwrap(),
+    ///     vec![
+    ///         (34 as u128, Some(String::from("Hello"))),
+    ///         (12 as u128, Some(String::from("Hi"))),
+    ///         (89 as u128, None)
+    ///     ]
+    /// );
+    /// # })
+    /// ```
+    pub async fn multi_get_pairs<Q>(
+        &self,
+        indices: impl IntoIterator<Item = Q>,
+    ) -> Result<Vec<(Q, Option<V>)>, ViewError>
+    where
+        I: Borrow<Q>,
+        Q: CustomSerialize + Clone,
+    {
+        let indices_vec = indices.into_iter().collect::<Vec<Q>>();
+        let values = self.multi_get(indices_vec.iter()).await?;
+        Ok(indices_vec.into_iter().zip(values).collect())
+    }
+
     /// Obtains a mutable reference to a value at a given position if available
     /// ```rust
     /// # tokio_test::block_on(async {
@@ -1627,7 +1829,7 @@ where
     /// # use linera_views::map_view::CustomMapView;
     /// # use linera_views::views::View;
     /// # let context = MemoryContext::new_for_testing(());
-    /// let mut map: CustomMapView<_, u128, String> = CustomMapView::load(context).await.unwrap();
+    /// let mut map = CustomMapView::<_, u128, _>::load(context).await.unwrap();
     /// map.insert(&(34 as u128), String::from("Hello"));
     /// let value = map.get_mut(&(34 as u128)).await.unwrap().unwrap();
     /// *value = String::from("Hola");
@@ -1649,8 +1851,7 @@ where
 
 impl<C, I, V> CustomMapView<C, I, V>
 where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     I: Send + CustomSerialize,
     V: Clone + Serialize + DeserializeOwned + 'static,
 {
@@ -1659,10 +1860,10 @@ where
     /// ```rust
     /// # tokio_test::block_on(async {
     /// # use linera_views::context::MemoryContext;
-    /// # use linera_views::map_view::MapView;
+    /// # use linera_views::map_view::CustomMapView;
     /// # use linera_views::views::View;
     /// # let context = MemoryContext::new_for_testing(());
-    /// let mut map: MapView<_, u128, String> = MapView::load(context).await.unwrap();
+    /// let mut map = CustomMapView::<_, u128, _>::load(context).await.unwrap();
     /// map.insert(&(34 as u128), String::from("Hello"));
     /// map.insert(&(37 as u128), String::from("Bonjour"));
     /// assert_eq!(map.indices().await.unwrap(), vec![34 as u128, 37 as u128]);
@@ -1804,7 +2005,7 @@ where
     /// # use linera_views::map_view::CustomMapView;
     /// # use linera_views::views::View;
     /// # let context = MemoryContext::new_for_testing(());
-    /// let mut map: CustomMapView<_, u128, String> = CustomMapView::load(context).await.unwrap();
+    /// let mut map = CustomMapView::<_, u128, _>::load(context).await.unwrap();
     /// map.insert(&(34 as u128), String::from("Hello"));
     /// map.insert(&(37 as u128), String::from("Hola"));
     /// let mut indices = Vec::<u128>::new();
@@ -1837,8 +2038,7 @@ where
 
 impl<C, I, V> CustomMapView<C, I, V>
 where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     I: Send + CustomSerialize,
     V: Clone + Sync + Send + Serialize + DeserializeOwned + 'static,
 {
@@ -1846,16 +2046,13 @@ where
     /// ```rust
     /// # tokio_test::block_on(async {
     /// # use linera_views::context::MemoryContext;
-    /// # use linera_views::map_view::MapView;
+    /// # use linera_views::map_view::CustomMapView;
     /// # use linera_views::views::View;
     /// # let context = MemoryContext::new_for_testing(());
-    /// let mut map: MapView<_, String, _> = MapView::load(context).await.unwrap();
-    /// map.insert("Italian", String::from("Ciao"));
+    /// let mut map = CustomMapView::<_, u128, _>::load(context).await.unwrap();
+    /// map.insert(&(24 as u128), String::from("Ciao"));
     /// let index_values = map.index_values().await.unwrap();
-    /// assert_eq!(
-    ///     index_values,
-    ///     vec![("Italian".to_string(), "Ciao".to_string())]
-    /// );
+    /// assert_eq!(index_values, vec![(24 as u128, "Ciao".to_string())]);
     /// # })
     /// ```
     pub async fn index_values(&self) -> Result<Vec<(I, V)>, ViewError> {
@@ -1873,24 +2070,23 @@ where
     /// ```rust
     /// # tokio_test::block_on(async {
     /// # use linera_views::context::MemoryContext;
-    /// # use linera_views::map_view::MapView;
+    /// # use linera_views::map_view::CustomMapView;
     /// # use linera_views::views::View;
     /// # let context = MemoryContext::new_for_testing(());
-    /// let mut map: MapView<_, String, _> = MapView::load(context).await.unwrap();
-    /// map.insert("Italian", String::from("Ciao"));
-    /// map.insert("French", String::from("Bonjour"));
-    /// assert_eq!(map.count().await.unwrap(), 2);
+    /// let mut map = CustomMapView::<_, u128, _>::load(context).await.unwrap();
+    /// map.insert(&(24 as u128), String::from("Ciao"));
+    /// map.insert(&(37 as u128), String::from("Bonjour"));
+    /// assert_eq!(map.iterative_count().await.unwrap(), 2);
     /// # })
     /// ```
-    pub async fn count(&self) -> Result<usize, ViewError> {
-        self.map.count().await
+    pub async fn iterative_count(&self) -> Result<usize, ViewError> {
+        self.map.iterative_count().await
     }
 }
 
 impl<C, I, V> CustomMapView<C, I, V>
 where
-    C: Context + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     I: CustomSerialize,
     V: Default + DeserializeOwned + 'static,
 {
@@ -1902,7 +2098,8 @@ where
     /// # use linera_views::map_view::CustomMapView;
     /// # use linera_views::views::View;
     /// # let context = MemoryContext::new_for_testing(());
-    /// let mut map: CustomMapView<_, u128, String> = CustomMapView::load(context).await.unwrap();
+    /// let mut map = CustomMapView::<_, u128, _>::load(context).await.unwrap();
+    /// map.insert(&(24 as u128), String::from("Hello"));
     /// assert_eq!(
     ///     *map.get_mut_or_default(&(34 as u128)).await.unwrap(),
     ///     String::new()
@@ -1919,11 +2116,9 @@ where
     }
 }
 
-#[async_trait]
-impl<C, I, V> HashableView<C> for CustomMapView<C, I, V>
+impl<C, I, V> HashableView for CustomMapView<C, I, V>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     I: Send + Sync + CustomSerialize,
     V: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
 {
@@ -1941,13 +2136,24 @@ where
 /// Type wrapping `ByteMapView` while memoizing the hash.
 pub type HashedByteMapView<C, V> = WrappedHashableContainerView<C, ByteMapView<C, V>, HasherOutput>;
 
+/// Wrapper around `ByteMapView` to compute hashes based on the history of changes.
+pub type HistoricallyHashedByteMapView<C, V> = HistoricallyHashableView<C, ByteMapView<C, V>>;
+
 /// Type wrapping `MapView` while memoizing the hash.
 pub type HashedMapView<C, I, V> = WrappedHashableContainerView<C, MapView<C, I, V>, HasherOutput>;
+
+/// Wrapper around `MapView` to compute hashes based on the history of changes.
+pub type HistoricallyHashedMapView<C, I, V> = HistoricallyHashableView<C, MapView<C, I, V>>;
 
 /// Type wrapping `CustomMapView` while memoizing the hash.
 pub type HashedCustomMapView<C, I, V> =
     WrappedHashableContainerView<C, CustomMapView<C, I, V>, HasherOutput>;
 
+/// Wrapper around `CustomMapView` to compute hashes based on the history of changes.
+pub type HistoricallyHashedCustomMapView<C, I, V> =
+    HistoricallyHashableView<C, CustomMapView<C, I, V>>;
+
+#[cfg(with_graphql)]
 mod graphql {
     use std::borrow::Cow;
 
@@ -1971,7 +2177,7 @@ mod graphql {
     #[async_graphql::Object(cache_control(no_cache), name_type)]
     impl<C, V> ByteMapView<C, V>
     where
-        C: Context + Send + Sync,
+        C: Context,
         V: async_graphql::OutputType
             + serde::ser::Serialize
             + serde::de::DeserializeOwned
@@ -2043,7 +2249,7 @@ mod graphql {
     #[async_graphql::Object(cache_control(no_cache), name_type)]
     impl<C, I, V> MapView<C, I, V>
     where
-        C: Context + Send + Sync,
+        C: Context,
         I: async_graphql::OutputType
             + async_graphql::InputType
             + serde::ser::Serialize
@@ -2071,6 +2277,11 @@ mod graphql {
             })
         }
 
+        #[graphql(derived(name = "count"))]
+        async fn count_(&self) -> Result<u32, async_graphql::Error> {
+            Ok(self.iterative_count().await? as u32)
+        }
+
         async fn entry(&self, key: I) -> Result<Entry<I, Option<V>>, async_graphql::Error> {
             Ok(Entry {
                 value: self.get(&key).await?,
@@ -2091,15 +2302,12 @@ mod graphql {
                 self.indices().await?
             };
 
-            let mut values = vec![];
-            for key in keys {
-                values.push(Entry {
-                    value: self.get(&key).await?,
-                    key,
-                })
-            }
-
-            Ok(values)
+            let values = self.multi_get(&keys).await?;
+            Ok(values
+                .into_iter()
+                .zip(keys)
+                .map(|(value, key)| Entry { value, key })
+                .collect())
         }
     }
 
@@ -2107,14 +2315,20 @@ mod graphql {
         async_graphql::TypeName for CustomMapView<C, I, V>
     {
         fn type_name() -> Cow<'static, str> {
-            format!("CustomMapView_{}_{}", I::type_name(), V::type_name()).into()
+            format!(
+                "CustomMapView_{}_{}_{:08x}",
+                mangle(I::type_name()),
+                mangle(V::type_name()),
+                hash_name::<(I, V)>(),
+            )
+            .into()
         }
     }
 
     #[async_graphql::Object(cache_control(no_cache), name_type)]
     impl<C, I, V> CustomMapView<C, I, V>
     where
-        C: Context + Send + Sync,
+        C: Context,
         I: async_graphql::OutputType
             + async_graphql::InputType
             + crate::common::CustomSerialize
@@ -2161,15 +2375,12 @@ mod graphql {
                 self.indices().await?
             };
 
-            let mut values = vec![];
-            for key in keys {
-                values.push(Entry {
-                    value: self.get(&key).await?,
-                    key,
-                })
-            }
-
-            Ok(values)
+            let values = self.multi_get(&keys).await?;
+            Ok(values
+                .into_iter()
+                .zip(keys)
+                .map(|(value, key)| Entry { value, key })
+                .collect())
         }
     }
 }

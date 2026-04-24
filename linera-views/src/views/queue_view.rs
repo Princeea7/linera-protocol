@@ -1,41 +1,44 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
 use std::{
     collections::{vec_deque::IterMut, VecDeque},
     ops::Range,
 };
 
-use async_trait::async_trait;
-use serde::{de::DeserializeOwned, Serialize};
+use allocative::Allocative;
 #[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{
-        exponential_bucket_latencies, register_histogram_vec, MeasureLatency,
-    },
-    prometheus::HistogramVec,
-};
+use linera_base::prometheus_util::MeasureLatency as _;
+use linera_base::visit_allocative_simple;
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     batch::Batch,
     common::{from_bytes_option_or_default, HasherOutput},
     context::Context,
     hashable_wrapper::WrappedHashableContainerView,
+    historical_hash_wrapper::HistoricallyHashableView,
+    store::ReadableKeyValueStore as _,
     views::{ClonableView, HashableView, Hasher, View, ViewError, MIN_VIEW_TAG},
 };
 
 #[cfg(with_metrics)]
-/// The runtime of hash computation
-static QUEUE_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "queue_view_hash_runtime",
-        "QueueView hash runtime",
-        &[],
-        exponential_bucket_latencies(5.0),
-    )
-});
+mod metrics {
+    use std::sync::LazyLock;
+
+    use linera_base::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+    use prometheus::HistogramVec;
+
+    /// The runtime of hash computation
+    pub static QUEUE_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "queue_view_hash_runtime",
+            "QueueView hash runtime",
+            &[],
+            exponential_bucket_latencies(5.0),
+        )
+    });
+}
 
 /// Key tags to create the sub-keys of a `QueueView` on top of the base key.
 #[repr(u8)]
@@ -47,30 +50,38 @@ enum KeyTag {
 }
 
 /// A view that supports a FIFO queue for values of type `T`.
-#[derive(Debug)]
+#[derive(Debug, Allocative)]
+#[allocative(bound = "C, T: Allocative")]
 pub struct QueueView<C, T> {
+    /// The view context.
+    #[allocative(skip)]
     context: C,
+    /// The range of indices for entries persisted in storage.
+    #[allocative(visit = visit_allocative_simple)]
     stored_indices: Range<usize>,
+    /// The number of entries to delete from the front.
     front_delete_count: usize,
+    /// Whether to clear storage before applying updates.
     delete_storage_first: bool,
+    /// New values added to the back, not yet persisted to storage.
     new_back_values: VecDeque<T>,
 }
 
-#[async_trait]
-impl<C, T> View<C> for QueueView<C, T>
+impl<C, T> View for QueueView<C, T>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    T: Send + Sync + Serialize,
+    C: Context,
+    T: Serialize + Send + Sync,
 {
     const NUM_INIT_KEYS: usize = 1;
 
-    fn context(&self) -> &C {
-        &self.context
+    type Context = C;
+
+    fn context(&self) -> C {
+        self.context.clone()
     }
 
     fn pre_load(context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
-        Ok(vec![context.base_tag(KeyTag::Store as u8)])
+        Ok(vec![context.base_key().base_tag(KeyTag::Store as u8)])
     }
 
     fn post_load(context: C, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
@@ -83,12 +94,6 @@ where
             delete_storage_first: false,
             new_back_values: VecDeque::new(),
         })
-    }
-
-    async fn load(context: C) -> Result<Self, ViewError> {
-        let keys = Self::pre_load(&context)?;
-        let values = context.read_multi_values_bytes(keys).await?;
-        Self::post_load(context, &values)
     }
 
     fn rollback(&mut self) {
@@ -107,21 +112,25 @@ where
         !self.new_back_values.is_empty()
     }
 
-    fn flush(&mut self, batch: &mut Batch) -> Result<bool, ViewError> {
+    fn pre_save(&self, batch: &mut Batch) -> Result<bool, ViewError> {
         let mut delete_view = false;
         if self.delete_storage_first {
-            batch.delete_key_prefix(self.context.base_key());
+            batch.delete_key_prefix(self.context.base_key().bytes.clone());
             delete_view = true;
         }
+        let mut new_stored_indices = self.stored_indices.clone();
         if self.stored_count() == 0 {
-            let key_prefix = self.context.base_tag(KeyTag::Index as u8);
+            let key_prefix = self.context.base_key().base_tag(KeyTag::Index as u8);
             batch.delete_key_prefix(key_prefix);
-            self.stored_indices = Range::default();
+            new_stored_indices = Range::default();
         } else if self.front_delete_count > 0 {
             let deletion_range = self.stored_indices.clone().take(self.front_delete_count);
-            self.stored_indices.start += self.front_delete_count;
+            new_stored_indices.start += self.front_delete_count;
             for index in deletion_range {
-                let key = self.context.derive_tag_key(KeyTag::Index as u8, &index)?;
+                let key = self
+                    .context
+                    .base_key()
+                    .derive_tag_key(KeyTag::Index as u8, &index)?;
                 batch.delete_key(key);
             }
         }
@@ -130,19 +139,31 @@ where
             for value in &self.new_back_values {
                 let key = self
                     .context
-                    .derive_tag_key(KeyTag::Index as u8, &self.stored_indices.end)?;
+                    .base_key()
+                    .derive_tag_key(KeyTag::Index as u8, &new_stored_indices.end)?;
                 batch.put_key_value(key, value)?;
-                self.stored_indices.end += 1;
+                new_stored_indices.end += 1;
             }
-            self.new_back_values.clear();
         }
-        if !self.delete_storage_first || !self.stored_indices.is_empty() {
-            let key = self.context.base_tag(KeyTag::Store as u8);
-            batch.put_key_value(key, &self.stored_indices)?;
+        if !self.delete_storage_first || !new_stored_indices.is_empty() {
+            let key = self.context.base_key().base_tag(KeyTag::Store as u8);
+            batch.put_key_value(key, &new_stored_indices)?;
+        }
+        Ok(delete_view)
+    }
+
+    fn post_save(&mut self) {
+        if self.stored_count() == 0 {
+            self.stored_indices = Range::default();
+        } else if self.front_delete_count > 0 {
+            self.stored_indices.start += self.front_delete_count;
+        }
+        if !self.new_back_values.is_empty() {
+            self.stored_indices.end += self.new_back_values.len();
+            self.new_back_values.clear();
         }
         self.front_delete_count = 0;
         self.delete_storage_first = false;
-        Ok(delete_view)
     }
 
     fn clear(&mut self) {
@@ -151,10 +172,9 @@ where
     }
 }
 
-impl<C, T> ClonableView<C> for QueueView<C, T>
+impl<C, T> ClonableView for QueueView<C, T>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     T: Clone + Send + Sync + Serialize,
 {
     fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
@@ -180,13 +200,15 @@ impl<C, T> QueueView<C, T> {
 
 impl<'a, C, T> QueueView<C, T>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     T: Send + Sync + Clone + Serialize + DeserializeOwned,
 {
     async fn get(&self, index: usize) -> Result<Option<T>, ViewError> {
-        let key = self.context.derive_tag_key(KeyTag::Index as u8, &index)?;
-        Ok(self.context.read_value(&key).await?)
+        let key = self
+            .context
+            .base_key()
+            .derive_tag_key(KeyTag::Index as u8, &index)?;
+        Ok(self.context.store().read_value(&key).await?)
     }
 
     /// Reads the front value, if any.
@@ -296,14 +318,17 @@ where
         let count = range.len();
         let mut keys = Vec::with_capacity(count);
         for index in range {
-            let key = self.context.derive_tag_key(KeyTag::Index as u8, &index)?;
+            let key = self
+                .context
+                .base_key()
+                .derive_tag_key(KeyTag::Index as u8, &index)?;
             keys.push(key)
         }
         let mut values = Vec::with_capacity(count);
-        for entry in self.context.read_multi_values(keys).await? {
+        for entry in self.context.store().read_multi_values(&keys).await? {
             match entry {
                 None => {
-                    return Err(ViewError::MissingEntries);
+                    return Err(ViewError::MissingEntries("QueueView".into()));
                 }
                 Some(value) => values.push(value),
             }
@@ -433,23 +458,21 @@ where
     /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = QueueView::load(context).await.unwrap();
     /// queue.push_back(34);
-    /// let mut iter = queue.iter_mut().await.unwrap();
+    /// let mut iter = queue.try_iter_mut().await.unwrap();
     /// let value = iter.next().unwrap();
     /// *value = 42;
     /// assert_eq!(queue.elements().await.unwrap(), vec![42]);
     /// # })
     /// ```
-    pub async fn iter_mut(&'a mut self) -> Result<IterMut<'a, T>, ViewError> {
+    pub async fn try_iter_mut(&'a mut self) -> Result<IterMut<'a, T>, ViewError> {
         self.load_all().await?;
         Ok(self.new_back_values.iter_mut())
     }
 }
 
-#[async_trait]
-impl<C, T> HashableView<C> for QueueView<C, T>
+impl<C, T> HashableView for QueueView<C, T>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     T: Send + Sync + Clone + Serialize + DeserializeOwned,
 {
     type Hasher = sha3::Sha3_256;
@@ -460,7 +483,7 @@ where
 
     async fn hash(&self) -> Result<<Self::Hasher as Hasher>::Output, ViewError> {
         #[cfg(with_metrics)]
-        let _hash_latency = QUEUE_VIEW_HASH_RUNTIME.measure_latency();
+        let _hash_latency = metrics::QUEUE_VIEW_HASH_RUNTIME.measure_latency();
         let elements = self.elements().await?;
         let mut hasher = sha3::Sha3_256::default();
         hasher.update_with_bcs_bytes(&elements)?;
@@ -471,6 +494,10 @@ where
 /// Type wrapping `QueueView` while memoizing the hash.
 pub type HashedQueueView<C, T> = WrappedHashableContainerView<C, QueueView<C, T>, HasherOutput>;
 
+/// Wrapper around `QueueView` to compute hashes based on the history of changes.
+pub type HistoricallyHashedQueueView<C, T> = HistoricallyHashableView<C, QueueView<C, T>>;
+
+#[cfg(with_graphql)]
 mod graphql {
     use std::borrow::Cow;
 
@@ -494,9 +521,13 @@ mod graphql {
     #[async_graphql::Object(cache_control(no_cache), name_type)]
     impl<C: Context, T: async_graphql::OutputType> QueueView<C, T>
     where
-        C: Send + Sync,
         T: serde::ser::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync,
     {
+        #[graphql(derived(name = "count"))]
+        async fn count_(&self) -> Result<u32, async_graphql::Error> {
+            Ok(self.count() as u32)
+        }
+
         async fn entries(&self, count: Option<usize>) -> async_graphql::Result<Vec<T>> {
             Ok(self
                 .read_front(count.unwrap_or_else(|| self.count()))

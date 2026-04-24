@@ -11,8 +11,10 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [features]
-benchmark = ["linera-base/test"]
 metrics = ["prometheus", "linera-views/metrics", "linera-execution/metrics"]
 test = [
     "dep:anyhow",
@@ -24,9 +26,9 @@ test = [
 web = ["linera-base/web", "linera-views/web", "linera-execution/web"]
 
 [dependencies]
+allocative.workspace = true
 anyhow = { workspace = true, optional = true }
 async-graphql.workspace = true
-async-trait.workspace = true
 axum = { workspace = true, optional = true }
 custom_debug_derive.workspace = true
 futures.workspace = true
@@ -38,6 +40,8 @@ rand_chacha.workspace = true
 rand_distr = { workspace = true, features = ["alloc", "serde1"] }
 serde.workspace = true
 serde_bytes.workspace = true
+serde_json.workspace = true
+strum.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

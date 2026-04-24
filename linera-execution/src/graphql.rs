@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use linera_base::{
-    crypto::ValidatorPublicKey,
+    crypto::{CryptoHash, ValidatorPublicKey},
     data_types::{Amount, ChainDescription, Epoch, Timestamp},
     doc_scalar,
     identifiers::{AccountOwner, ChainId},
@@ -14,12 +14,18 @@ use linera_views::{context::Context, map_view::MapView};
 
 use crate::{
     committee::{Committee, ValidatorState},
-    system::{Recipient, UserData},
+    policy::ResourceControlPolicy,
+    system::UserData,
     ExecutionStateView, SystemExecutionStateView,
 };
 
-doc_scalar!(Recipient, "The recipient of a transfer");
 doc_scalar!(UserData, "Optional user message attached to a transfer");
+
+async_graphql::scalar!(
+    ResourceControlPolicy,
+    "ResourceControlPolicyScalar",
+    "A collection of prices and limits associated with block execution"
+);
 
 #[async_graphql::Object(cache_control(no_cache))]
 impl Committee {
@@ -42,6 +48,11 @@ impl Committee {
     async fn _validity_threshold(&self) -> u64 {
         self.validity_threshold()
     }
+
+    #[graphql(derived(name = "policy"))]
+    async fn _policy(&self) -> &ResourceControlPolicy {
+        self.policy()
+    }
 }
 
 #[async_graphql::Object(cache_control(no_cache))]
@@ -55,28 +66,28 @@ impl<C: Send + Sync + Context> ExecutionStateView<C> {
 #[async_graphql::Object(cache_control(no_cache))]
 impl<C: Send + Sync + Context> SystemExecutionStateView<C> {
     #[graphql(derived(name = "description"))]
-    async fn _description(&self) -> &Option<ChainDescription> {
-        self.description.get()
+    async fn _description(&self) -> Result<&Option<ChainDescription>, async_graphql::Error> {
+        Ok(self.description.get().await?)
     }
 
     #[graphql(derived(name = "epoch"))]
-    async fn _epoch(&self) -> &Option<Epoch> {
+    async fn _epoch(&self) -> &Epoch {
         self.epoch.get()
     }
 
-    #[graphql(derived(name = "admin_id"))]
-    async fn _admin_id(&self) -> &Option<ChainId> {
-        self.admin_id.get()
+    #[graphql(derived(name = "admin_chain_id"))]
+    async fn _admin_chain_id(&self) -> &Option<ChainId> {
+        self.admin_chain_id.get()
     }
 
     #[graphql(derived(name = "committees"))]
-    async fn _committees(&self) -> &BTreeMap<Epoch, Committee> {
+    async fn _committees(&self) -> &BTreeMap<Epoch, CryptoHash> {
         self.committees.get()
     }
 
     #[graphql(derived(name = "ownership"))]
-    async fn _ownership(&self) -> &ChainOwnership {
-        self.ownership.get()
+    async fn _ownership(&self) -> Result<&ChainOwnership, async_graphql::Error> {
+        Ok(self.ownership.get().await?)
     }
 
     #[graphql(derived(name = "balance"))]

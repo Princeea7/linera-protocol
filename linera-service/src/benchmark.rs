@@ -10,13 +10,13 @@ use linera_base::{
     async_graphql::InputType,
     data_types::Amount,
     identifiers::{Account, AccountOwner, ApplicationId, ChainId},
-    time::timer::Instant,
+    time::Instant,
     vm::VmRuntime,
 };
-use linera_sdk::abis::fungible::{self, FungibleTokenAbi, InitialState, Parameters};
+use linera_sdk::abis::fungible::{FungibleTokenAbi, InitialState, Parameters};
 use linera_service::cli_wrappers::{
     local_net::{PathProvider, ProcessInbox},
-    ApplicationWrapper, ClientWrapper, Faucet, FaucetOption, Network, OnClientDrop,
+    ApplicationWrapper, ClientWrapper, Faucet, Network, OnClientDrop,
 };
 use port_selector::random_free_tcp_port;
 use rand::{Rng as _, SeedableRng};
@@ -40,7 +40,7 @@ enum Args {
         transactions: usize,
 
         /// The faucet (which implicitly defines the network)
-        #[arg(long = "faucet", default_value = "http://faucet.devnet.linera.net")]
+        #[arg(long = "faucet")]
         faucet: String,
 
         /// The seed for the PRNG determining the pattern of transactions.
@@ -55,7 +55,7 @@ enum Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    linera_base::tracing::init("benchmark");
+    linera_service::tracing::init("benchmark");
 
     let args = Args::parse();
     match args {
@@ -87,9 +87,8 @@ async fn benchmark_with_fungible(
         num_wallets,
         OnClientDrop::CloseChains,
     );
-    publisher
-        .wallet_init(&[], FaucetOption::NewChain(&faucet))
-        .await?;
+    publisher.wallet_init(Some(&faucet)).await?;
+    publisher.request_chain(&faucet, true).await?;
     let clients = (0..num_wallets)
         .map(|n| {
             let path_provider = PathProvider::create_temporary_directory().unwrap();
@@ -102,11 +101,10 @@ async fn benchmark_with_fungible(
             ))
         })
         .collect::<Result<Vec<_>, anyhow::Error>>()?;
-    try_join_all(
-        clients
-            .iter()
-            .map(|client| client.wallet_init(&[], FaucetOption::NewChain(&faucet))),
-    )
+    try_join_all(clients.iter().map(|client| async {
+        client.wallet_init(Some(&faucet)).await?;
+        client.request_chain(&faucet, true).await
+    }))
     .await?;
 
     info!("Synchronizing balances (sanity check)");
@@ -169,9 +167,7 @@ async fn benchmark_with_fungible(
                 default_chain,
             };
             let app = FungibleApp(
-                node_service
-                    .make_application(&context.default_chain, &context.application_id)
-                    .await?,
+                node_service.make_application(&context.default_chain, &context.application_id)?,
             );
             Ok::<_, anyhow::Error>((app, context, node_service))
         },
@@ -198,7 +194,7 @@ async fn benchmark_with_fungible(
                 sender_app.transfer(
                     sender_context.owner,
                     Amount::ONE,
-                    fungible::Account {
+                    Account {
                         chain_id: receiver_context.default_chain,
                         owner: receiver_context.owner,
                     },
@@ -236,14 +232,10 @@ async fn benchmark_with_fungible(
                         return Ok(()); // No transfers: The app won't be registered on this chain.
                     }
                     node_service.process_inbox(&context.default_chain).await?;
-                    let app = FungibleApp(
-                        node_service
-                            .make_application(
-                                &context.default_chain,
-                                &sender_context.application_id,
-                            )
-                            .await?,
-                    );
+                    let app = FungibleApp(node_service.make_application(
+                        &context.default_chain,
+                        &sender_context.application_id,
+                    )?);
                     for i in 0.. {
                         linera_base::time::timer::sleep(Duration::from_secs(i)).await;
                         let actual_balance = app.get_amount(&context.owner).await;
@@ -286,7 +278,7 @@ impl FungibleApp {
         &self,
         account_owner: AccountOwner,
         amount_transfer: Amount,
-        destination: fungible::Account,
+        destination: Account,
     ) -> Result<Value> {
         let mutation = format!(
             "transfer(owner: {}, amount: \"{}\", targetAccount: {})",

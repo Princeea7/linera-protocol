@@ -8,7 +8,7 @@ use std::{
     fmt::Debug,
 };
 
-use async_trait::async_trait;
+use allocative::Allocative;
 
 use crate::{
     self as linera_views,
@@ -20,14 +20,12 @@ use crate::{
     queue_view::QueueView,
     register_view::RegisterView,
     set_view::SetView,
-    views::{ClonableView, RootView, ViewError},
+    views::{ClonableView, RootView},
+    ViewError,
 };
 
 /// A [`View`][`crate::views::View`] to be used in test cases.
-#[async_trait]
-pub trait TestView:
-    RootView<MemoryContext<()>> + ClonableView<MemoryContext<()>> + Send + Sync + 'static
-{
+pub trait TestView: RootView<Context = MemoryContext<()>> + ClonableView {
     /// Representation of the view's state.
     type State: Debug + Eq + Send;
 
@@ -57,7 +55,6 @@ pub struct TestRegisterView<C> {
     byte: RegisterView<C, u8>,
 }
 
-#[async_trait]
 impl TestView for TestRegisterView<MemoryContext<()>> {
     type State = u8;
 
@@ -92,7 +89,6 @@ pub struct TestLogView<C> {
     log: LogView<C, u16>,
 }
 
-#[async_trait]
 impl TestView for TestLogView<MemoryContext<()>> {
     type State = Vec<u16>;
 
@@ -113,7 +109,7 @@ impl TestView for TestLogView<MemoryContext<()>> {
 
         Ok(INITIAL_LOG_QUEUE_VIEW_CHANGES
             .iter()
-            .cloned()
+            .copied()
             .chain(new_values)
             .collect())
     }
@@ -127,7 +123,7 @@ impl TestView for TestLogView<MemoryContext<()>> {
 
         Ok(INITIAL_LOG_QUEUE_VIEW_CHANGES
             .iter()
-            .cloned()
+            .copied()
             .chain(new_values)
             .collect())
     }
@@ -152,18 +148,17 @@ pub struct TestMapView<C> {
     map: MapView<C, i32, String>,
 }
 
-#[async_trait]
 impl TestView for TestMapView<MemoryContext<()>> {
     type State = HashMap<i32, String>;
 
     async fn stage_initial_changes(&mut self) -> Result<Self::State, ViewError> {
         for (key, value) in INITIAL_MAP_COLLECTION_VIEW_CHANGES {
-            self.map.insert(key, value.to_string())?;
+            self.map.insert(key, (*value).to_string())?;
         }
 
         Ok(INITIAL_MAP_COLLECTION_VIEW_CHANGES
             .iter()
-            .map(|(key, value)| (*key, value.to_string()))
+            .map(|(key, value)| (*key, (*value).to_string()))
             .collect::<HashMap<_, _>>())
     }
 
@@ -185,7 +180,7 @@ impl TestView for TestMapView<MemoryContext<()>> {
         let new_state = INITIAL_MAP_COLLECTION_VIEW_CHANGES
             .iter()
             .filter(|(key, _)| !entries_to_remove.contains(key))
-            .map(|(key, value)| (*key, value.to_string()))
+            .map(|(key, value)| (*key, (*value).to_string()))
             .chain(new_entries)
             .collect();
 
@@ -210,7 +205,7 @@ impl TestView for TestMapView<MemoryContext<()>> {
         let new_state = INITIAL_MAP_COLLECTION_VIEW_CHANGES
             .iter()
             .filter(|(key, _)| !entries_to_remove.contains(key))
-            .map(|(key, value)| (*key, value.to_string()))
+            .map(|(key, value)| (*key, (*value).to_string()))
             .chain(new_entries)
             .collect();
 
@@ -238,7 +233,6 @@ pub struct TestSetView<C> {
 
 const INITIAL_SET_VIEW_CHANGES: &[i32] = &[0, -1, 2, -3, 4, -5];
 
-#[async_trait]
 impl TestView for TestSetView<MemoryContext<()>> {
     type State = HashSet<i32>;
 
@@ -247,13 +241,13 @@ impl TestView for TestSetView<MemoryContext<()>> {
             self.set.insert(key)?;
         }
 
-        Ok(INITIAL_SET_VIEW_CHANGES.iter().cloned().collect())
+        Ok(INITIAL_SET_VIEW_CHANGES.iter().copied().collect())
     }
 
     async fn stage_changes_to_be_discarded(&mut self) -> Result<Self::State, ViewError> {
         let mut state = INITIAL_SET_VIEW_CHANGES
             .iter()
-            .cloned()
+            .copied()
             .collect::<HashSet<_>>();
         let new_entries = [-1_000_000, 2_000_000];
 
@@ -275,7 +269,7 @@ impl TestView for TestSetView<MemoryContext<()>> {
     async fn stage_changes_to_be_persisted(&mut self) -> Result<Self::State, ViewError> {
         let mut state = INITIAL_SET_VIEW_CHANGES
             .iter()
-            .cloned()
+            .copied()
             .collect::<HashSet<_>>();
         let new_entries = [1_234, -2_101_010];
 
@@ -306,7 +300,6 @@ pub struct TestCollectionView<C> {
     collection: CollectionView<C, i32, RegisterView<C, String>>,
 }
 
-#[async_trait]
 impl TestView for TestCollectionView<MemoryContext<()>> {
     type State = HashMap<i32, String>;
 
@@ -315,12 +308,12 @@ impl TestView for TestCollectionView<MemoryContext<()>> {
             self.collection
                 .load_entry_mut(key)
                 .await?
-                .set(value.to_string());
+                .set((*value).to_string());
         }
 
         Ok(INITIAL_MAP_COLLECTION_VIEW_CHANGES
             .iter()
-            .map(|(key, value)| (*key, value.to_string()))
+            .map(|(key, value)| (*key, (*value).to_string()))
             .collect::<HashMap<_, _>>())
     }
 
@@ -342,7 +335,7 @@ impl TestView for TestCollectionView<MemoryContext<()>> {
         let new_state = INITIAL_MAP_COLLECTION_VIEW_CHANGES
             .iter()
             .filter(|(key, _)| !entries_to_remove.contains(key))
-            .map(|(key, value)| (*key, value.to_string()))
+            .map(|(key, value)| (*key, (*value).to_string()))
             .chain(new_entries)
             .collect();
 
@@ -367,7 +360,7 @@ impl TestView for TestCollectionView<MemoryContext<()>> {
         let new_state = INITIAL_MAP_COLLECTION_VIEW_CHANGES
             .iter()
             .filter(|(key, _)| !entries_to_remove.contains(key))
-            .map(|(key, value)| (*key, value.to_string()))
+            .map(|(key, value)| (*key, (*value).to_string()))
             .chain(new_entries)
             .collect();
 
@@ -394,7 +387,6 @@ pub struct TestQueueView<C> {
     queue: QueueView<C, u16>,
 }
 
-#[async_trait]
 impl TestView for TestQueueView<MemoryContext<()>> {
     type State = Vec<u16>;
 
@@ -442,12 +434,11 @@ impl TestView for TestQueueView<MemoryContext<()>> {
 }
 
 /// Wrapper to test with a [`BucketQueueView`].
-#[derive(RootView, ClonableView)]
+#[derive(RootView, ClonableView, Allocative)]
 pub struct TestBucketQueueView<C> {
     queue: BucketQueueView<C, u16, 2>,
 }
 
-#[async_trait]
 impl TestView for TestBucketQueueView<MemoryContext<()>> {
     type State = Vec<u16>;
 

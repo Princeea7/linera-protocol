@@ -6,15 +6,14 @@
 use std::sync::Mutex;
 
 use linera_base::{
-    abi::ServiceAbi,
-    data_types::{Amount, BlockHeight, Timestamp},
+    abi::{ContractAbi, ServiceAbi},
+    data_types::{Amount, ApplicationDescription, BlockHeight, Timestamp},
     http,
-    identifiers::{AccountOwner, ApplicationId, ChainId},
+    identifiers::{AccountOwner, ApplicationId, ChainId, DataBlobHash},
 };
-use serde::Serialize;
 
 use super::wit::{base_runtime_api as base_wit, service_runtime_api as service_wit};
-use crate::{DataBlobHash, KeyValueStore, Service, ViewStorageContext};
+use crate::{KeyValueStore, Service, ViewStorageContext};
 
 /// The runtime available during execution of a query.
 pub struct ServiceRuntime<Application>
@@ -23,6 +22,7 @@ where
 {
     application_parameters: Mutex<Option<Application::Parameters>>,
     application_id: Mutex<Option<ApplicationId<Application::Abi>>>,
+    application_creator_chain_id: Mutex<Option<ChainId>>,
     chain_id: Mutex<Option<ChainId>>,
     next_block_height: Mutex<Option<BlockHeight>>,
     timestamp: Mutex<Option<Timestamp>>,
@@ -40,6 +40,7 @@ where
         ServiceRuntime {
             application_parameters: Mutex::new(None),
             application_id: Mutex::new(None),
+            application_creator_chain_id: Mutex::new(None),
             chain_id: Mutex::new(None),
             next_block_height: Mutex::new(None),
             timestamp: Mutex::new(None),
@@ -56,7 +57,7 @@ where
 
     /// Returns a storage context suitable for a root view.
     pub fn root_view_storage_context(&self) -> ViewStorageContext {
-        ViewStorageContext::new_unsafe(self.key_value_store(), Vec::new(), ())
+        ViewStorageContext::new_unchecked(self.key_value_store(), Vec::new(), ())
     }
 }
 
@@ -77,6 +78,21 @@ where
         Self::fetch_value_through_cache(&self.application_id, || {
             ApplicationId::from(base_wit::get_application_id()).with_abi()
         })
+    }
+
+    /// Returns the chain ID of the current application creator.
+    pub fn application_creator_chain_id(&self) -> ChainId {
+        Self::fetch_value_through_cache(&self.application_creator_chain_id, || {
+            base_wit::get_application_creator_chain_id().into()
+        })
+    }
+
+    /// Returns the description of the given application.
+    pub fn read_application_description(
+        &self,
+        application_id: ApplicationId,
+    ) -> ApplicationDescription {
+        base_wit::read_application_description(application_id.forget_abi().into()).into()
     }
 
     /// Returns the ID of the current chain.
@@ -130,6 +146,19 @@ where
         })
     }
 
+    /// Returns the allowance for a given owner-spender pair.
+    pub fn allowance(&self, owner: AccountOwner, spender: AccountOwner) -> Amount {
+        base_wit::read_allowance(owner.into(), spender.into()).into()
+    }
+
+    /// Returns all allowances on this chain.
+    pub fn allowances(&self) -> Vec<(AccountOwner, AccountOwner, Amount)> {
+        base_wit::read_allowances()
+            .into_iter()
+            .map(|(owner, spender, amount)| (owner.into(), spender.into(), amount.into()))
+            .collect()
+    }
+
     /// Makes an HTTP request to the given URL as an oracle and returns the answer, if any.
     ///
     /// Should only be used with queries where it is very likely that all validators will receive
@@ -143,12 +172,12 @@ where
 
     /// Reads a data blob with the given hash from storage.
     pub fn read_data_blob(&self, hash: DataBlobHash) -> Vec<u8> {
-        base_wit::read_data_blob(hash.0.into())
+        base_wit::read_data_blob(hash.into())
     }
 
     /// Asserts that a data blob with the given hash exists in storage.
     pub fn assert_data_blob_exists(&self, hash: DataBlobHash) {
-        base_wit::assert_data_blob_exists(hash.0.into())
+        base_wit::assert_data_blob_exists(hash.into())
     }
 }
 
@@ -159,15 +188,16 @@ where
     /// Schedules an operation to be included in the block being built.
     ///
     /// The operation is specified as an opaque blob of bytes.
-    pub fn schedule_raw_operation(&self, operation: Vec<u8>) {
-        service_wit::schedule_operation(&operation);
+    pub fn schedule_raw_operation(&self, operation: &[u8]) {
+        service_wit::schedule_operation(operation);
     }
 
     /// Schedules an operation to be included in the block being built.
     ///
-    /// The operation is serialized using BCS.
-    pub fn schedule_operation(&self, operation: &impl Serialize) {
-        let bytes = bcs::to_bytes(operation).expect("Failed to serialize application operation");
+    /// The operation is serialized using the application ABI.
+    pub fn schedule_operation(&self, operation: &<Application::Abi as ContractAbi>::Operation) {
+        let bytes = <Application::Abi as ContractAbi>::serialize_operation(operation)
+            .expect("Failed to serialize application operation");
 
         service_wit::schedule_operation(&bytes);
     }

@@ -1,10 +1,6 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Some of these items are only used by some tests, but Rust will complain about unused
-// items for the tests where they aren't used
-#![allow(unused_imports)]
-
 mod mock_application;
 #[cfg(with_revm)]
 pub mod solidity;
@@ -13,60 +9,52 @@ mod system_execution_state;
 use std::{collections::BTreeMap, sync::Arc, thread, vec};
 
 use linera_base::{
-    crypto::{AccountPublicKey, BcsSignable, CryptoHash, ValidatorPublicKey},
+    crypto::{AccountPublicKey, ValidatorPublicKey},
     data_types::{
         Amount, Blob, BlockHeight, ChainDescription, ChainOrigin, CompressedBytecode, Epoch,
         InitialChainConfig, OracleResponse, Timestamp,
     },
-    identifiers::{AccountOwner, ApplicationId, BlobId, BlobType, ChainId, MessageId, ModuleId},
+    identifiers::{AccountOwner, ApplicationId, BlobId, ChainId, ModuleId},
     ownership::ChainOwnership,
     vm::VmRuntime,
 };
-use linera_views::{
-    context::Context,
-    views::{View, ViewError},
-};
+use linera_views::{context::Context, views::View};
 use proptest::{prelude::any, strategy::Strategy};
-use serde::{Deserialize, Serialize};
 
 pub use self::{
     mock_application::{ExpectedCall, MockApplication, MockApplicationInstance},
     system_execution_state::SystemExecutionState,
 };
 use crate::{
-    committee::Committee, ApplicationDescription, ExecutionRequest, ExecutionRuntimeContext,
-    ExecutionStateView, MessageContext, OperationContext, QueryContext, ServiceRuntimeEndpoint,
-    ServiceRuntimeRequest, ServiceSyncRuntime, SystemExecutionStateView,
-    TestExecutionRuntimeContext,
+    committee::Committee, ApplicationDescription, ExecutionRuntimeContext, ExecutionStateView,
+    MessageContext, OperationContext, QueryContext, ServiceRuntimeEndpoint, ServiceSyncRuntime,
+    SystemExecutionStateView,
 };
+
+pub fn dummy_committee() -> Committee {
+    Committee::make_simple(vec![(
+        ValidatorPublicKey::test_key(0),
+        AccountPublicKey::test_key(0),
+    )])
+}
+
+pub fn dummy_committees() -> BTreeMap<Epoch, Committee> {
+    let committee = dummy_committee();
+    BTreeMap::from([(Epoch::ZERO, committee)])
+}
 
 pub fn dummy_chain_description_with_ownership_and_balance(
     index: u32,
     ownership: ChainOwnership,
     balance: Amount,
 ) -> ChainDescription {
-    let committee = Committee::make_simple(vec![(
-        ValidatorPublicKey::test_key(index as u8),
-        AccountPublicKey::test_key(2 * (index % 128) as u8),
-    )]);
-    let committees = BTreeMap::from([(
-        Epoch::ZERO,
-        bcs::to_bytes(&committee).expect("serializing a committee shouldn't fail"),
-    )]);
     let origin = ChainOrigin::Root(index);
     let config = InitialChainConfig {
-        admin_id: if index == 0 {
-            None
-        } else {
-            Some(
-                dummy_chain_description_with_ownership_and_balance(0, ownership.clone(), balance)
-                    .id(),
-            )
-        },
         application_permissions: Default::default(),
         balance,
-        committees,
         epoch: Epoch::ZERO,
+        min_active_epoch: Epoch::ZERO,
+        max_active_epoch: Epoch::ZERO,
         ownership,
     };
     ChainDescription::new(origin, config, Timestamp::default())
@@ -96,10 +84,10 @@ pub fn create_dummy_user_application_description(
     contract_bytes.push(index as u8);
     service_bytes.push(index as u8);
     let contract_blob = Blob::new_contract_bytecode(CompressedBytecode {
-        compressed_bytes: contract_bytes,
+        compressed_bytes: Arc::new(contract_bytes.into_boxed_slice()),
     });
     let service_blob = Blob::new_service_bytecode(CompressedBytecode {
-        compressed_bytes: service_bytes,
+        compressed_bytes: Arc::new(service_bytes.into_boxed_slice()),
     });
 
     let vm_runtime = VmRuntime::Wasm;
@@ -123,8 +111,7 @@ pub fn create_dummy_operation_context(chain_id: ChainId) -> OperationContext {
         chain_id,
         height: BlockHeight(0),
         round: Some(0),
-        authenticated_signer: None,
-        authenticated_caller_id: None,
+        authenticated_owner: None,
         timestamp: Default::default(),
     }
 }
@@ -132,20 +119,16 @@ pub fn create_dummy_operation_context(chain_id: ChainId) -> OperationContext {
 /// Creates a dummy [`MessageContext`] to use in tests.
 pub fn create_dummy_message_context(
     chain_id: ChainId,
-    authenticated_signer: Option<AccountOwner>,
+    authenticated_owner: Option<AccountOwner>,
 ) -> MessageContext {
     MessageContext {
         chain_id,
+        origin: chain_id,
         is_bouncing: false,
-        authenticated_signer,
+        authenticated_owner,
         refund_grant_to: None,
         height: BlockHeight(0),
         round: Some(0),
-        message_id: MessageId {
-            chain_id,
-            height: BlockHeight(0),
-            index: 0,
-        },
         timestamp: Default::default(),
     }
 }
@@ -165,7 +148,7 @@ pub trait RegisterMockApplication {
     /// Returns the chain to use for the creation of the application.
     ///
     /// This is included in the mocked [`ApplicationId`].
-    fn creator_chain_id(&self) -> ChainId;
+    async fn creator_chain_id(&self) -> ChainId;
 
     /// Registers a new [`MockApplication`] and returns it with the [`ApplicationId`] that was
     /// used for it.
@@ -203,8 +186,8 @@ where
     C: Context + Clone + Send + Sync + 'static,
     C::Extra: ExecutionRuntimeContext,
 {
-    fn creator_chain_id(&self) -> ChainId {
-        self.system.creator_chain_id()
+    async fn creator_chain_id(&self) -> ChainId {
+        self.system.creator_chain_id().await
     }
 
     async fn register_mock_application_with(
@@ -224,8 +207,8 @@ where
     C: Context + Clone + Send + Sync + 'static,
     C::Extra: ExecutionRuntimeContext,
 {
-    fn creator_chain_id(&self) -> ChainId {
-        self.description.get().as_ref().expect(
+    async fn creator_chain_id(&self) -> ChainId {
+        self.description.get().await.expect("failed to load description").as_ref().expect(
             "Can't register applications on a system state with no associated `ChainDescription`",
         ).into()
     }
@@ -237,14 +220,17 @@ where
         service: Blob,
     ) -> anyhow::Result<(ApplicationId, MockApplication)> {
         let id = From::from(&description);
-        let extra = self.context().extra();
+        let context = self.context();
+        let extra = context.extra();
         let mock_application = MockApplication::default();
 
         extra
             .user_contracts()
+            .pin()
             .insert(id, mock_application.clone().into());
         extra
             .user_services()
+            .pin()
             .insert(id, mock_application.clone().into());
         extra
             .add_blobs([
@@ -258,7 +244,7 @@ where
     }
 }
 
-pub async fn create_dummy_user_application_registrations(
+pub fn create_dummy_user_application_registrations(
     count: u32,
 ) -> anyhow::Result<Vec<(ApplicationId, ApplicationDescription, Blob, Blob)>> {
     let mut ids = Vec::with_capacity(count as usize);
@@ -284,7 +270,7 @@ impl QueryContext {
         let (runtime_request_sender, runtime_request_receiver) = std::sync::mpsc::channel();
 
         thread::spawn(move || {
-            ServiceSyncRuntime::new(execution_state_sender, self).run(runtime_request_receiver)
+            ServiceSyncRuntime::new(execution_state_sender, self).run(&runtime_request_receiver)
         });
 
         ServiceRuntimeEndpoint {
@@ -304,7 +290,7 @@ pub fn test_accounts_strategy() -> impl Strategy<Value = BTreeMap<AccountOwner, 
     )
 }
 
-/// Creates a vector of ['OracleResponse`]s for the supplied [`BlobId`]s.
+/// Creates a vector of [`OracleResponse`]s for the supplied [`BlobId`]s.
 pub fn blob_oracle_responses<'a>(blobs: impl Iterator<Item = &'a BlobId>) -> Vec<OracleResponse> {
     blobs
         .into_iter()

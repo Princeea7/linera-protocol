@@ -5,17 +5,21 @@ interface base-runtime-api {
     get-block-height: func() -> block-height;
     get-application-id: func() -> application-id;
     get-application-creator-chain-id: func() -> chain-id;
+    read-application-description: func(application-id: application-id) -> application-description;
     application-parameters: func() -> list<u8>;
     get-chain-ownership: func() -> chain-ownership;
+    get-application-permissions: func() -> application-permissions;
     read-system-timestamp: func() -> timestamp;
     read-chain-balance: func() -> amount;
     read-owner-balance: func(owner: account-owner) -> amount;
     read-owner-balances: func() -> list<tuple<account-owner, amount>>;
     read-balance-owners: func() -> list<account-owner>;
+    read-allowance: func(owner: account-owner, spender: account-owner) -> amount;
+    read-allowances: func() -> list<tuple<account-owner, account-owner, amount>>;
     perform-http-request: func(request: http-request) -> http-response;
     assert-before: func(timestamp: timestamp);
-    read-data-blob: func(hash: crypto-hash) -> list<u8>;
-    assert-data-blob-exists: func(hash: crypto-hash);
+    read-data-blob: func(hash: data-blob-hash) -> list<u8>;
+    assert-data-blob-exists: func(hash: data-blob-hash);
     log: func(message: string, level: log-level);
     contains-key-new: func(key: list<u8>) -> u32;
     contains-key-wait: func(promise-id: u32) -> bool;
@@ -40,8 +44,25 @@ interface base-runtime-api {
         inner0: u128,
     }
 
+    record application-description {
+        module-id: module-id,
+        creator-chain-id: chain-id,
+        block-height: block-height,
+        application-index: u32,
+        parameters: list<u8>,
+        required-application-ids: list<application-id>,
+    }
+
     record application-id {
         application-description-hash: crypto-hash,
+    }
+
+    record application-permissions {
+        execute-operations: option<list<application-id>>,
+        mandatory-applications: list<application-id>,
+        manage-chain: list<application-id>,
+        call-service-as-oracle: option<list<application-id>>,
+        make-http-requests: option<list<application-id>>,
     }
 
     record array20 {
@@ -61,6 +82,7 @@ interface base-runtime-api {
     record chain-ownership {
         super-owners: list<account-owner>,
         owners: list<tuple<account-owner, u64>>,
+        first-leader: option<account-owner>,
         multi-leader-rounds: u32,
         open-multi-leader-rounds: bool,
         timeout-config: timeout-config,
@@ -71,6 +93,10 @@ interface base-runtime-api {
         part2: u64,
         part3: u64,
         part4: u64,
+    }
+
+    record data-blob-hash {
+        inner0: crypto-hash,
     }
 
     record http-header {
@@ -111,6 +137,12 @@ interface base-runtime-api {
         trace,
     }
 
+    record module-id {
+        contract-blob-hash: crypto-hash,
+        service-blob-hash: crypto-hash,
+        vm-runtime: vm-runtime,
+    }
+
     record time-delta {
         inner0: u64,
     }
@@ -127,4 +159,9 @@ interface base-runtime-api {
     }
 
     type u128 = tuple<u64, u64>;
+
+    enum vm-runtime {
+        wasm,
+        evm,
+    }
 }

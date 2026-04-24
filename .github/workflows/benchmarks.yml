@@ -1,8 +1,9 @@
 name: Benchmarks
 
 on:
-  push:
-    branches: [ main, 'devnet_*', 'testnet_*' ]
+  # TODO(#5173): reactivate this rule
+  # push:
+  #   branches: [ main, 'devnet_*', 'testnet_*' ]
   workflow_dispatch:
 
 env:
@@ -24,8 +25,9 @@ jobs:
         sudo rm -rf "/usr/local/share/boost"
         sudo rm -rf "$AGENT_TOOLSDIRECTORY"
     - name: Install Protoc
-      uses: arduino/setup-protoc@v1
+      uses: arduino/setup-protoc@v3
       with:
+        version: "34.1"
         repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Run benchmarks
       run: |

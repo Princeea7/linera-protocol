@@ -3,6 +3,7 @@
 
 //! Types used when performing HTTP requests.
 
+use allocative::Allocative;
 use custom_debug_derive::Debug;
 use linera_witty::{WitLoad, WitStore, WitType};
 use serde::{Deserialize, Serialize};
@@ -46,26 +47,6 @@ impl Request {
             headers: vec![],
             body: payload.into(),
         }
-    }
-
-    /// Creates an HTTP POST [`Request`] for a `url` with a body that's the `payload` serialized to
-    /// JSON.
-    pub fn post_json(
-        url: impl Into<String>,
-        payload: &impl Serialize,
-    ) -> Result<Self, serde_json::Error> {
-        Ok(Request {
-            method: Method::Post,
-            url: url.into(),
-            headers: vec![Header::new("Content-Type", b"application/json")],
-            body: serde_json::to_vec(payload)?,
-        })
-    }
-
-    /// Adds a header to this [`Request`].
-    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
-        self.headers.push(Header::new(name, value));
-        self
     }
 }
 
@@ -119,7 +100,19 @@ impl From<Method> for reqwest::Method {
 }
 
 /// A response for an HTTP request.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, WitLoad, WitStore, WitType)]
+#[derive(
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    PartialEq,
+    Serialize,
+    WitLoad,
+    WitStore,
+    WitType,
+    Allocative,
+)]
 #[witty(name = "http-response")]
 pub struct Response {
     /// The status code of the HTTP response.
@@ -161,16 +154,22 @@ impl Response {
             body: vec![],
         }
     }
-
-    /// Adds a header to this [`Response`].
-    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
-        self.headers.push(Header::new(name, value));
-        self
-    }
 }
 
 /// A header for an HTTP request or response.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, WitLoad, WitStore, WitType)]
+#[derive(
+    Clone,
+    Debug,
+    Deserialize,
+    Eq,
+    Hash,
+    PartialEq,
+    Serialize,
+    WitLoad,
+    WitStore,
+    WitType,
+    Allocative,
+)]
 #[witty(name = "http-header")]
 pub struct Header {
     /// The header name.

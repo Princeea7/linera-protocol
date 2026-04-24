@@ -7,7 +7,7 @@ use linera_base::{
     crypto::CryptoHash,
     data_types::{BlockHeight, Timestamp},
     http,
-    identifiers::{AccountOwner, ApplicationId, ChainId},
+    identifiers::{AccountOwner, ApplicationId, ChainId, DataBlobHash},
 };
 
 use crate::{
@@ -30,12 +30,20 @@ macro_rules! impl_to_wit {
             }
         }
 
+        impl From<DataBlobHash> for $wit_base_api::DataBlobHash {
+            fn from(hash_value: DataBlobHash) -> Self {
+                $wit_base_api::DataBlobHash {
+                    inner0: hash_value.0.into(),
+                }
+            }
+        }
+
         impl From<[u8; 20]> for $wit_base_api::Array20 {
             fn from(bytes: [u8; 20]) -> Self {
                 $wit_base_api::Array20 {
                     part1: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
                     part2: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
-                    part3: u64::from_be_bytes(bytes[16..20].try_into().unwrap()),
+                    part3: (u32::from_be_bytes(bytes[16..20].try_into().unwrap()) as u64) << 32,
                 }
             }
         }

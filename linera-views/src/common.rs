@@ -9,24 +9,30 @@ use std::{
         Bound,
         Bound::{Excluded, Included, Unbounded},
     },
+    slice::ChunksExact,
 };
 
+use allocative::Allocative;
+use itertools::Either;
 use serde::de::DeserializeOwned;
 
-use crate::views::ViewError;
+use crate::ViewError;
 
+type HasherOutputSize = <sha3::Sha3_256 as sha3::digest::OutputSizeUser>::OutputSize;
 #[doc(hidden)]
-pub type HasherOutputSize = <sha3::Sha3_256 as sha3::digest::OutputSizeUser>::OutputSize;
-#[doc(hidden)]
+#[allow(deprecated)]
 pub type HasherOutput = generic_array::GenericArray<u8, HasherOutputSize>;
 
-#[derive(Clone, Debug)]
-pub(crate) enum Update<T> {
+#[derive(Clone, Debug, Allocative)]
+/// An update, for example to a view.
+pub enum Update<T> {
+    /// The entry is removed.
     Removed,
+    /// The entry is set to the following.
     Set(T),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Allocative)]
 pub(crate) struct DeletionSet {
     pub(crate) delete_storage_first: bool,
     pub(crate) deleted_prefixes: BTreeSet<Vec<u8>>,
@@ -74,9 +80,8 @@ impl DeletionSet {
 pub(crate) fn get_upper_bound_option(key_prefix: &[u8]) -> Option<Vec<u8>> {
     let len = key_prefix.len();
     for i in (0..len).rev() {
-        let val = key_prefix[i];
-        if val < u8::MAX {
-            let mut upper_bound = key_prefix[0..i + 1].to_vec();
+        if key_prefix[i] < u8::MAX {
+            let mut upper_bound = key_prefix[0..=i].to_vec();
             upper_bound[i] += 1;
             return Some(upper_bound);
         }
@@ -96,34 +101,29 @@ pub(crate) fn get_upper_bound(key_prefix: &[u8]) -> Bound<Vec<u8>> {
 
 /// Computes an interval so that a vector has `key_prefix` as a prefix
 /// if and only if it belongs to the range.
-pub(crate) fn get_interval(key_prefix: Vec<u8>) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+pub(crate) fn get_key_range_for_prefix(key_prefix: Vec<u8>) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
     let upper_bound = get_upper_bound(&key_prefix);
     (Included(key_prefix), upper_bound)
 }
 
 /// Deserializes an optional vector of `u8`
-pub fn from_bytes_option<V: DeserializeOwned, E>(key_opt: &Option<Vec<u8>>) -> Result<Option<V>, E>
-where
-    E: From<bcs::Error>,
-{
-    match key_opt {
-        Some(bytes) => {
-            let value = bcs::from_bytes(bytes)?;
-            Ok(Some(value))
-        }
-        None => Ok(None),
+pub fn from_bytes_option<V: DeserializeOwned>(
+    key_opt: &Option<Vec<u8>>,
+) -> Result<Option<V>, bcs::Error> {
+    if let Some(bytes) = key_opt {
+        Ok(Some(bcs::from_bytes(bytes)?))
+    } else {
+        Ok(None)
     }
 }
 
-pub(crate) fn from_bytes_option_or_default<V: DeserializeOwned + Default, E>(
+pub(crate) fn from_bytes_option_or_default<V: DeserializeOwned + Default>(
     key_opt: &Option<Vec<u8>>,
-) -> Result<V, E>
-where
-    E: From<bcs::Error>,
-{
-    match key_opt {
-        Some(bytes) => Ok(bcs::from_bytes(bytes)?),
-        None => Ok(V::default()),
+) -> Result<V, bcs::Error> {
+    if let Some(bytes) = key_opt {
+        Ok(bcs::from_bytes(bytes)?)
+    } else {
+        Ok(V::default())
     }
 }
 
@@ -193,7 +193,7 @@ pub(crate) fn contains_prefix_of(prefixes: &BTreeSet<Vec<u8>>, key: &[u8]) -> bo
 pub(crate) fn insert_key_prefix(prefixes: &mut BTreeSet<Vec<u8>>, prefix: Vec<u8>) {
     if !contains_prefix_of(prefixes, &prefix) {
         let key_prefix_list = prefixes
-            .range(get_interval(prefix.clone()))
+            .range(get_key_range_for_prefix(prefix.clone()))
             .map(|x| x.to_vec())
             .collect::<Vec<_>>();
         for key in key_prefix_list {
@@ -315,6 +315,30 @@ pub(crate) const fn get_uleb128_size(len: usize) -> usize {
         expo += 1;
     }
     expo
+}
+
+/// Extention trait for slices.
+pub trait SliceExt<T> {
+    /// Same as `chunks_exact` but we allow the `chunk_size` to be zero when the slice is empty.
+    fn chunks_exact_or_repeat(
+        &self,
+        chunk_size: usize,
+    ) -> Either<ChunksExact<'_, T>, std::iter::Repeat<&[T]>>;
+}
+
+impl<T> SliceExt<T> for [T] {
+    fn chunks_exact_or_repeat(
+        &self,
+        chunk_size: usize,
+    ) -> Either<ChunksExact<'_, T>, std::iter::Repeat<&[T]>> {
+        if chunk_size > 0 {
+            Either::Left(self.chunks_exact(chunk_size))
+        } else if self.is_empty() {
+            Either::Right(std::iter::repeat(&[]))
+        } else {
+            panic!("chunk_size must be nonzero unless the slice is empty")
+        }
+    }
 }
 
 #[cfg(test)]

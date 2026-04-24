@@ -1,0 +1,14 @@
+[target.wasm32-unknown-unknown]
+rustflags = [
+    # support threading
+    "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals,+reference-types",
+    # allow unstable Web APIs needed by `web-sys` bindings used in the web client
+    "--cfg=web_sys_unstable_apis",
+    "-Z", "wasm_c_abi=spec",
+]
+
+[unstable]
+build-std = ["panic_abort", "std"]
+
+[build]
+target = "wasm32-unknown-unknown"

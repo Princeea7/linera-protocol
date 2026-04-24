@@ -11,18 +11,15 @@ use std::{
 
 use async_lock::{Semaphore, SemaphoreGuard};
 use futures::future::join_all;
-use linera_base::ensure;
+use linera_base::{ensure, util::future::FutureSyncExt as _};
 #[cfg(with_metrics)]
-use linera_views::metering::MeteredStore;
+use linera_views::metering::MeteredDatabase;
 #[cfg(with_testing)]
-use linera_views::store::TestKeyValueStore;
+use linera_views::store::TestKeyValueDatabase;
 use linera_views::{
     batch::{Batch, WriteOperation},
-    lru_caching::LruCachingStore,
-    store::{
-        AdminKeyValueStore, CommonStoreInternalConfig, ReadableKeyValueStore, WithError,
-        WritableKeyValueStore,
-    },
+    lru_caching::LruCachingDatabase,
+    store::{KeyValueDatabase, ReadableKeyValueStore, WithError, WritableKeyValueStore},
 };
 use serde::de::DeserializeOwned;
 use tonic::transport::{Channel, Endpoint};
@@ -30,9 +27,11 @@ use tonic::transport::{Channel, Endpoint};
 #[cfg(with_testing)]
 use crate::common::storage_service_test_endpoint;
 use crate::{
-    common::{KeyPrefix, ServiceStoreError, ServiceStoreInternalConfig, MAX_PAYLOAD_SIZE},
+    common::{
+        KeyPrefix, StorageServiceStoreError, StorageServiceStoreInternalConfig, MAX_PAYLOAD_SIZE,
+    },
     key_value_store::{
-        statement::Operation, store_processor_client::StoreProcessorClient, KeyValue,
+        statement::Operation, storage_service_client::StorageServiceClient, KeyValue,
         KeyValueAppend, ReplyContainsKey, ReplyContainsKeys, ReplyExistsNamespace,
         ReplyFindKeyValuesByPrefix, ReplyFindKeysByPrefix, ReplyListAll, ReplyListRootKeys,
         ReplyReadMultiValues, ReplyReadValue, ReplySpecificChunk, RequestContainsKey,
@@ -66,7 +65,15 @@ const MAX_KEY_SIZE: usize = 1000000;
 //   [`KeyPrefix::RootKey`] + namespace + root_key
 //   to indicate the existence of a root key.
 #[derive(Clone)]
-pub struct ServiceStoreClientInternal {
+pub struct StorageServiceDatabaseInternal {
+    channel: Channel,
+    semaphore: Option<Arc<Semaphore>>,
+    max_stream_queries: usize,
+    namespace: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct StorageServiceStoreInternal {
     channel: Channel,
     semaphore: Option<Arc<Semaphore>>,
     max_stream_queries: usize,
@@ -75,29 +82,42 @@ pub struct ServiceStoreClientInternal {
     root_key_written: Arc<AtomicBool>,
 }
 
-impl WithError for ServiceStoreClientInternal {
-    type Error = ServiceStoreError;
+impl WithError for StorageServiceDatabaseInternal {
+    type Error = StorageServiceStoreError;
 }
 
-impl ReadableKeyValueStore for ServiceStoreClientInternal {
+impl WithError for StorageServiceStoreInternal {
+    type Error = StorageServiceStoreError;
+}
+
+impl ReadableKeyValueStore for StorageServiceStoreInternal {
     const MAX_KEY_SIZE: usize = MAX_KEY_SIZE;
-    type Keys = Vec<Vec<u8>>;
-    type KeyValues = Vec<(Vec<u8>, Vec<u8>)>;
 
     fn max_stream_queries(&self) -> usize {
         self.max_stream_queries
     }
 
-    async fn read_value_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ServiceStoreError> {
-        ensure!(key.len() <= MAX_KEY_SIZE, ServiceStoreError::KeyTooLong);
+    fn root_key(&self) -> Result<Vec<u8>, StorageServiceStoreError> {
+        let root_key = bcs::from_bytes(&self.start_key[self.prefix_len..])?;
+        Ok(root_key)
+    }
+
+    async fn read_value_bytes(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, StorageServiceStoreError> {
+        ensure!(
+            key.len() <= MAX_KEY_SIZE,
+            StorageServiceStoreError::KeyTooLong
+        );
         let mut full_key = self.start_key.clone();
         full_key.extend(key);
         let query = RequestReadValue { key: full_key };
         let request = tonic::Request::new(query);
         let channel = self.channel.clone();
-        let mut client = StoreProcessorClient::new(channel);
+        let mut client = StorageServiceClient::new(channel);
         let _guard = self.acquire().await;
-        let response = client.process_read_value(request).await?;
+        let response = client.process_read_value(request).make_sync().await?;
         let response = response.into_inner();
         let ReplyReadValue {
             value,
@@ -111,35 +131,41 @@ impl ReadableKeyValueStore for ServiceStoreClientInternal {
         }
     }
 
-    async fn contains_key(&self, key: &[u8]) -> Result<bool, ServiceStoreError> {
-        ensure!(key.len() <= MAX_KEY_SIZE, ServiceStoreError::KeyTooLong);
+    async fn contains_key(&self, key: &[u8]) -> Result<bool, StorageServiceStoreError> {
+        ensure!(
+            key.len() <= MAX_KEY_SIZE,
+            StorageServiceStoreError::KeyTooLong
+        );
         let mut full_key = self.start_key.clone();
         full_key.extend(key);
         let query = RequestContainsKey { key: full_key };
         let request = tonic::Request::new(query);
         let channel = self.channel.clone();
-        let mut client = StoreProcessorClient::new(channel);
+        let mut client = StorageServiceClient::new(channel);
         let _guard = self.acquire().await;
-        let response = client.process_contains_key(request).await?;
+        let response = client.process_contains_key(request).make_sync().await?;
         let response = response.into_inner();
         let ReplyContainsKey { test } = response;
         Ok(test)
     }
 
-    async fn contains_keys(&self, keys: Vec<Vec<u8>>) -> Result<Vec<bool>, ServiceStoreError> {
+    async fn contains_keys(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, StorageServiceStoreError> {
         let mut full_keys = Vec::new();
         for key in keys {
-            ensure!(key.len() <= MAX_KEY_SIZE, ServiceStoreError::KeyTooLong);
+            ensure!(
+                key.len() <= MAX_KEY_SIZE,
+                StorageServiceStoreError::KeyTooLong
+            );
             let mut full_key = self.start_key.clone();
-            full_key.extend(&key);
+            full_key.extend(key);
             full_keys.push(full_key);
         }
         let query = RequestContainsKeys { keys: full_keys };
         let request = tonic::Request::new(query);
         let channel = self.channel.clone();
-        let mut client = StoreProcessorClient::new(channel);
+        let mut client = StorageServiceClient::new(channel);
         let _guard = self.acquire().await;
-        let response = client.process_contains_keys(request).await?;
+        let response = client.process_contains_keys(request).make_sync().await?;
         let response = response.into_inner();
         let ReplyContainsKeys { tests } = response;
         Ok(tests)
@@ -147,21 +173,27 @@ impl ReadableKeyValueStore for ServiceStoreClientInternal {
 
     async fn read_multi_values_bytes(
         &self,
-        keys: Vec<Vec<u8>>,
-    ) -> Result<Vec<Option<Vec<u8>>>, ServiceStoreError> {
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, StorageServiceStoreError> {
         let mut full_keys = Vec::new();
         for key in keys {
-            ensure!(key.len() <= MAX_KEY_SIZE, ServiceStoreError::KeyTooLong);
+            ensure!(
+                key.len() <= MAX_KEY_SIZE,
+                StorageServiceStoreError::KeyTooLong
+            );
             let mut full_key = self.start_key.clone();
-            full_key.extend(&key);
+            full_key.extend(key);
             full_keys.push(full_key);
         }
         let query = RequestReadMultiValues { keys: full_keys };
         let request = tonic::Request::new(query);
         let channel = self.channel.clone();
-        let mut client = StoreProcessorClient::new(channel);
+        let mut client = StorageServiceClient::new(channel);
         let _guard = self.acquire().await;
-        let response = client.process_read_multi_values(request).await?;
+        let response = client
+            .process_read_multi_values(request)
+            .make_sync()
+            .await?;
         let response = response.into_inner();
         let ReplyReadMultiValues {
             values,
@@ -179,10 +211,10 @@ impl ReadableKeyValueStore for ServiceStoreClientInternal {
     async fn find_keys_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Vec<Vec<u8>>, ServiceStoreError> {
+    ) -> Result<Vec<Vec<u8>>, StorageServiceStoreError> {
         ensure!(
             key_prefix.len() <= MAX_KEY_SIZE,
-            ServiceStoreError::KeyTooLong
+            StorageServiceStoreError::KeyTooLong
         );
         let mut full_key_prefix = self.start_key.clone();
         full_key_prefix.extend(key_prefix);
@@ -191,9 +223,12 @@ impl ReadableKeyValueStore for ServiceStoreClientInternal {
         };
         let request = tonic::Request::new(query);
         let channel = self.channel.clone();
-        let mut client = StoreProcessorClient::new(channel);
+        let mut client = StorageServiceClient::new(channel);
         let _guard = self.acquire().await;
-        let response = client.process_find_keys_by_prefix(request).await?;
+        let response = client
+            .process_find_keys_by_prefix(request)
+            .make_sync()
+            .await?;
         let response = response.into_inner();
         let ReplyFindKeysByPrefix {
             keys,
@@ -210,10 +245,10 @@ impl ReadableKeyValueStore for ServiceStoreClientInternal {
     async fn find_key_values_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ServiceStoreError> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageServiceStoreError> {
         ensure!(
             key_prefix.len() <= MAX_KEY_SIZE,
-            ServiceStoreError::KeyTooLong
+            StorageServiceStoreError::KeyTooLong
         );
         let mut full_key_prefix = self.start_key.clone();
         full_key_prefix.extend(key_prefix);
@@ -222,9 +257,12 @@ impl ReadableKeyValueStore for ServiceStoreClientInternal {
         };
         let request = tonic::Request::new(query);
         let channel = self.channel.clone();
-        let mut client = StoreProcessorClient::new(channel);
+        let mut client = StorageServiceClient::new(channel);
         let _guard = self.acquire().await;
-        let response = client.process_find_key_values_by_prefix(request).await?;
+        let response = client
+            .process_find_key_values_by_prefix(request)
+            .make_sync()
+            .await?;
         let response = response.into_inner();
         let ReplyFindKeyValuesByPrefix {
             key_values,
@@ -243,10 +281,10 @@ impl ReadableKeyValueStore for ServiceStoreClientInternal {
     }
 }
 
-impl WritableKeyValueStore for ServiceStoreClientInternal {
+impl WritableKeyValueStore for StorageServiceStoreInternal {
     const MAX_VALUE_SIZE: usize = usize::MAX;
 
-    async fn write_batch(&self, batch: Batch) -> Result<(), ServiceStoreError> {
+    async fn write_batch(&self, batch: Batch) -> Result<(), StorageServiceStoreError> {
         if batch.operations.is_empty() {
             return Ok(());
         }
@@ -267,15 +305,18 @@ impl WritableKeyValueStore for ServiceStoreClientInternal {
             chunk_size += self.start_key.len();
         }
 
-        let root_key_len = self.start_key.len() - self.prefix_len;
+        let bcs_root_key_len = self.start_key.len() - self.prefix_len;
         for operation in batch.operations {
             let (key_len, value_len) = match &operation {
                 WriteOperation::Delete { key } => (key.len(), 0),
                 WriteOperation::Put { key, value } => (key.len(), value.len()),
                 WriteOperation::DeletePrefix { key_prefix } => (key_prefix.len(), 0),
             };
-            let operation_size = key_len + value_len + root_key_len;
-            ensure!(key_len <= MAX_KEY_SIZE, ServiceStoreError::KeyTooLong);
+            let operation_size = key_len + value_len + bcs_root_key_len;
+            ensure!(
+                key_len <= MAX_KEY_SIZE,
+                StorageServiceStoreError::KeyTooLong
+            );
             if operation_size + chunk_size < MAX_PAYLOAD_SIZE {
                 let statement = self.get_statement(operation);
                 statements.push(statement);
@@ -319,12 +360,12 @@ impl WritableKeyValueStore for ServiceStoreClientInternal {
         self.submit_statements(mem::take(&mut statements)).await
     }
 
-    async fn clear_journal(&self) -> Result<(), ServiceStoreError> {
+    async fn clear_journal(&self) -> Result<(), StorageServiceStoreError> {
         Ok(())
     }
 }
 
-impl ServiceStoreClientInternal {
+impl StorageServiceStoreInternal {
     /// Obtains the semaphore lock on the database if needed.
     async fn acquire(&self) -> Option<SemaphoreGuard<'_>> {
         match &self.semaphore {
@@ -333,14 +374,20 @@ impl ServiceStoreClientInternal {
         }
     }
 
-    async fn submit_statements(&self, statements: Vec<Statement>) -> Result<(), ServiceStoreError> {
+    async fn submit_statements(
+        &self,
+        statements: Vec<Statement>,
+    ) -> Result<(), StorageServiceStoreError> {
         if !statements.is_empty() {
             let query = RequestWriteBatchExtended { statements };
             let request = tonic::Request::new(query);
             let channel = self.channel.clone();
-            let mut client = StoreProcessorClient::new(channel);
+            let mut client = StorageServiceClient::new(channel);
             let _guard = self.acquire().await;
-            let _response = client.process_write_batch_extended(request).await?;
+            let _response = client
+                .process_write_batch_extended(request)
+                .make_sync()
+                .await?;
         }
         Ok(())
     }
@@ -375,15 +422,15 @@ impl ServiceStoreClientInternal {
         &self,
         message_index: i64,
         index: i32,
-    ) -> Result<Vec<u8>, ServiceStoreError> {
+    ) -> Result<Vec<u8>, StorageServiceStoreError> {
         let channel = self.channel.clone();
         let query = RequestSpecificChunk {
             message_index,
             index,
         };
         let request = tonic::Request::new(query);
-        let mut client = StoreProcessorClient::new(channel);
-        let response = client.process_specific_chunk(request).await?;
+        let mut client = StorageServiceClient::new(channel);
+        let response = client.process_specific_chunk(request).make_sync().await?;
         let response = response.into_inner();
         let ReplySpecificChunk { chunk } = response;
         Ok(chunk)
@@ -393,7 +440,7 @@ impl ServiceStoreClientInternal {
         &self,
         message_index: i64,
         num_chunks: i32,
-    ) -> Result<S, ServiceStoreError> {
+    ) -> Result<S, StorageServiceStoreError> {
         let mut handles = Vec::new();
         for index in 0..num_chunks {
             let handle = self.read_single_entry(message_index, index);
@@ -408,23 +455,23 @@ impl ServiceStoreClientInternal {
     }
 }
 
-impl AdminKeyValueStore for ServiceStoreClientInternal {
-    type Config = ServiceStoreInternalConfig;
+impl KeyValueDatabase for StorageServiceDatabaseInternal {
+    type Config = StorageServiceStoreInternalConfig;
+    type Store = StorageServiceStoreInternal;
 
     fn get_name() -> String {
         "service store".to_string()
     }
 
-    async fn connect(config: &Self::Config, namespace: &str) -> Result<Self, ServiceStoreError> {
+    async fn connect(
+        config: &Self::Config,
+        namespace: &str,
+    ) -> Result<Self, StorageServiceStoreError> {
         let semaphore = config
-            .common_config
             .max_concurrent_queries
             .map(|n| Arc::new(Semaphore::new(n)));
         let namespace = bcs::to_bytes(namespace)?;
-        let max_stream_queries = config.common_config.max_stream_queries;
-        let mut start_key = vec![KeyPrefix::Key as u8];
-        start_key.extend(&namespace);
-        let prefix_len = namespace.len() + 1;
+        let max_stream_queries = config.max_stream_queries;
         let endpoint = config.http_address();
         let endpoint = Endpoint::from_shared(endpoint)?;
         let channel = endpoint.connect_lazy();
@@ -432,20 +479,19 @@ impl AdminKeyValueStore for ServiceStoreClientInternal {
             channel,
             semaphore,
             max_stream_queries,
-            prefix_len,
-            start_key,
-            root_key_written: Arc::new(AtomicBool::new(false)),
+            namespace,
         })
     }
 
-    fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, ServiceStoreError> {
+    fn open_shared(&self, root_key: &[u8]) -> Result<Self::Store, StorageServiceStoreError> {
         let channel = self.channel.clone();
-        let prefix_len = self.prefix_len;
         let semaphore = self.semaphore.clone();
         let max_stream_queries = self.max_stream_queries;
-        let mut start_key = self.start_key[..prefix_len].to_vec();
-        start_key.extend(root_key);
-        Ok(Self {
+        let mut start_key = vec![KeyPrefix::Key as u8];
+        start_key.extend(&self.namespace);
+        start_key.extend(bcs::to_bytes(root_key)?);
+        let prefix_len = self.namespace.len() + 1;
+        Ok(StorageServiceStoreInternal {
             channel,
             semaphore,
             max_stream_queries,
@@ -455,11 +501,15 @@ impl AdminKeyValueStore for ServiceStoreClientInternal {
         })
     }
 
-    async fn list_all(config: &Self::Config) -> Result<Vec<String>, ServiceStoreError> {
+    fn open_exclusive(&self, root_key: &[u8]) -> Result<Self::Store, Self::Error> {
+        self.open_shared(root_key)
+    }
+
+    async fn list_all(config: &Self::Config) -> Result<Vec<String>, StorageServiceStoreError> {
         let endpoint = config.http_address();
         let endpoint = Endpoint::from_shared(endpoint)?;
-        let mut client = StoreProcessorClient::connect(endpoint).await?;
-        let response = client.process_list_all(()).await?;
+        let mut client = StorageServiceClient::connect(endpoint).make_sync().await?;
+        let response = client.process_list_all(()).make_sync().await?;
         let response = response.into_inner();
         let ReplyListAll { namespaces } = response;
         let namespaces = namespaces
@@ -469,113 +519,120 @@ impl AdminKeyValueStore for ServiceStoreClientInternal {
         Ok(namespaces)
     }
 
-    async fn list_root_keys(
-        config: &Self::Config,
-        namespace: &str,
-    ) -> Result<Vec<Vec<u8>>, ServiceStoreError> {
-        let namespace = bcs::to_bytes(namespace)?;
-        let query = RequestListRootKeys { namespace };
+    async fn list_root_keys(&self) -> Result<Vec<Vec<u8>>, StorageServiceStoreError> {
+        let query = RequestListRootKeys {
+            namespace: self.namespace.clone(),
+        };
         let request = tonic::Request::new(query);
-        let endpoint = config.http_address();
-        let endpoint = Endpoint::from_shared(endpoint)?;
-        let mut client = StoreProcessorClient::connect(endpoint).await?;
-        let response = client.process_list_root_keys(request).await?;
+        let mut client = StorageServiceClient::new(self.channel.clone());
+        let response = client.process_list_root_keys(request).make_sync().await?;
         let response = response.into_inner();
         let ReplyListRootKeys { root_keys } = response;
         Ok(root_keys)
     }
 
-    async fn delete_all(config: &Self::Config) -> Result<(), ServiceStoreError> {
+    async fn delete_all(config: &Self::Config) -> Result<(), StorageServiceStoreError> {
         let endpoint = config.http_address();
         let endpoint = Endpoint::from_shared(endpoint)?;
-        let mut client = StoreProcessorClient::connect(endpoint).await?;
-        let _response = client.process_delete_all(()).await?;
+        let mut client = StorageServiceClient::connect(endpoint).make_sync().await?;
+        let _response = client.process_delete_all(()).make_sync().await?;
         Ok(())
     }
 
-    async fn exists(config: &Self::Config, namespace: &str) -> Result<bool, ServiceStoreError> {
+    async fn exists(
+        config: &Self::Config,
+        namespace: &str,
+    ) -> Result<bool, StorageServiceStoreError> {
         let namespace = bcs::to_bytes(namespace)?;
         let query = RequestExistsNamespace { namespace };
         let request = tonic::Request::new(query);
         let endpoint = config.http_address();
         let endpoint = Endpoint::from_shared(endpoint)?;
-        let mut client = StoreProcessorClient::connect(endpoint).await?;
-        let response = client.process_exists_namespace(request).await?;
+        let mut client = StorageServiceClient::connect(endpoint).make_sync().await?;
+        let response = client.process_exists_namespace(request).make_sync().await?;
         let response = response.into_inner();
         let ReplyExistsNamespace { exists } = response;
         Ok(exists)
     }
 
-    async fn create(config: &Self::Config, namespace: &str) -> Result<(), ServiceStoreError> {
-        if ServiceStoreClientInternal::exists(config, namespace).await? {
-            return Err(ServiceStoreError::StoreAlreadyExists);
+    async fn create(
+        config: &Self::Config,
+        namespace: &str,
+    ) -> Result<(), StorageServiceStoreError> {
+        if StorageServiceDatabaseInternal::exists(config, namespace).await? {
+            return Err(StorageServiceStoreError::StoreAlreadyExists);
         }
         let namespace = bcs::to_bytes(namespace)?;
         let query = RequestCreateNamespace { namespace };
         let request = tonic::Request::new(query);
         let endpoint = config.http_address();
         let endpoint = Endpoint::from_shared(endpoint)?;
-        let mut client = StoreProcessorClient::connect(endpoint).await?;
-        let _response = client.process_create_namespace(request).await?;
+        let mut client = StorageServiceClient::connect(endpoint).make_sync().await?;
+        let _response = client.process_create_namespace(request).make_sync().await?;
         Ok(())
     }
 
-    async fn delete(config: &Self::Config, namespace: &str) -> Result<(), ServiceStoreError> {
+    async fn delete(
+        config: &Self::Config,
+        namespace: &str,
+    ) -> Result<(), StorageServiceStoreError> {
         let namespace = bcs::to_bytes(namespace)?;
         let query = RequestDeleteNamespace { namespace };
         let request = tonic::Request::new(query);
         let endpoint = config.http_address();
         let endpoint = Endpoint::from_shared(endpoint)?;
-        let mut client = StoreProcessorClient::connect(endpoint).await?;
-        let _response = client.process_delete_namespace(request).await?;
+        let mut client = StorageServiceClient::connect(endpoint).make_sync().await?;
+        let _response = client.process_delete_namespace(request).make_sync().await?;
         Ok(())
     }
 }
 
 #[cfg(with_testing)]
-impl TestKeyValueStore for ServiceStoreClientInternal {
-    async fn new_test_config() -> Result<ServiceStoreInternalConfig, ServiceStoreError> {
+impl TestKeyValueDatabase for StorageServiceDatabaseInternal {
+    async fn new_test_config() -> Result<StorageServiceStoreInternalConfig, StorageServiceStoreError>
+    {
         let endpoint = storage_service_test_endpoint()?;
         service_config_from_endpoint(&endpoint)
     }
 }
 
-/// Creates a `ServiceStoreConfig` from an endpoint.
+/// Creates a `StorageServiceStoreConfig` from an endpoint.
 pub fn service_config_from_endpoint(
     endpoint: &str,
-) -> Result<ServiceStoreInternalConfig, ServiceStoreError> {
-    let common_config = CommonStoreInternalConfig {
+) -> Result<StorageServiceStoreInternalConfig, StorageServiceStoreError> {
+    Ok(StorageServiceStoreInternalConfig {
+        endpoint: endpoint.to_string(),
         max_concurrent_queries: None,
         max_stream_queries: 100,
-    };
-    let endpoint = endpoint.to_string();
-    Ok(ServiceStoreInternalConfig {
-        endpoint,
-        common_config,
     })
 }
 
 /// Checks that endpoint is truly absent.
-pub async fn storage_service_check_absence(endpoint: &str) -> Result<bool, ServiceStoreError> {
+pub async fn storage_service_check_absence(
+    endpoint: &str,
+) -> Result<bool, StorageServiceStoreError> {
     let endpoint = Endpoint::from_shared(endpoint.to_string())?;
-    let result = StoreProcessorClient::connect(endpoint).await;
+    let result = StorageServiceClient::connect(endpoint).await;
     Ok(result.is_err())
 }
 
 /// Checks whether an endpoint is valid or not.
-pub async fn storage_service_check_validity(endpoint: &str) -> Result<(), ServiceStoreError> {
+pub async fn storage_service_check_validity(
+    endpoint: &str,
+) -> Result<(), StorageServiceStoreError> {
     let config = service_config_from_endpoint(endpoint).unwrap();
     let namespace = "namespace";
-    let store = ServiceStoreClientInternal::connect(&config, namespace).await?;
+    let database = StorageServiceDatabaseInternal::connect(&config, namespace).await?;
+    let store = database.open_shared(&[])?;
     let _value = store.read_value_bytes(&[42]).await?;
     Ok(())
 }
 
-/// The service store client with metrics
+/// The service database client with metrics
 #[cfg(with_metrics)]
-pub type ServiceStoreClient =
-    MeteredStore<LruCachingStore<MeteredStore<ServiceStoreClientInternal>>>;
+pub type StorageServiceDatabase =
+    MeteredDatabase<LruCachingDatabase<MeteredDatabase<StorageServiceDatabaseInternal>>>;
 
-/// The service store client without metrics
+/// The service database client without metrics
 #[cfg(not(with_metrics))]
-pub type ServiceStoreClient = LruCachingStore<ServiceStoreClientInternal>;
+pub type StorageServiceDatabase = LruCachingDatabase<StorageServiceDatabaseInternal>;

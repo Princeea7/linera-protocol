@@ -2,8 +2,9 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Deref};
 
+use allocative::{Allocative, Key, Visitor};
 use linera_base::{
     crypto::{ValidatorPublicKey, ValidatorSignature},
     data_types::Round,
@@ -29,6 +30,19 @@ pub struct LiteCertificate<'a> {
     pub signatures: Cow<'a, [(ValidatorPublicKey, ValidatorSignature)]>,
 }
 
+impl Allocative for LiteCertificate<'_> {
+    fn visit<'a, 'b: 'a>(&self, visitor: &'a mut Visitor<'b>) {
+        visitor.visit_field(Key::new("LiteCertificate_value"), &self.value);
+        visitor.visit_field(Key::new("LiteCertificate_round"), &self.round);
+        if matches!(self.signatures, Cow::Owned(_)) {
+            for (public_key, signature) in self.signatures.deref() {
+                visitor.visit_field(Key::new("ValidatorPublicKey"), public_key);
+                visitor.visit_field(Key::new("ValidatorSignature"), signature);
+            }
+        }
+    }
+}
+
 impl LiteCertificate<'_> {
     pub fn new(
         value: LiteValue,
@@ -45,22 +59,26 @@ impl LiteCertificate<'_> {
         }
     }
 
-    /// Creates a [`LiteCertificate`] from a list of votes, without cryptographically checking the
+    /// Creates a [`LiteCertificate`] from a list of votes with their validator public keys, without cryptographically checking the
     /// signatures. Returns `None` if the votes are empty or don't have matching values and rounds.
-    pub fn try_from_votes(votes: impl IntoIterator<Item = LiteVote>) -> Option<Self> {
+    pub fn try_from_votes(
+        votes: impl IntoIterator<Item = (ValidatorPublicKey, LiteVote)>,
+    ) -> Option<Self> {
         let mut votes = votes.into_iter();
-        let LiteVote {
-            value,
-            round,
+        let (
             public_key,
-            signature,
-        } = votes.next()?;
+            LiteVote {
+                value,
+                round,
+                signature,
+            },
+        ) = votes.next()?;
         let mut signatures = vec![(public_key, signature)];
-        for vote in votes {
+        for (validator_key, vote) in votes {
             if vote.value.value_hash != value.value_hash || vote.round != round {
                 return None;
             }
-            signatures.push((vote.public_key, vote.signature));
+            signatures.push((validator_key, vote.signature));
         }
         Some(LiteCertificate::new(value, round, signatures))
     }

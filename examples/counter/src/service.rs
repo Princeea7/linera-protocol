@@ -8,12 +8,13 @@ mod state;
 use std::sync::Arc;
 
 use async_graphql::{EmptySubscription, Object, Request, Response, Schema};
+use counter::CounterOperation;
 use linera_sdk::{linera_base_types::WithServiceAbi, views::View, Service, ServiceRuntime};
 
 use self::state::CounterState;
 
 pub struct CounterService {
-    state: CounterState,
+    state: Arc<CounterState>,
     runtime: Arc<ServiceRuntime<Self>>,
 }
 
@@ -31,16 +32,14 @@ impl Service for CounterService {
             .await
             .expect("Failed to load state");
         CounterService {
-            state,
+            state: Arc::new(state),
             runtime: Arc::new(runtime),
         }
     }
 
     async fn handle_query(&self, request: Request) -> Response {
         let schema = Schema::build(
-            QueryRoot {
-                value: *self.state.value.get(),
-            },
+            self.state.clone(),
             MutationRoot {
                 runtime: self.runtime.clone(),
             },
@@ -58,19 +57,9 @@ struct MutationRoot {
 #[Object]
 impl MutationRoot {
     async fn increment(&self, value: u64) -> [u8; 0] {
-        self.runtime.schedule_operation(&value);
+        let operation = CounterOperation::Increment { value };
+        self.runtime.schedule_operation(&operation);
         []
-    }
-}
-
-struct QueryRoot {
-    value: u64,
-}
-
-#[Object]
-impl QueryRoot {
-    async fn value(&self) -> &u64 {
-        &self.value
     }
 }
 
@@ -94,7 +83,10 @@ mod tests {
             .expect("Failed to read from mock key value store");
         state.value.set(value);
 
-        let service = CounterService { state, runtime };
+        let service = CounterService {
+            state: Arc::new(state),
+            runtime,
+        };
         let request = Request::new("{ value }");
 
         let response = service

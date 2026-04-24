@@ -6,18 +6,20 @@
 use linera_base::{
     abi::{ContractAbi, ServiceAbi},
     data_types::{
-        Amount, ApplicationPermissions, BlockHeight, Resources, SendMessageRequest, Timestamp,
+        Amount, ApplicationDescription, ApplicationPermissions, BlockHeight, Bytecode, Resources,
+        SendMessageRequest, Timestamp,
     },
     ensure, http,
-    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, ModuleId, StreamName},
-    ownership::{
-        AccountPermissionError, ChainOwnership, ChangeApplicationPermissionsError, CloseChainError,
+    identifiers::{
+        Account, AccountOwner, ApplicationId, ChainId, DataBlobHash, ModuleId, StreamName,
     },
+    ownership::{AccountPermissionError, ChainOwnership, ManageChainError},
+    vm::VmRuntime,
 };
 use serde::Serialize;
 
 use super::wit::{base_runtime_api as base_wit, contract_runtime_api as contract_wit};
-use crate::{Contract, DataBlobHash, KeyValueStore, ViewStorageContext};
+use crate::{Contract, KeyValueStore, ViewStorageContext};
 
 /// The common runtime to interface with the host executing the contract.
 ///
@@ -31,11 +33,9 @@ where
     application_id: Option<ApplicationId<Application::Abi>>,
     application_creator_chain_id: Option<ChainId>,
     chain_id: Option<ChainId>,
-    authenticated_signer: Option<Option<AccountOwner>>,
     block_height: Option<BlockHeight>,
     message_is_bouncing: Option<Option<bool>>,
-    message_id: Option<Option<MessageId>>,
-    authenticated_caller_id: Option<Option<ApplicationId>>,
+    message_origin_chain_id: Option<Option<ChainId>>,
     timestamp: Option<Timestamp>,
 }
 
@@ -50,11 +50,9 @@ where
             application_id: None,
             application_creator_chain_id: None,
             chain_id: None,
-            authenticated_signer: None,
             block_height: None,
             message_is_bouncing: None,
-            message_id: None,
-            authenticated_caller_id: None,
+            message_origin_chain_id: None,
             timestamp: None,
         }
     }
@@ -66,7 +64,7 @@ where
 
     /// Returns a storage context suitable for a root view.
     pub fn root_view_storage_context(&self) -> ViewStorageContext {
-        ViewStorageContext::new_unsafe(self.key_value_store(), Vec::new(), ())
+        ViewStorageContext::new_unchecked(self.key_value_store(), Vec::new(), ())
     }
 }
 
@@ -97,6 +95,14 @@ where
         *self
             .application_creator_chain_id
             .get_or_insert_with(|| base_wit::get_application_creator_chain_id().into())
+    }
+
+    /// Returns the description of the given application.
+    pub fn read_application_description(
+        &mut self,
+        application_id: ApplicationId,
+    ) -> ApplicationDescription {
+        base_wit::read_application_description(application_id.forget_abi().into()).into()
     }
 
     /// Returns the ID of the current chain.
@@ -135,6 +141,11 @@ where
         base_wit::get_chain_ownership().into()
     }
 
+    /// Retrieves the application permissions for the current chain.
+    pub fn application_permissions(&mut self) -> ApplicationPermissions {
+        base_wit::get_application_permissions().into()
+    }
+
     /// Makes an HTTP `request` as an oracle and returns the HTTP response.
     ///
     /// Should only be used with queries where it is very likely that all validators will receive
@@ -157,12 +168,22 @@ where
 
     /// Reads a data blob with the given hash from storage.
     pub fn read_data_blob(&mut self, hash: DataBlobHash) -> Vec<u8> {
-        base_wit::read_data_blob(hash.0.into())
+        base_wit::read_data_blob(hash.into())
     }
 
     /// Asserts that a data blob with the given hash exists in storage.
     pub fn assert_data_blob_exists(&mut self, hash: DataBlobHash) {
-        base_wit::assert_data_blob_exists(hash.0.into())
+        base_wit::assert_data_blob_exists(hash.into())
+    }
+
+    /// Returns the amount of execution fuel remaining before execution is aborted.
+    pub fn remaining_fuel(&mut self) -> u64 {
+        contract_wit::remaining_fuel()
+    }
+
+    /// Returns true if the corresponding contract uses a zero amount of storage.
+    pub fn has_empty_storage(&mut self, application: ApplicationId) -> bool {
+        contract_wit::has_empty_storage(application.into())
     }
 }
 
@@ -170,19 +191,9 @@ impl<Application> ContractRuntime<Application>
 where
     Application: Contract,
 {
-    /// Returns the authenticated signer for this execution, if there is one.
-    pub fn authenticated_signer(&mut self) -> Option<AccountOwner> {
-        *self
-            .authenticated_signer
-            .get_or_insert_with(|| contract_wit::authenticated_signer().map(AccountOwner::from))
-    }
-
-    /// Returns the ID of the incoming message that is being handled, or [`None`] if not executing
-    /// an incoming message.
-    pub fn message_id(&mut self) -> Option<MessageId> {
-        *self
-            .message_id
-            .get_or_insert_with(|| contract_wit::get_message_id().map(MessageId::from))
+    /// Returns the authenticated owner for this execution, if there is one.
+    pub fn authenticated_owner(&mut self) -> Option<AccountOwner> {
+        contract_wit::authenticated_owner().map(AccountOwner::from)
     }
 
     /// Returns [`true`] if the incoming message was rejected from the original destination and is
@@ -193,12 +204,18 @@ where
             .get_or_insert_with(contract_wit::message_is_bouncing)
     }
 
+    /// Returns the chain ID where the incoming message originated from, or [`None`] if not executing
+    /// an incoming message.
+    pub fn message_origin_chain_id(&mut self) -> Option<ChainId> {
+        *self
+            .message_origin_chain_id
+            .get_or_insert_with(|| contract_wit::message_origin_chain_id().map(ChainId::from))
+    }
+
     /// Returns the authenticated caller ID, if the caller configured it and if the current context
     /// is executing a cross-application call.
     pub fn authenticated_caller_id(&mut self) -> Option<ApplicationId> {
-        *self
-            .authenticated_caller_id
-            .get_or_insert_with(|| contract_wit::authenticated_caller_id().map(ApplicationId::from))
+        contract_wit::authenticated_caller_id().map(ApplicationId::from)
     }
 
     /// Verifies that the current execution context authorizes operations on a given account.
@@ -207,7 +224,7 @@ where
         owner: AccountOwner,
     ) -> Result<(), AccountPermissionError> {
         ensure!(
-            self.authenticated_signer() == Some(owner)
+            self.authenticated_owner() == Some(owner)
                 || self.authenticated_caller_id().map(AccountOwner::from) == Some(owner),
             AccountPermissionError::NotPermitted(owner)
         );
@@ -238,6 +255,28 @@ where
         contract_wit::claim(source.into(), destination.into(), amount.into())
     }
 
+    /// Approves `spender` to withdraw `amount` of native tokens from `owner`'s account.
+    pub fn approve(&mut self, owner: AccountOwner, spender: AccountOwner, amount: Amount) {
+        contract_wit::approve(owner.into(), spender.into(), amount.into())
+    }
+
+    /// Transfers `amount` of native tokens from `owner` to `destination` using `spender`'s
+    /// allowance.
+    pub fn transfer_from(
+        &mut self,
+        owner: AccountOwner,
+        spender: AccountOwner,
+        destination: Account,
+        amount: Amount,
+    ) {
+        contract_wit::transfer_from(
+            owner.into(),
+            spender.into(),
+            destination.into(),
+            amount.into(),
+        )
+    }
+
     /// Calls another application.
     pub fn call_application<A: ContractAbi + Send>(
         &mut self,
@@ -245,7 +284,7 @@ where
         application: ApplicationId<A>,
         call: &A::Operation,
     ) -> A::Response {
-        let call_bytes = A::serialize_operation(call)
+        let call_bytes = <A as ContractAbi>::serialize_operation(call)
             .expect("Failed to serialize `Operation` in cross-application call");
 
         let response_bytes = contract_wit::try_call_application(
@@ -309,9 +348,9 @@ where
     pub fn query_service<A: ServiceAbi + Send>(
         &mut self,
         application_id: ApplicationId<A>,
-        query: A::Query,
+        query: &A::Query,
     ) -> A::QueryResponse {
-        let query = serde_json::to_vec(&query).expect("Failed to serialize service query");
+        let query = serde_json::to_vec(query).expect("Failed to serialize service query");
         let response = contract_wit::query_service(application_id.forget_abi().into(), &query);
         serde_json::from_slice(&response).expect("Failed to deserialize service response")
     }
@@ -334,15 +373,21 @@ where
 
     /// Closes the current chain. Returns an error if the application doesn't have
     /// permission to do so.
-    pub fn close_chain(&mut self) -> Result<(), CloseChainError> {
+    pub fn close_chain(&mut self) -> Result<(), ManageChainError> {
         contract_wit::close_chain().map_err(|error| error.into())
+    }
+
+    /// Changes the ownership of the current chain. Returns an error if the application doesn't
+    /// have permission to do so.
+    pub fn change_ownership(&mut self, ownership: ChainOwnership) -> Result<(), ManageChainError> {
+        contract_wit::change_ownership(&ownership.into()).map_err(|error| error.into())
     }
 
     /// Changes the application permissions for the current chain.
     pub fn change_application_permissions(
         &mut self,
         application_permissions: ApplicationPermissions,
-    ) -> Result<(), ChangeApplicationPermissionsError> {
+    ) -> Result<(), ManageChainError> {
         contract_wit::change_application_permissions(&application_permissions.into())
             .map_err(|error| error.into())
     }
@@ -378,7 +423,23 @@ where
         ApplicationId::from(application_id).with_abi::<Abi>()
     }
 
-    /// Returns the round in which this block was validated.
+    /// Creates a new data blob and returns its hash.
+    pub fn create_data_blob(&mut self, bytes: &[u8]) -> DataBlobHash {
+        let hash = contract_wit::create_data_blob(bytes);
+        hash.into()
+    }
+
+    /// Publishes a module with contract and service bytecode and returns the module ID.
+    pub fn publish_module(
+        &mut self,
+        contract: Bytecode,
+        service: Bytecode,
+        vm_runtime: VmRuntime,
+    ) -> ModuleId {
+        contract_wit::publish_module(&contract.into(), &service.into(), vm_runtime.into()).into()
+    }
+
+    /// Returns the multi-leader round in which this block was validated.
     pub fn validation_round(&mut self) -> Option<u32> {
         contract_wit::validation_round()
     }
@@ -418,7 +479,7 @@ where
         self
     }
 
-    /// Forwards the authenticated signer with the message.
+    /// Forwards the authenticated owner with the message.
     pub fn with_authentication(mut self) -> Self {
         self.authenticated = true;
         self

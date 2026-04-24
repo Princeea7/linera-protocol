@@ -1,12 +1,12 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashSet, time::Duration};
+use std::collections::{HashSet, VecDeque};
 
 use custom_debug_derive::Debug;
-use futures::{future::try_join_all, stream::FuturesUnordered, StreamExt};
+use futures::future::try_join_all;
 use linera_base::{
-    crypto::{CryptoHash, ValidatorPublicKey},
+    crypto::ValidatorPublicKey,
     data_types::{Blob, BlockHeight},
     ensure,
     identifiers::{BlobId, ChainId},
@@ -18,11 +18,10 @@ use linera_chain::{
         TimeoutCertificate, ValidatedBlockCertificate,
     },
 };
-use rand::seq::SliceRandom as _;
-use tracing::{instrument, warn};
+use tracing::{debug, info, instrument};
 
 use crate::{
-    data_types::{BlockHeightRange, ChainInfo, ChainInfoQuery, ChainInfoResponse},
+    data_types::{ChainInfo, ChainInfoQuery, ChainInfoResponse},
     node::{CrossChainMessageDelivery, NodeError, ValidatorNode},
 };
 
@@ -100,48 +99,53 @@ impl<N: ValidatorNode> RemoteNode<N> {
     }
 
     pub(crate) async fn handle_optimized_validated_certificate(
-        &mut self,
+        &self,
         certificate: &ValidatedBlockCertificate,
         delivery: CrossChainMessageDelivery,
     ) -> Result<Box<ChainInfo>, NodeError> {
-        if certificate.is_signed_by(&self.public_key) {
-            let result = self
-                .handle_lite_certificate(certificate.lite_certificate(), delivery)
-                .await;
-            match result {
-                Err(NodeError::MissingCertificateValue) => {
-                    warn!(
-                        "Validator {} forgot a certificate value that they signed before",
-                        self.public_key
-                    );
-                }
-                _ => return result,
-            }
+        if let Some(result) = self.try_lite_certificate(certificate, delivery).await {
+            return result;
         }
         self.handle_validated_certificate(certificate.clone()).await
     }
 
     pub(crate) async fn handle_optimized_confirmed_certificate(
-        &mut self,
+        &self,
         certificate: &ConfirmedBlockCertificate,
         delivery: CrossChainMessageDelivery,
     ) -> Result<Box<ChainInfo>, NodeError> {
-        if certificate.is_signed_by(&self.public_key) {
-            let result = self
-                .handle_lite_certificate(certificate.lite_certificate(), delivery)
-                .await;
-            match result {
-                Err(NodeError::MissingCertificateValue) => {
-                    warn!(
-                        "Validator {} forgot a certificate value that they signed before",
-                        self.public_key
-                    );
-                }
-                _ => return result,
-            }
+        if let Some(result) = self.try_lite_certificate(certificate, delivery).await {
+            return result;
         }
         self.handle_confirmed_certificate(certificate.clone(), delivery)
             .await
+    }
+
+    /// Tries to send a lite certificate if this validator signed it. Returns `Some` on
+    /// success or non-recoverable error, `None` if the full certificate should be sent.
+    async fn try_lite_certificate<T: CertificateValue>(
+        &self,
+        certificate: &GenericCertificate<T>,
+        delivery: CrossChainMessageDelivery,
+    ) -> Option<Result<Box<ChainInfo>, NodeError>> {
+        if !certificate.is_signed_by(&self.public_key) {
+            return None;
+        }
+        let result = self
+            .handle_lite_certificate(certificate.lite_certificate(), delivery)
+            .await;
+        match result {
+            Err(NodeError::MissingCertificateValue) => {
+                debug!(
+                    address = self.address(),
+                    certificate_hash = %certificate.hash(),
+                    kind = ?T::KIND,
+                    "validator forgot a certificate value that they signed before",
+                );
+                None
+            }
+            other => Some(other),
+        }
     }
 
     fn check_and_return_info(
@@ -155,44 +159,10 @@ impl<N: ValidatorNode> RemoteNode<N> {
         ensure!(
             proposed.is_none_or(|proposal| proposal.content.block.chain_id == chain_id)
                 && locking.is_none_or(|cert| cert.chain_id() == chain_id)
-                && response.check(&self.public_key).is_ok(),
+                && response.check(self.public_key).is_ok(),
             NodeError::InvalidChainInfoResponse
         );
         Ok(response.info)
-    }
-
-    #[instrument(level = "trace", skip_all)]
-    pub(crate) async fn try_query_certificates_from(
-        &self,
-        chain_id: ChainId,
-        start: BlockHeight,
-        limit: u64,
-    ) -> Result<Option<Vec<ConfirmedBlockCertificate>>, NodeError> {
-        tracing::debug!(name = ?self.public_key, ?chain_id, ?start, ?limit, "Querying certificates");
-        let range = BlockHeightRange {
-            start,
-            limit: Some(limit),
-        };
-        let query = ChainInfoQuery::new(chain_id).with_sent_certificate_hashes_in_range(range);
-        match self.handle_chain_info_query(query).await {
-            Ok(info) => {
-                let certificates = self
-                    .node
-                    .download_certificates(info.requested_sent_certificate_hashes)
-                    .await?
-                    .into_iter()
-                    .map(|c| {
-                        ConfirmedBlockCertificate::try_from(c)
-                            .map_err(|_| NodeError::InvalidChainInfoResponse)
-                    })
-                    .collect::<Result<_, _>>()?;
-                Ok(Some(certificates))
-            }
-            Err(error) => {
-                tracing::warn!("Failed to query certificates: {error}");
-                Ok(None)
-            }
-        }
     }
 
     #[instrument(level = "trace")]
@@ -200,26 +170,16 @@ impl<N: ValidatorNode> RemoteNode<N> {
         &self,
         blob_id: BlobId,
     ) -> Result<ConfirmedBlockCertificate, NodeError> {
-        let last_used_hash = self.node.blob_last_used_by(blob_id).await?;
-        let certificate = self.node.download_certificate(last_used_hash).await?;
+        let certificate = self.node.blob_last_used_by_certificate(blob_id).await?;
         if !certificate.block().requires_or_creates_blob(&blob_id) {
-            warn!(
-                "Got invalid last used by certificate for blob {} from validator {}",
-                blob_id, self.public_key
+            info!(
+                address = self.address(),
+                %blob_id,
+                "got invalid last used by certificate for blob from validator",
             );
             return Err(NodeError::InvalidCertificateForBlob(blob_id));
         }
         Ok(certificate)
-    }
-
-    /// Uploads the blobs to the validator.
-    #[instrument(level = "trace")]
-    pub(crate) async fn upload_blobs(&self, blobs: Vec<Blob>) -> Result<(), NodeError> {
-        let tasks = blobs
-            .into_iter()
-            .map(|blob| self.node.upload_blob(blob.into()));
-        try_join_all(tasks).await?;
-        Ok(())
     }
 
     /// Sends a pending validated block's blobs to the validator.
@@ -236,128 +196,77 @@ impl<N: ValidatorNode> RemoteNode<N> {
         Ok(())
     }
 
-    /// Tries to download the given blobs from this node. Returns `None` if not all could be found.
     #[instrument(level = "trace")]
-    pub(crate) async fn try_download_blobs(&self, blob_ids: &[BlobId]) -> Option<Vec<Blob>> {
-        let mut stream = blob_ids
-            .iter()
-            .map(|blob_id| self.try_download_blob(*blob_id))
-            .collect::<FuturesUnordered<_>>();
-        let mut blobs = Vec::new();
-        while let Some(maybe_blob) = stream.next().await {
-            blobs.push(maybe_blob?);
-        }
-        Some(blobs)
-    }
-
-    #[instrument(level = "trace")]
-    async fn try_download_blob(&self, blob_id: BlobId) -> Option<Blob> {
+    pub async fn download_blob(&self, blob_id: BlobId) -> Result<Option<Blob>, NodeError> {
         match self.node.download_blob(blob_id).await {
             Ok(blob) => {
                 let blob = Blob::new(blob);
                 if blob.id() != blob_id {
                     tracing::info!(
-                        "Validator {} sent an invalid blob {blob_id}.",
-                        self.public_key
+                        address = self.address(),
+                        %blob_id,
+                        "validator sent an invalid blob.",
                     );
-                    None
+                    Ok(None)
                 } else {
-                    Some(blob)
+                    Ok(Some(blob))
                 }
             }
-            Err(error) => {
+            Err(NodeError::BlobsNotFound(_error)) => {
                 tracing::debug!(
-                    "Failed to fetch blob {blob_id} from validator {}: {error}",
-                    self.public_key
+                    ?blob_id,
+                    address = self.address(),
+                    "validator is missing the blob",
                 );
-                None
+                Ok(None)
             }
+            Err(error) => Err(error),
         }
     }
 
-    /// Returns the list of certificate hashes on the given chain in the given range of heights.
-    /// Returns an error if the number of hashes does not match the size of the range.
+    /// Downloads a list of certificates from the given chain.
     #[instrument(level = "trace")]
-    pub(crate) async fn fetch_sent_certificate_hashes(
+    pub async fn download_certificates_by_heights(
         &self,
         chain_id: ChainId,
-        range: BlockHeightRange,
-    ) -> Result<Vec<CryptoHash>, NodeError> {
-        let query =
-            ChainInfoQuery::new(chain_id).with_sent_certificate_hashes_in_range(range.clone());
-        let response = self.handle_chain_info_query(query).await?;
-        let hashes = response.requested_sent_certificate_hashes;
-
-        if range
-            .limit
-            .is_some_and(|limit| hashes.len() as u64 != limit)
-        {
-            warn!(
-                ?range,
-                received_num = hashes.len(),
-                "Validator sent invalid number of certificate hashes."
-            );
-            return Err(NodeError::InvalidChainInfoResponse);
-        }
-        Ok(hashes)
-    }
-
-    #[instrument(level = "trace")]
-    pub async fn download_certificates(
-        &self,
-        hashes: Vec<CryptoHash>,
+        heights: Vec<BlockHeight>,
     ) -> Result<Vec<ConfirmedBlockCertificate>, NodeError> {
-        if hashes.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.node.download_certificates(hashes).await
-    }
+        let mut expected_heights = VecDeque::from(heights.clone());
+        let certificates = self
+            .node
+            .download_certificates_by_heights(chain_id, heights)
+            .await?;
 
-    /// Downloads a blob, but does not verify if it has actually been published and
-    /// accepted by a quorum of validators.
-    #[instrument(level = "trace", skip(validators))]
-    pub async fn download_blob(
-        validators: &[Self],
-        blob_id: BlobId,
-        timeout: Duration,
-    ) -> Option<Blob> {
-        // Sequentially try each validator in random order.
-        let mut validators = validators.iter().collect::<Vec<_>>();
-        validators.shuffle(&mut rand::thread_rng());
-        let mut stream = validators
-            .into_iter()
-            .zip(0..)
-            .map(|(remote_node, i)| async move {
-                linera_base::time::timer::sleep(timeout * i * i).await;
-                remote_node.try_download_blob(blob_id).await
-            })
-            .collect::<FuturesUnordered<_>>();
-        while let Some(maybe_blob) = stream.next().await {
-            if let Some(blob) = maybe_blob {
-                return Some(blob);
+        if certificates.len() > expected_heights.len() {
+            return Err(NodeError::TooManyCertificatesReturned {
+                chain_id,
+                remote_node: Box::new(self.public_key),
+            });
+        }
+
+        for certificate in &certificates {
+            ensure!(
+                certificate.inner().chain_id() == chain_id,
+                NodeError::UnexpectedCertificateValue
+            );
+            if let Some(expected_height) = expected_heights.pop_front() {
+                ensure!(
+                    expected_height == certificate.inner().height(),
+                    NodeError::UnexpectedCertificateValue
+                );
+            } else {
+                return Err(NodeError::UnexpectedCertificateValue);
             }
         }
-        None
-    }
 
-    /// Downloads the blobs with the given IDs. This is done in one concurrent task per block.
-    /// Each task goes through the validators sequentially in random order and tries to download
-    /// it. Returns `None` if it couldn't find all blobs.
-    #[instrument(level = "trace", skip(validators))]
-    pub async fn download_blobs(
-        blob_ids: &[BlobId],
-        validators: &[Self],
-        timeout: Duration,
-    ) -> Option<Vec<Blob>> {
-        let mut stream = blob_ids
-            .iter()
-            .map(|blob_id| Self::download_blob(validators, *blob_id, timeout))
-            .collect::<FuturesUnordered<_>>();
-        let mut blobs = Vec::new();
-        while let Some(maybe_blob) = stream.next().await {
-            blobs.push(maybe_blob?);
-        }
-        Some(blobs)
+        ensure!(
+            expected_heights.is_empty(),
+            NodeError::MissingCertificatesByHeights {
+                chain_id,
+                heights: expected_heights.into_iter().collect(),
+            }
+        );
+        Ok(certificates)
     }
 
     /// Checks that requesting these blobs when trying to handle this certificate is legitimate,
@@ -369,18 +278,37 @@ impl<N: ValidatorNode> RemoteNode<N> {
     ) -> Result<(), NodeError> {
         ensure!(!blob_ids.is_empty(), NodeError::EmptyBlobsNotFound);
         let required = certificate.inner().required_blob_ids();
-        let public_key = &self.public_key;
         for blob_id in blob_ids {
             if !required.contains(blob_id) {
-                warn!("validator {public_key} requested blob {blob_id:?} but it is not required");
+                info!(
+                    address = self.address(),
+                    %blob_id,
+                    "validator requested blob but it is not required",
+                );
                 return Err(NodeError::UnexpectedEntriesInBlobsNotFound);
             }
         }
-        let unique_missing_blob_ids = blob_ids.iter().cloned().collect::<HashSet<_>>();
+        let unique_missing_blob_ids = blob_ids.iter().copied().collect::<HashSet<_>>();
         if blob_ids.len() > unique_missing_blob_ids.len() {
-            warn!("blobs requested by validator {public_key} contain duplicates");
+            info!(
+                address = self.address(),
+                "blobs requested by validator contain duplicates",
+            );
             return Err(NodeError::DuplicatesInBlobsNotFound);
         }
         Ok(())
     }
+
+    /// Returns the validator's URL.
+    pub fn address(&self) -> String {
+        self.node.address()
+    }
 }
+
+impl<N: ValidatorNode> PartialEq for RemoteNode<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.public_key == other.public_key
+    }
+}
+
+impl<N: ValidatorNode> Eq for RemoteNode<N> {}

@@ -50,6 +50,12 @@ linera_spawn linera net up --with-faucet --faucet-port $FAUCET_PORT
 #   FAUCET_URL=https://faucet.testnet-XXX.linera.net  # for some value XXX
 ```
 
+Enable logs for user applications:
+
+```bash
+export LINERA_APPLICATION_LOGS=true
+```
+
 Create the user wallet and add chains to it:
 
 ```bash
@@ -65,9 +71,9 @@ INFO_2=($(linera wallet request-chain --faucet $FAUCET_URL))
 CHAIN_AMM="${INFO_AMM[0]}"
 CHAIN_1="${INFO_1[0]}"
 CHAIN_2="${INFO_2[0]}"
-OWNER_AMM="${INFO_AMM[2]}"
-OWNER_1="${INFO_1[2]}"
-OWNER_2="${INFO_2[2]}"
+OWNER_AMM="${INFO_AMM[1]}"
+OWNER_1="${INFO_1[1]}"
+OWNER_2="${INFO_2[1]}"
 ```
 
 Now we have to publish and create the fungible applications. The flag `--wait-for-outgoing-messages` waits until a quorum of validators has confirmed that all sent cross-chain messages have been delivered.
@@ -248,12 +254,12 @@ with empty blocks.
 kill %% && sleep 1    # Kill the service so we can use CLI commands for chain 1.
 
 linera --wait-for-outgoing-messages change-ownership \
-    --owners $OWNER_AMM $OWNER_2
+    --owners "{\"$OWNER_AMM\":100,\"$OWNER_2\":100}"
 
 linera --wait-for-outgoing-messages change-application-permissions \
-    --execute-operations $AMM_APPLICATION_ID \
-    --mandatory-applications $AMM_APPLICATION_ID \
-    --close-chain $AMM_APPLICATION_ID
+    --execute-operations "[\"$AMM_APPLICATION_ID\"]" \
+    --mandatory-applications "[\"$AMM_APPLICATION_ID\"]" \
+    --manage-chain "[\"$AMM_APPLICATION_ID\"]"
 
 linera service --port $PORT &
 ```

@@ -2,7 +2,7 @@ name: Docker Image
 
 on:
   push:
-    branches: [ 'devnet_*', 'testnet_*' ]
+    branches: [ 'devnet_*', 'testnet_*', 'bridge-main' ]
   workflow_dispatch:
 
 permissions:
@@ -10,53 +10,159 @@ permissions:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
+    runs-on: linera-io-self-hosted-builder
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Auth service account
         uses: google-github-actions/auth@v1
         with:
           credentials_json: ${{ secrets.GCP_SA_ACTIONS_RUNNER_KEY }}
+
       - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v1
-    
-      - name: Authenticate Docker with GCP
+
+      - name: Configure Docker to push to Artifact Registry
+        run: gcloud auth configure-docker us-docker.pkg.dev --quiet
+
+      # Self-hosted builder occasionally exposes an unhealthy
+      # docker socket at job start despite
+      # RUNNER_WAIT_FOR_DOCKER_IN_SECONDS. Probe + retry so
+      # we do not fail the whole run on a startup race.
+      - name: Wait for docker daemon
         run: |
-          gcloud auth configure-docker us-docker.pkg.dev
-  
+          for i in $(seq 1 60); do
+            if docker info >/dev/null 2>&1; then
+              echo "Docker ready after ${i} attempt(s)"
+              exit 0
+            fi
+            echo "Waiting for docker daemon ($i/60)..."
+            sleep 2
+          done
+          echo "Docker daemon did not become ready in 120s"
+          exit 1
+
       - name: Set env variables
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          echo "GIT_COMMIT_SHORT=${GITHUB_SHA:0:7}" >> $GITHUB_ENV
-          echo "GIT_COMMIT_LONG=${GITHUB_SHA}" >> $GITHUB_ENV
-          if [ -n "${{ github.head_ref }}" ]; then
-            echo "BRANCH_NAME=${{ github.head_ref }}" >> $GITHUB_ENV
+          if [ -n "${HEAD_REF}" ]; then
+            BRANCH_NAME="${HEAD_REF}"
           else
-            echo "BRANCH_NAME=${{ github.ref_name }}" >> $GITHUB_ENV
+            BRANCH_NAME="${REF_NAME}"
           fi
 
-      - name: Set docker image env variable
+          echo "GIT_COMMIT_SHORT=${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+          echo "GIT_COMMIT_LONG=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "BRANCH_NAME=${BRANCH_NAME}" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_ENV"
+
+          REGISTRY_BASE="us-docker.pkg.dev/linera-io-dev/linera-public-registry"
+
+          for IMAGE_VAR in LINERA:linera INDEXER:linera-indexer EXPLORER:linera-explorer EXPORTER:linera-exporter BRIDGE:linera-bridge; do
+            VAR="${IMAGE_VAR%%:*}"
+            NAME="${IMAGE_VAR##*:}"
+            echo "${VAR}_IMAGE_BRANCH=${REGISTRY_BASE}/${NAME}:${BRANCH_NAME}" >> "$GITHUB_ENV"
+            echo "${VAR}_IMAGE_SHORT=${REGISTRY_BASE}/${NAME}:${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+            echo "${VAR}_IMAGE_LONG=${REGISTRY_BASE}/${NAME}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+          done
+
+      - name: Prune stale Docker layers
+        run: docker system prune -af --filter "until=24h" || true
+
+      - name: Build and push all images in parallel
         run: |
-          echo "DOCKER_IMAGE=us-docker.pkg.dev/linera-io-dev/linera-public-registry/linera" >> $GITHUB_ENV
-  
-      - name: Build Docker image
-        run: |
-          docker build --build-arg git_commit=${{ env.GIT_COMMIT_LONG }} --build-arg build_flag="--release" --build-arg build_folder="release" \
-            -f docker/Dockerfile . \
-            -t ${{ env.DOCKER_IMAGE }}:${{ env.BRANCH_NAME }} \
-            -t ${{ env.DOCKER_IMAGE }}:${{ env.GIT_COMMIT_SHORT }} \
-            -t ${{ env.DOCKER_IMAGE }}:${{ env.GIT_COMMIT_LONG }}
-  
-      - name: Push Docker image to Google Artifact Registry
-        run: |
-          docker push ${{ env.DOCKER_IMAGE }}:${{ env.BRANCH_NAME }}
-          docker push ${{ env.DOCKER_IMAGE }}:${{ env.GIT_COMMIT_SHORT }}
-          docker push ${{ env.DOCKER_IMAGE }}:${{ env.GIT_COMMIT_LONG }}
+          set -e
+
+          build_and_push() {
+            local DOCKERFILE=$1
+            local IMAGE_BRANCH=$2
+            local IMAGE_SHORT=$3
+            local IMAGE_LONG=$4
+            local BUILD_NAME=$5
+            local LOG_FILE="/tmp/${BUILD_NAME}.log"
+
+            {
+              echo "========================================"
+              echo "Building ${BUILD_NAME} (${DOCKERFILE})"
+              echo "========================================"
+
+              DOCKER_BUILDKIT=1 docker build \
+                -t "${IMAGE_BRANCH}" \
+                -t "${IMAGE_SHORT}" \
+                -t "${IMAGE_LONG}" \
+                -f "${DOCKERFILE}" \
+                --build-arg "git_commit=${GIT_COMMIT_LONG}" \
+                --build-arg "build_date=${BUILD_DATE}" \
+                --build-arg "build_flag=--release" \
+                --build-arg "build_folder=release" \
+                .
+
+              echo "Pushing ${BUILD_NAME} images..."
+              docker push "${IMAGE_BRANCH}"
+              docker push "${IMAGE_SHORT}"
+              docker push "${IMAGE_LONG}"
+
+              echo "${BUILD_NAME} completed successfully"
+            } > "${LOG_FILE}" 2>&1
+          }
+
+          echo "Starting parallel builds..."
+
+          build_and_push "docker/Dockerfile" \
+            "${LINERA_IMAGE_BRANCH}" "${LINERA_IMAGE_SHORT}" "${LINERA_IMAGE_LONG}" "Linera" &
+          PID_LINERA=$!
+
+          build_and_push "docker/Dockerfile.indexer" \
+            "${INDEXER_IMAGE_BRANCH}" "${INDEXER_IMAGE_SHORT}" "${INDEXER_IMAGE_LONG}" "Indexer" &
+          PID_INDEXER=$!
+
+          build_and_push "docker/Dockerfile.explorer" \
+            "${EXPLORER_IMAGE_BRANCH}" "${EXPLORER_IMAGE_SHORT}" "${EXPLORER_IMAGE_LONG}" "Explorer" &
+          PID_EXPLORER=$!
+
+          build_and_push "docker/Dockerfile.exporter" \
+            "${EXPORTER_IMAGE_BRANCH}" "${EXPORTER_IMAGE_SHORT}" "${EXPORTER_IMAGE_LONG}" "Exporter" &
+          PID_EXPORTER=$!
+
+          build_and_push "docker/Dockerfile.bridge" \
+            "${BRIDGE_IMAGE_BRANCH}" "${BRIDGE_IMAGE_SHORT}" "${BRIDGE_IMAGE_LONG}" "Bridge" &
+          PID_BRIDGE=$!
+
+          SUCCESS_NAMES=""
+          FAILED_NAMES=""
+          for NAME_PID in Linera:$PID_LINERA Indexer:$PID_INDEXER Explorer:$PID_EXPLORER Exporter:$PID_EXPORTER Bridge:$PID_BRIDGE; do
+            NAME="${NAME_PID%%:*}"
+            PID="${NAME_PID##*:}"
+            if wait "$PID"; then
+              SUCCESS_NAMES="${SUCCESS_NAMES} ${NAME}"
+            else
+              FAILED_NAMES="${FAILED_NAMES} ${NAME}"
+              echo "::error::${NAME} build failed"
+            fi
+          done
+
+          # Print successes first, then failures, so the last thing
+          # on screen when a build fails is the failing log.
+          for NAME in ${SUCCESS_NAMES}; do
+            echo "::group::${NAME} (success)"
+            cat "/tmp/${NAME}.log" 2>/dev/null || true
+            echo "::endgroup::"
+          done
+          for NAME in ${FAILED_NAMES}; do
+            echo "::group::${NAME} (FAILED)"
+            cat "/tmp/${NAME}.log" 2>/dev/null || true
+            echo "::endgroup::"
+          done
+
+          if [ -n "${FAILED_NAMES}" ]; then
+            echo "One or more image builds failed:${FAILED_NAMES}"
+            exit 1
+          fi
+
+          echo "All image builds completed successfully!"

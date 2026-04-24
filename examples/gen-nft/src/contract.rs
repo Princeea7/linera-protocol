@@ -7,10 +7,9 @@ mod state;
 
 use std::collections::BTreeSet;
 
-use fungible::Account;
 use gen_nft::{GenNftAbi, Message, Nft, Operation, TokenId};
 use linera_sdk::{
-    linera_base_types::{AccountOwner, WithContractAbi},
+    linera_base_types::{Account, AccountOwner, WithContractAbi},
     views::{RootView, View},
     Contract, ContractRuntime,
 };
@@ -125,8 +124,11 @@ impl Contract for GenNftContract {
         }
     }
 
-    async fn store(mut self) {
-        self.state.save().await.expect("Failed to save state");
+    async fn store(self) {
+        self.state
+            .save_and_drop()
+            .await
+            .expect("Failed to save state");
     }
 }
 

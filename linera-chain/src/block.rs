@@ -8,12 +8,13 @@ use std::{
     fmt::Debug,
 };
 
+use allocative::Allocative;
 use async_graphql::SimpleObject;
 use linera_base::{
     crypto::{BcsHashable, CryptoHash},
     data_types::{Blob, BlockHeight, Epoch, Event, OracleResponse, Timestamp},
     hashed::Hashed,
-    identifiers::{AccountOwner, BlobId, BlobType, ChainId, MessageId},
+    identifiers::{AccountOwner, BlobId, BlobType, ChainId, EventId, StreamId},
 };
 use linera_execution::{BlobState, Operation, OutgoingMessage};
 use serde::{ser::SerializeStruct, Deserialize, Serialize};
@@ -22,13 +23,13 @@ use thiserror::Error;
 use crate::{
     data_types::{
         BlockExecutionOutcome, IncomingBundle, MessageBundle, OperationResult, OutgoingMessageExt,
-        ProposedBlock,
+        ProposedBlock, Transaction,
     },
     types::CertificateValue,
 };
 
 /// Wrapper around a `Block` that has been validated.
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Allocative)]
 #[serde(transparent)]
 pub struct ValidatedBlock(Hashed<Block>);
 
@@ -74,7 +75,7 @@ impl ValidatedBlock {
 }
 
 /// Wrapper around a `Block` that has been confirmed.
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Allocative)]
 #[serde(transparent)]
 pub struct ConfirmedBlock(Hashed<Block>);
 
@@ -129,6 +130,10 @@ impl ConfirmedBlock {
         self.0.inner().header.height
     }
 
+    pub fn timestamp(&self) -> Timestamp {
+        self.0.inner().header.timestamp
+    }
+
     pub fn to_log_str(&self) -> &'static str {
         "confirmed_block"
     }
@@ -139,26 +144,26 @@ impl ConfirmedBlock {
     }
 
     /// Returns a blob state that applies to all blobs used by this block.
-    pub fn to_blob_state(&self) -> BlobState {
+    pub fn to_blob_state(&self, is_stored_block: bool) -> BlobState {
         BlobState {
-            last_used_by: self.0.hash(),
+            last_used_by: is_stored_block.then_some(self.0.hash()),
             chain_id: self.chain_id(),
             block_height: self.height(),
-            epoch: self.epoch(),
+            epoch: is_stored_block.then_some(self.epoch()),
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Allocative)]
 #[serde(transparent)]
 pub struct Timeout(Hashed<TimeoutInner>);
 
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Allocative)]
 #[serde(rename = "Timeout")]
-pub struct TimeoutInner {
-    pub chain_id: ChainId,
-    pub height: BlockHeight,
-    pub epoch: Epoch,
+pub(crate) struct TimeoutInner {
+    chain_id: ChainId,
+    height: BlockHeight,
+    epoch: Epoch,
 }
 
 impl Timeout {
@@ -187,7 +192,7 @@ impl Timeout {
         self.0.inner().epoch
     }
 
-    pub fn inner(&self) -> &Hashed<TimeoutInner> {
+    pub(crate) fn inner(&self) -> &Hashed<TimeoutInner> {
         &self.0
     }
 }
@@ -217,7 +222,7 @@ pub enum ConversionError {
 /// and operations to execute which define a state transition of the chain.
 /// Resulting messages produced by the operations are also included in the block body,
 /// together with oracle responses and events.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, SimpleObject)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, SimpleObject, Allocative)]
 pub struct Block {
     /// Header of the block containing metadata of the block.
     pub header: BlockHeader,
@@ -236,7 +241,7 @@ impl Serialize for Block {
             timestamp: self.header.timestamp,
             state_hash: self.header.state_hash,
             previous_block_hash: self.header.previous_block_hash,
-            authenticated_signer: self.header.authenticated_signer,
+            authenticated_owner: self.header.authenticated_owner,
         };
         state.serialize_field("header", &header)?;
         state.serialize_field("body", &self.body)?;
@@ -254,12 +259,14 @@ impl<'de> Deserialize<'de> for Block {
         }
         let inner = Inner::deserialize(deserializer)?;
 
-        let bundles_hash = hashing::hash_vec(&inner.body.incoming_bundles);
+        let transactions_hash = hashing::hash_vec(&inner.body.transactions);
         let messages_hash = hashing::hash_vec_vec(&inner.body.messages);
         let previous_message_blocks_hash = CryptoHash::new(&PreviousMessageBlocksMap {
             inner: Cow::Borrowed(&inner.body.previous_message_blocks),
         });
-        let operations_hash = hashing::hash_vec(&inner.body.operations);
+        let previous_event_blocks_hash = CryptoHash::new(&PreviousEventBlocksMap {
+            inner: Cow::Borrowed(&inner.body.previous_event_blocks),
+        });
         let oracle_responses_hash = hashing::hash_vec_vec(&inner.body.oracle_responses);
         let events_hash = hashing::hash_vec_vec(&inner.body.events);
         let blobs_hash = hashing::hash_vec_vec(&inner.body.blobs);
@@ -272,11 +279,11 @@ impl<'de> Deserialize<'de> for Block {
             timestamp: inner.header.timestamp,
             state_hash: inner.header.state_hash,
             previous_block_hash: inner.header.previous_block_hash,
-            authenticated_signer: inner.header.authenticated_signer,
-            bundles_hash,
-            operations_hash,
+            authenticated_owner: inner.header.authenticated_owner,
+            transactions_hash,
             messages_hash,
             previous_message_blocks_hash,
+            previous_event_blocks_hash,
             oracle_responses_hash,
             events_hash,
             blobs_hash,
@@ -293,7 +300,7 @@ impl<'de> Deserialize<'de> for Block {
 /// Succinct representation of a block.
 /// Contains all the metadata to follow the chain of blocks or verifying
 /// inclusion (event, message, oracle response, etc.) in the block's body.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject, Allocative)]
 pub struct BlockHeader {
     /// The chain to which this block belongs.
     pub chain_id: ChainId,
@@ -311,19 +318,19 @@ pub struct BlockHeader {
     /// fees. If set, this must be the `owner` in the block proposal. `None` means that
     /// the default account of the chain is used. This value is also used as recipient of
     /// potential refunds for the message grants created by the operations.
-    pub authenticated_signer: Option<AccountOwner>,
+    pub authenticated_owner: Option<AccountOwner>,
 
     // Inputs to the block, chosen by the block proposer.
-    /// Cryptographic hash of all the incoming bundles in the block.
-    pub bundles_hash: CryptoHash,
-    /// Cryptographic hash of all the operations in the block.
-    pub operations_hash: CryptoHash,
+    /// Cryptographic hash of all the transactions in the block.
+    pub transactions_hash: CryptoHash,
 
     // Outcome of the block execution.
     /// Cryptographic hash of all the messages in the block.
     pub messages_hash: CryptoHash,
     /// Cryptographic hash of the lookup table for previous sending blocks.
     pub previous_message_blocks_hash: CryptoHash,
+    /// Cryptographic hash of the lookup table for previous blocks publishing events.
+    pub previous_event_blocks_hash: CryptoHash,
     /// Cryptographic hash of all the oracle responses in the block.
     pub oracle_responses_hash: CryptoHash,
     /// Cryptographic hash of all the events in the block.
@@ -335,17 +342,19 @@ pub struct BlockHeader {
 }
 
 /// The body of a block containing all the data included in the block.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject, Allocative)]
+#[graphql(complex)]
 pub struct BlockBody {
-    /// A selection of incoming messages to be executed first. Successive messages of the same
-    /// sender and height are grouped together for conciseness.
-    pub incoming_bundles: Vec<IncomingBundle>,
-    /// The operations to execute.
-    pub operations: Vec<Operation>,
+    /// The transactions to execute in this block. Each transaction can be either
+    /// incoming messages or an operation.
+    #[graphql(skip)]
+    pub transactions: Vec<Transaction>,
     /// The list of outgoing messages for each transaction.
     pub messages: Vec<Vec<OutgoingMessage>>,
-    /// The hashes of previous blocks that sent messages to the same recipients.
-    pub previous_message_blocks: BTreeMap<ChainId, CryptoHash>,
+    /// The hashes and heights of previous blocks that sent messages to the same recipients.
+    pub previous_message_blocks: BTreeMap<ChainId, (CryptoHash, BlockHeight)>,
+    /// The hashes and heights of previous blocks that published events to the same channels.
+    pub previous_event_blocks: BTreeMap<StreamId, (CryptoHash, BlockHeight)>,
     /// The record of oracle responses for each transaction.
     pub oracle_responses: Vec<Vec<OracleResponse>>,
     /// The list of events produced by each transaction.
@@ -356,14 +365,45 @@ pub struct BlockBody {
     pub operation_results: Vec<OperationResult>,
 }
 
+impl BlockBody {
+    /// Returns all operations in this block body.
+    pub fn operations(&self) -> impl Iterator<Item = &Operation> {
+        self.transactions.iter().filter_map(|tx| match tx {
+            Transaction::ExecuteOperation(operation) => Some(operation),
+            Transaction::ReceiveMessages(_) => None,
+        })
+    }
+
+    /// Returns all incoming bundles in this block body.
+    pub fn incoming_bundles(&self) -> impl Iterator<Item = &IncomingBundle> {
+        self.transactions.iter().filter_map(|tx| match tx {
+            Transaction::ReceiveMessages(bundle) => Some(bundle),
+            Transaction::ExecuteOperation(_) => None,
+        })
+    }
+}
+
+#[async_graphql::ComplexObject]
+impl BlockBody {
+    /// Metadata about the transactions in this block.
+    async fn transaction_metadata(&self) -> Vec<crate::data_types::TransactionMetadata> {
+        self.transactions
+            .iter()
+            .map(crate::data_types::TransactionMetadata::from_transaction)
+            .collect()
+    }
+}
+
 impl Block {
     pub fn new(block: ProposedBlock, outcome: BlockExecutionOutcome) -> Self {
-        let bundles_hash = hashing::hash_vec(&block.incoming_bundles);
+        let transactions_hash = hashing::hash_vec(&block.transactions);
         let messages_hash = hashing::hash_vec_vec(&outcome.messages);
         let previous_message_blocks_hash = CryptoHash::new(&PreviousMessageBlocksMap {
             inner: Cow::Borrowed(&outcome.previous_message_blocks),
         });
-        let operations_hash = hashing::hash_vec(&block.operations);
+        let previous_event_blocks_hash = CryptoHash::new(&PreviousEventBlocksMap {
+            inner: Cow::Borrowed(&outcome.previous_event_blocks),
+        });
         let oracle_responses_hash = hashing::hash_vec_vec(&outcome.oracle_responses);
         let events_hash = hashing::hash_vec_vec(&outcome.events);
         let blobs_hash = hashing::hash_vec_vec(&outcome.blobs);
@@ -376,11 +416,11 @@ impl Block {
             timestamp: block.timestamp,
             state_hash: outcome.state_hash,
             previous_block_hash: block.previous_block_hash,
-            authenticated_signer: block.authenticated_signer,
-            bundles_hash,
-            operations_hash,
+            authenticated_owner: block.authenticated_owner,
+            transactions_hash,
             messages_hash,
             previous_message_blocks_hash,
+            previous_event_blocks_hash,
             oracle_responses_hash,
             events_hash,
             blobs_hash,
@@ -388,10 +428,10 @@ impl Block {
         };
 
         let body = BlockBody {
-            incoming_bundles: block.incoming_bundles,
-            operations: block.operations,
+            transactions: block.transactions,
             messages: outcome.messages,
             previous_message_blocks: outcome.previous_message_blocks,
+            previous_event_blocks: outcome.previous_event_blocks,
             oracle_responses: outcome.oracle_responses,
             events: outcome.events,
             blobs: outcome.blobs,
@@ -437,60 +477,6 @@ impl Block {
             })
     }
 
-    /// Returns the `message_index`th outgoing message created by the `operation_index`th operation,
-    /// or `None` if there is no such operation or message.
-    pub fn message_id_for_operation(
-        &self,
-        operation_index: usize,
-        message_index: u32,
-    ) -> Option<MessageId> {
-        let block = &self.body;
-        let transaction_index = block.incoming_bundles.len().checked_add(operation_index)?;
-        if message_index >= u32::try_from(self.body.messages.get(transaction_index)?.len()).ok()? {
-            return None;
-        }
-        let first_message_index = u32::try_from(
-            self.body
-                .messages
-                .iter()
-                .take(transaction_index)
-                .map(Vec::len)
-                .sum::<usize>(),
-        )
-        .ok()?;
-        let index = first_message_index.checked_add(message_index)?;
-        Some(self.message_id(index))
-    }
-
-    /// Returns the message ID belonging to the `index`th outgoing message in this block.
-    pub fn message_id(&self, index: u32) -> MessageId {
-        MessageId {
-            chain_id: self.header.chain_id,
-            height: self.header.height,
-            index,
-        }
-    }
-
-    /// Returns the outgoing message with the specified id, or `None` if there is no such message.
-    pub fn message_by_id(&self, message_id: &MessageId) -> Option<&OutgoingMessage> {
-        let MessageId {
-            chain_id,
-            height,
-            index,
-        } = message_id;
-        if self.header.chain_id != *chain_id || self.header.height != *height {
-            return None;
-        }
-        let mut index = usize::try_from(*index).ok()?;
-        for messages in self.messages() {
-            if let Some(message) = messages.get(index) {
-                return Some(message);
-            }
-            index -= messages.len();
-        }
-        None
-    }
-
     /// Returns all the blob IDs required by this block.
     /// Either as oracle responses or as published blobs.
     pub fn required_blob_ids(&self) -> BTreeSet<BlobId> {
@@ -517,16 +503,15 @@ impl Block {
                     && blob_id.hash == self.header.chain_id.0))
     }
 
-    /// Returns all the published blob IDs in this block's operations.
+    /// Returns all the published blob IDs in this block's transactions.
     pub fn published_blob_ids(&self) -> BTreeSet<BlobId> {
         self.body
-            .operations
-            .iter()
+            .operations()
             .flat_map(Operation::published_blob_ids)
             .collect()
     }
 
-    /// Returns all the blob IDs created by the block's operations.
+    /// Returns all the blob IDs created by the block's transactions.
     pub fn created_blob_ids(&self) -> BTreeSet<BlobId> {
         self.body
             .blobs
@@ -536,7 +521,7 @@ impl Block {
             .collect()
     }
 
-    /// Returns all the blobs created by the block's operations.
+    /// Returns all the blobs created by the block's transactions.
     pub fn created_blobs(&self) -> BTreeMap<BlobId, Blob> {
         self.body
             .blobs
@@ -565,6 +550,15 @@ impl Block {
         &self.body.messages
     }
 
+    /// Returns all recipients of messages in this block.
+    pub fn recipients(&self) -> BTreeSet<ChainId> {
+        self.body
+            .messages
+            .iter()
+            .flat_map(|messages| messages.iter().map(|message| message.destination))
+            .collect()
+    }
+
     /// Returns whether there are any oracle responses in this block.
     pub fn has_oracle_responses(&self) -> bool {
         self.body
@@ -578,58 +572,68 @@ impl Block {
         let ProposedBlock {
             chain_id,
             epoch,
-            incoming_bundles,
-            operations,
+            transactions,
             height,
             timestamp,
-            authenticated_signer,
+            authenticated_owner,
             previous_block_hash,
         } = block;
         *chain_id == self.header.chain_id
             && *epoch == self.header.epoch
-            && *incoming_bundles == self.body.incoming_bundles
-            && *operations == self.body.operations
+            && *transactions == self.body.transactions
             && *height == self.header.height
             && *timestamp == self.header.timestamp
-            && *authenticated_signer == self.header.authenticated_signer
+            && *authenticated_owner == self.header.authenticated_owner
             && *previous_block_hash == self.header.previous_block_hash
     }
 
-    /// Returns whether this block matches the execution outcome.
-    pub fn matches_outcome(&self, outcome: &BlockExecutionOutcome) -> bool {
-        let BlockExecutionOutcome {
-            state_hash,
+    /// Returns whether the outcomes of the block's execution match the passed values.
+    #[cfg(with_testing)]
+    #[expect(clippy::too_many_arguments)]
+    pub fn outcome_matches(
+        &self,
+        expected_messages: &[Vec<OutgoingMessage>],
+        expected_previous_message_blocks: &BTreeMap<ChainId, (CryptoHash, BlockHeight)>,
+        expected_previous_event_blocks: &BTreeMap<StreamId, (CryptoHash, BlockHeight)>,
+        expected_oracle_responses: &[Vec<OracleResponse>],
+        expected_events: &[Vec<Event>],
+        expected_blobs: &[Vec<Blob>],
+        expected_operation_results: &[OperationResult],
+    ) -> bool {
+        let BlockBody {
+            transactions: _,
             messages,
             previous_message_blocks,
+            previous_event_blocks,
             oracle_responses,
             events,
             blobs,
             operation_results,
-        } = outcome;
-        *state_hash == self.header.state_hash
-            && *messages == self.body.messages
-            && *previous_message_blocks == self.body.previous_message_blocks
-            && *oracle_responses == self.body.oracle_responses
-            && *events == self.body.events
-            && *blobs == self.body.blobs
-            && *operation_results == self.body.operation_results
+        } = &self.body;
+        messages == expected_messages
+            && previous_message_blocks == expected_previous_message_blocks
+            && previous_event_blocks == expected_previous_event_blocks
+            && oracle_responses == expected_oracle_responses
+            && events == expected_events
+            && blobs == expected_blobs
+            && operation_results == expected_operation_results
     }
 
     pub fn into_proposal(self) -> (ProposedBlock, BlockExecutionOutcome) {
         let proposed_block = ProposedBlock {
             chain_id: self.header.chain_id,
             epoch: self.header.epoch,
-            incoming_bundles: self.body.incoming_bundles,
-            operations: self.body.operations,
+            transactions: self.body.transactions,
             height: self.header.height,
             timestamp: self.header.timestamp,
-            authenticated_signer: self.header.authenticated_signer,
+            authenticated_owner: self.header.authenticated_owner,
             previous_block_hash: self.header.previous_block_hash,
         };
         let outcome = BlockExecutionOutcome {
             state_hash: self.header.state_hash,
             messages: self.body.messages,
             previous_message_blocks: self.body.previous_message_blocks,
+            previous_event_blocks: self.body.previous_event_blocks,
             oracle_responses: self.body.oracle_responses,
             events: self.body.events,
             blobs: self.body.blobs,
@@ -638,12 +642,10 @@ impl Block {
         (proposed_block, outcome)
     }
 
-    pub fn iter_created_blobs(&self) -> impl Iterator<Item = (BlobId, Blob)> + '_ {
-        self.body
-            .blobs
-            .iter()
-            .flatten()
-            .map(|blob| (blob.id(), blob.clone()))
+    /// Returns the IDs of all events in this block.
+    pub fn event_ids(&self) -> impl Iterator<Item = EventId> + '_ {
+        let to_id = |event: &Event| event.id(self.header.chain_id);
+        self.body.events.iter().flatten().map(to_id)
     }
 }
 
@@ -651,10 +653,17 @@ impl BcsHashable<'_> for Block {}
 
 #[derive(Serialize, Deserialize)]
 pub struct PreviousMessageBlocksMap<'a> {
-    inner: Cow<'a, BTreeMap<ChainId, CryptoHash>>,
+    inner: Cow<'a, BTreeMap<ChainId, (CryptoHash, BlockHeight)>>,
 }
 
 impl<'de> BcsHashable<'de> for PreviousMessageBlocksMap<'de> {}
+
+#[derive(Serialize, Deserialize)]
+pub struct PreviousEventBlocksMap<'a> {
+    inner: Cow<'a, BTreeMap<StreamId, (CryptoHash, BlockHeight)>>,
+}
+
+impl<'de> BcsHashable<'de> for PreviousEventBlocksMap<'de> {}
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename = "BlockHeader")]
@@ -665,7 +674,7 @@ struct SerializedHeader {
     timestamp: Timestamp,
     state_hash: CryptoHash,
     previous_block_hash: Option<CryptoHash>,
-    authenticated_signer: Option<AccountOwner>,
+    authenticated_owner: Option<AccountOwner>,
 }
 
 mod hashing {

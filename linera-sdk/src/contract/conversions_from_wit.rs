@@ -5,12 +5,12 @@
 
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{Amount, BlockHeight, StreamUpdate},
+    data_types::{Amount, StreamUpdate},
     identifiers::{
-        AccountOwner, ApplicationId, ChainId, GenericApplicationId, MessageId, ModuleId, StreamId,
-        StreamName,
+        AccountOwner, ApplicationId, ChainId, DataBlobHash, GenericApplicationId, ModuleId,
+        StreamId, StreamName,
     },
-    ownership::{ChangeApplicationPermissionsError, CloseChainError},
+    ownership::ManageChainError,
     vm::VmRuntime,
 };
 
@@ -30,12 +30,18 @@ impl From<wit_contract_api::CryptoHash> for CryptoHash {
     }
 }
 
+impl From<wit_contract_api::DataBlobHash> for DataBlobHash {
+    fn from(hash_value: wit_contract_api::DataBlobHash) -> Self {
+        DataBlobHash(hash_value.inner0.into())
+    }
+}
+
 impl From<wit_contract_api::Array20> for [u8; 20] {
     fn from(ethereum_address: wit_contract_api::Array20) -> Self {
         let mut bytes = [0u8; 20];
-        bytes[0..8].copy_from_slice(&ethereum_address.part1.to_le_bytes());
-        bytes[8..16].copy_from_slice(&ethereum_address.part2.to_le_bytes());
-        bytes[16..20].copy_from_slice(&ethereum_address.part3.to_le_bytes());
+        bytes[0..8].copy_from_slice(&ethereum_address.part1.to_be_bytes());
+        bytes[8..16].copy_from_slice(&ethereum_address.part2.to_be_bytes());
+        bytes[16..20].copy_from_slice(&ethereum_address.part3.to_be_bytes()[0..4]);
         bytes
     }
 }
@@ -73,16 +79,6 @@ impl From<wit_contract_api::VmRuntime> for VmRuntime {
     }
 }
 
-impl From<wit_contract_api::MessageId> for MessageId {
-    fn from(message_id: wit_contract_api::MessageId) -> Self {
-        MessageId {
-            chain_id: message_id.chain_id.into(),
-            height: BlockHeight(message_id.height.inner0),
-            index: message_id.index,
-        }
-    }
-}
-
 impl From<wit_contract_api::ApplicationId> for ApplicationId {
     fn from(application_id: wit_contract_api::ApplicationId) -> Self {
         ApplicationId::new(application_id.application_description_hash.into())
@@ -103,22 +99,10 @@ impl From<wit_contract_api::Amount> for Amount {
     }
 }
 
-impl From<wit_contract_api::CloseChainError> for CloseChainError {
-    fn from(guest: wit_contract_api::CloseChainError) -> Self {
+impl From<wit_contract_api::ManageChainError> for ManageChainError {
+    fn from(guest: wit_contract_api::ManageChainError) -> Self {
         match guest {
-            wit_contract_api::CloseChainError::NotPermitted => CloseChainError::NotPermitted,
-        }
-    }
-}
-
-impl From<wit_contract_api::ChangeApplicationPermissionsError>
-    for ChangeApplicationPermissionsError
-{
-    fn from(guest: wit_contract_api::ChangeApplicationPermissionsError) -> Self {
-        match guest {
-            wit_contract_api::ChangeApplicationPermissionsError::NotPermitted => {
-                ChangeApplicationPermissionsError::NotPermitted
-            }
+            wit_contract_api::ManageChainError::NotPermitted => ManageChainError::NotPermitted,
         }
     }
 }

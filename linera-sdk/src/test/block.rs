@@ -8,20 +8,18 @@
 use linera_base::{
     abi::ContractAbi,
     data_types::{Amount, ApplicationPermissions, Blob, Epoch, Round, Timestamp},
-    identifiers::{AccountOwner, ApplicationId, ChainId},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId},
     ownership::TimeoutConfig,
 };
 use linera_chain::{
     data_types::{
-        IncomingBundle, LiteValue, LiteVote, MessageAction, ProposedBlock, SignatureAggregator,
+        BundleExecutionPolicy, IncomingBundle, LiteValue, LiteVote, MessageAction, ProposedBlock,
+        SignatureAggregator, Transaction,
     },
     types::{ConfirmedBlock, ConfirmedBlockCertificate},
 };
 use linera_core::worker::WorkerError;
-use linera_execution::{
-    system::{Recipient, SystemOperation},
-    Operation,
-};
+use linera_execution::{system::SystemOperation, Operation, ResourceTracker};
 
 use super::TestValidator;
 
@@ -38,6 +36,11 @@ impl BlockBuilder {
     /// Initializes the block so that it belongs to the microchain identified by `chain_id` and
     /// owned by `owner`. It becomes the block after the specified `previous_block`, or the genesis
     /// block if [`None`] is specified.
+    ///
+    /// The block's timestamp defaults to the maximum of the parent block's timestamp and the
+    /// validator's current clock time, ensuring it satisfies the validity rule that a block's
+    /// timestamp must not be earlier than its parent's. Use [`with_timestamp`](Self::with_timestamp)
+    /// to override.
     ///
     /// # Notes
     ///
@@ -61,23 +64,31 @@ impl BlockBuilder {
                     .expect("Block height limit reached")
             })
             .unwrap_or_default();
+        let parent_timestamp = previous_block
+            .map(|certificate| certificate.inner().timestamp())
+            .unwrap_or_default();
+        let timestamp = parent_timestamp.max(validator.clock().current_time());
 
         BlockBuilder {
             block: ProposedBlock {
                 epoch,
                 chain_id,
-                incoming_bundles: vec![],
-                operations: vec![],
+                transactions: vec![],
                 previous_block_hash,
                 height,
-                authenticated_signer: Some(owner),
-                timestamp: Timestamp::from(0),
+                authenticated_owner: Some(owner),
+                timestamp,
             },
             validator,
         }
     }
 
     /// Configures the timestamp of this block.
+    ///
+    /// The timestamp must be at least as large as the parent block's timestamp (which is used as
+    /// the default). It must also be at least as large as the timestamp of any incoming message
+    /// bundle added via [`with_messages_from`](Self::with_messages_from) or
+    /// [`with_messages_from_by_action`](Self::with_messages_from_by_action).
     pub fn with_timestamp(&mut self, timestamp: Timestamp) -> &mut Self {
         self.block.timestamp = timestamp;
         self
@@ -87,7 +98,7 @@ impl BlockBuilder {
     pub fn with_native_token_transfer(
         &mut self,
         sender: AccountOwner,
-        recipient: Recipient,
+        recipient: Account,
         amount: Amount,
     ) -> &mut Self {
         self.with_system_operation(SystemOperation::Transfer {
@@ -99,7 +110,9 @@ impl BlockBuilder {
 
     /// Adds a [`SystemOperation`] to this block.
     pub(crate) fn with_system_operation(&mut self, operation: SystemOperation) -> &mut Self {
-        self.block.operations.push(operation.into());
+        self.block
+            .transactions
+            .push(Transaction::ExecuteOperation(operation.into()));
         self
     }
 
@@ -108,6 +121,7 @@ impl BlockBuilder {
         &mut self,
         super_owners: Vec<AccountOwner>,
         owners: Vec<(AccountOwner, u64)>,
+        first_leader: Option<AccountOwner>,
         multi_leader_rounds: u32,
         open_multi_leader_rounds: bool,
         timeout_config: TimeoutConfig,
@@ -115,6 +129,7 @@ impl BlockBuilder {
         self.with_system_operation(SystemOperation::ChangeOwnership {
             super_owners,
             owners,
+            first_leader,
             multi_leader_rounds,
             open_multi_leader_rounds,
             timeout_config,
@@ -131,17 +146,17 @@ impl BlockBuilder {
 
     /// Adds a user `operation` to this block.
     ///
-    /// The operation is serialized using [`bcs`] and added to the block, marked to be executed by
-    /// `application`.
+    /// The operation is serialized using the application ABI and added to the block, marked to be
+    /// executed by `application`.
     pub fn with_operation<Abi>(
         &mut self,
         application_id: ApplicationId<Abi>,
-        operation: Abi::Operation,
+        operation: &Abi::Operation,
     ) -> &mut Self
     where
         Abi: ContractAbi,
     {
-        let operation = Abi::serialize_operation(&operation)
+        let operation = <Abi as ContractAbi>::serialize_operation(operation)
             .expect("Failed to serialize `Operation` in BlockBuilder");
         self.with_raw_operation(application_id.forget_abi(), operation)
     }
@@ -152,14 +167,21 @@ impl BlockBuilder {
         application_id: ApplicationId,
         operation: impl Into<Vec<u8>>,
     ) -> &mut Self {
-        self.block.operations.push(Operation::User {
-            application_id,
-            bytes: operation.into(),
-        });
+        self.block
+            .transactions
+            .push(Transaction::ExecuteOperation(Operation::User {
+                application_id,
+                bytes: operation.into(),
+            }));
         self
     }
 
     /// Receives incoming message bundles by specifying them directly.
+    ///
+    /// Automatically advances the block's timestamp to be at least as large as the latest
+    /// bundle's timestamp, since blocks are not allowed to have a timestamp older than any of
+    /// their incoming bundles. Use [`with_timestamp`](Self::with_timestamp) afterwards to set a
+    /// later timestamp if needed.
     ///
     /// This is an internal method that bypasses the check to see if the messages are already
     /// present in the inboxes of the microchain that owns this block.
@@ -167,16 +189,27 @@ impl BlockBuilder {
         &mut self,
         bundles: impl IntoIterator<Item = IncomingBundle>,
     ) -> &mut Self {
-        self.block.incoming_bundles.extend(bundles);
+        for bundle in bundles {
+            self.block.timestamp = self.block.timestamp.max(bundle.bundle.timestamp);
+            self.block
+                .transactions
+                .push(Transaction::ReceiveMessages(bundle));
+        }
         self
     }
 
-    /// Receives all direct messages  that were sent to this chain by the given certificate.
+    /// Receives all direct messages that were sent to this chain by the given certificate.
+    ///
+    /// The block's timestamp is automatically advanced to be at least as large as the
+    /// certificate's block timestamp.
     pub fn with_messages_from(&mut self, certificate: &ConfirmedBlockCertificate) -> &mut Self {
         self.with_messages_from_by_action(certificate, MessageAction::Accept)
     }
 
     /// Receives all messages that were sent to this chain by the given certificate.
+    ///
+    /// The block's timestamp is automatically advanced to be at least as large as the
+    /// certificate's block timestamp.
     pub fn with_messages_from_by_action(
         &mut self,
         certificate: &ConfirmedBlockCertificate,
@@ -195,11 +228,12 @@ impl BlockBuilder {
     }
 
     /// Tries to sign the prepared block with the [`TestValidator`]'s keys and return the
-    /// resulting [`Certificate`]. Returns an error if block execution fails.
+    /// resulting [`Certificate`] and the [`ResourceTracker`] with execution costs.
+    /// Returns an error if block execution fails.
     pub(crate) async fn try_sign(
         self,
         blobs: &[Blob],
-    ) -> Result<ConfirmedBlockCertificate, WorkerError> {
+    ) -> Result<(ConfirmedBlockCertificate, ResourceTracker), WorkerError> {
         let published_blobs = self
             .block
             .published_blob_ids()
@@ -212,10 +246,15 @@ impl BlockBuilder {
                     .clone()
             })
             .collect();
-        let (block, _) = self
+        let (_, block, _, resource_tracker) = self
             .validator
             .worker()
-            .stage_block_execution(self.block, None, published_blobs)
+            .stage_block_execution(
+                self.block,
+                None,
+                published_blobs,
+                BundleExecutionPolicy::committed(),
+            )
             .await?;
 
         let value = ConfirmedBlock::new(block);
@@ -225,12 +264,13 @@ impl BlockBuilder {
             self.validator.key_pair(),
         );
         let committee = self.validator.committee().await;
+        let public_key = self.validator.key_pair().public();
         let mut builder = SignatureAggregator::new(value, Round::Fast, &committee);
         let certificate = builder
-            .append(vote.public_key, vote.signature)
+            .append(public_key, vote.signature)
             .expect("Failed to sign block")
             .expect("Committee has more than one test validator");
 
-        Ok(certificate)
+        Ok((certificate, resource_tracker))
     }
 }

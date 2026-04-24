@@ -17,20 +17,21 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    fmt::Debug,
+    fmt,
     iter::Peekable,
     ops::Bound,
     vec::IntoIter,
 };
 
-use async_trait::async_trait;
 use bcs::serialized_size;
+use custom_debug_derive::Debug;
+use linera_base::hex_debug;
 use linera_witty::{WitLoad, WitStore, WitType};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    common::{get_interval, get_uleb128_size},
-    views::ViewError,
+    common::{get_key_range_for_prefix, get_uleb128_size},
+    ViewError,
 };
 
 /// A write operation as requested by a view when it needs to persist staged changes.
@@ -38,29 +39,33 @@ use crate::{
 /// * Deletion of a specific key.
 /// * Deletion of all keys matching a specific prefix.
 /// * Insertion or replacement of a key with a value.
-#[derive(Clone, Debug, Eq, PartialEq, WitType, WitLoad, WitStore)]
+#[derive(Clone, Debug, Eq, PartialEq, WitType, WitLoad, WitStore, Serialize)]
 pub enum WriteOperation {
     /// Delete the given key.
     Delete {
         /// The key that will be deleted.
+        #[debug(with = "hex_debug")]
         key: Vec<u8>,
     },
     /// Delete all the keys matching the given prefix.
     DeletePrefix {
         /// The prefix of the keys to be deleted.
+        #[debug(with = "hex_debug")]
         key_prefix: Vec<u8>,
     },
     /// Set or replace the value of a given key.
     Put {
         /// The key to be inserted or replaced.
+        #[debug(with = "hex_debug")]
         key: Vec<u8>,
         /// The value to be inserted on the key.
+        #[debug(with = "hex_debug")]
         value: Vec<u8>,
     },
 }
 
 /// A batch of write operations.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct Batch {
     /// The write operations.
     pub operations: Vec<WriteOperation>,
@@ -100,7 +105,7 @@ impl UnorderedBatch {
         let insertions = self.simple_unordered_batch.insertions;
         let mut deletions = self.simple_unordered_batch.deletions;
         for key_prefix in self.key_prefix_deletions {
-            for short_key in db.expand_delete_prefix(&key_prefix).await?.iter() {
+            for short_key in &db.expand_delete_prefix(&key_prefix).await? {
                 let mut key = key_prefix.clone();
                 key.extend(short_key);
                 if !insert_set.contains(&key) {
@@ -133,11 +138,11 @@ impl UnorderedBatch {
         let mut key_prefix_deletions = Vec::new();
         for key_prefix in &self.key_prefix_deletions {
             if inserted_keys
-                .range(get_interval(key_prefix.clone()))
+                .range(get_key_range_for_prefix(key_prefix.clone()))
                 .next()
                 .is_some()
             {
-                for short_key in db.expand_delete_prefix(key_prefix).await?.iter() {
+                for short_key in &db.expand_delete_prefix(key_prefix).await? {
                     let mut key = key_prefix.clone();
                     key.extend(short_key);
                     if !inserted_keys.contains(&key) {
@@ -255,7 +260,7 @@ impl Batch {
                 WriteOperation::DeletePrefix { key_prefix } => {
                     // Remove the previous deletions and insertions covered by `key_prefix`.
                     let keys = delete_and_insert_map
-                        .range(get_interval(key_prefix.clone()))
+                        .range(get_key_range_for_prefix(key_prefix.clone()))
                         .map(|x| x.0.to_vec())
                         .collect::<Vec<_>>();
                     for key in keys {
@@ -268,7 +273,7 @@ impl Batch {
                     // Otherwise, find the prefixes that are covered by the new key
                     // prefix.
                     let key_prefixes = delete_prefix_set
-                        .range(get_interval(key_prefix.clone()))
+                        .range(get_key_range_for_prefix(key_prefix.clone()))
                         .map(|x: &Vec<u8>| x.to_vec())
                         .collect::<Vec<_>>();
                     // Delete them.
@@ -368,26 +373,23 @@ impl Batch {
 /// Certain databases (e.g. DynamoDB) do not support the deletion by prefix.
 /// Thus we need to access the databases in order to replace a `DeletePrefix`
 /// by a vector of the keys to be removed.
-#[trait_variant::make(DeletePrefixExpander: Send)]
-pub trait LocalDeletePrefixExpander {
+#[cfg_attr(not(web), trait_variant::make(Send + Sync))]
+pub trait DeletePrefixExpander {
     /// The error type that can happen when expanding the key prefix.
-    type Error: Debug;
+    type Error: fmt::Debug;
 
     /// Returns the list of keys to be appended to the list.
     async fn expand_delete_prefix(&self, key_prefix: &[u8]) -> Result<Vec<Vec<u8>>, Self::Error>;
 }
 
+#[cfg_attr(not(web), trait_variant::make(Send + Sync))]
 /// A notion of batch useful for certain computations (notably journaling).
-#[async_trait]
 pub trait SimplifiedBatch: Sized + Send + Sync {
     /// The iterator type used to process values from the batch.
     type Iter: BatchValueWriter<Self>;
 
     /// Creates a simplified batch from a standard one.
-    async fn from_batch<S: DeletePrefixExpander + Send + Sync>(
-        store: S,
-        batch: Batch,
-    ) -> Result<Self, S::Error>;
+    async fn from_batch<S: DeletePrefixExpander>(store: S, batch: Batch) -> Result<Self, S::Error>;
 
     /// Returns an owning iterator over the values in the batch.
     fn into_iter(self) -> Self::Iter;
@@ -415,7 +417,8 @@ pub trait SimplifiedBatch: Sized + Send + Sync {
 
 /// An iterator-like object that can write values one by one to a batch while updating the
 /// total size of the batch.
-pub trait BatchValueWriter<Batch>: Send + Sync {
+#[cfg_attr(not(web), trait_variant::make(Send + Sync))]
+pub trait BatchValueWriter<Batch> {
     /// Returns true if there are no more values to write.
     fn is_empty(&self) -> bool;
 
@@ -443,7 +446,6 @@ pub struct SimpleUnorderedBatchIter {
     insert_iter: Peekable<IntoIter<(Vec<u8>, Vec<u8>)>>,
 }
 
-#[async_trait]
 impl SimplifiedBatch for SimpleUnorderedBatch {
     type Iter = SimpleUnorderedBatchIter;
 
@@ -483,10 +485,7 @@ impl SimplifiedBatch for SimpleUnorderedBatch {
         self.insertions.push((key, value))
     }
 
-    async fn from_batch<S: DeletePrefixExpander + Send + Sync>(
-        store: S,
-        batch: Batch,
-    ) -> Result<Self, S::Error> {
+    async fn from_batch<S: DeletePrefixExpander>(store: S, batch: Batch) -> Result<Self, S::Error> {
         let unordered_batch = batch.simplify();
         unordered_batch.expand_delete_prefixes(&store).await
     }
@@ -548,7 +547,6 @@ pub struct UnorderedBatchIter {
     insert_deletion_iter: SimpleUnorderedBatchIter,
 }
 
-#[async_trait]
 impl SimplifiedBatch for UnorderedBatch {
     type Iter = UnorderedBatchIter;
 
@@ -586,10 +584,7 @@ impl SimplifiedBatch for UnorderedBatch {
         self.simple_unordered_batch.add_insert(key, value)
     }
 
-    async fn from_batch<S: DeletePrefixExpander + Send + Sync>(
-        store: S,
-        batch: Batch,
-    ) -> Result<Self, S::Error> {
+    async fn from_batch<S: DeletePrefixExpander>(store: S, batch: Batch) -> Result<Self, S::Error> {
         let mut unordered_batch = batch.simplify();
         unordered_batch
             .expand_colliding_prefix_deletions(&store)
@@ -644,6 +639,7 @@ mod tests {
     use linera_views::{
         batch::{Batch, SimpleUnorderedBatch, UnorderedBatch},
         context::{Context, MemoryContext},
+        store::WritableKeyValueStore as _,
     };
 
     #[test]
@@ -706,7 +702,7 @@ mod tests {
         batch.put_key_value_bytes(vec![1, 2, 4], vec![]);
         batch.put_key_value_bytes(vec![1, 2, 5], vec![]);
         batch.put_key_value_bytes(vec![1, 3, 3], vec![]);
-        context.write_batch(batch).await.unwrap();
+        context.store().write_batch(batch).await.unwrap();
         let mut batch = Batch::new();
         batch.delete_key_prefix(vec![1, 2]);
         let unordered_batch = batch.simplify();

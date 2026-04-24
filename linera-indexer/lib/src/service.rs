@@ -19,7 +19,7 @@ use linera_base::{
 use linera_chain::types::ConfirmedBlock;
 use linera_core::worker::Reason;
 use linera_service_graphql_client::{block, chains, notifications, Block, Chains, Notifications};
-use linera_views::store::KeyValueStore;
+use linera_views::store::{KeyValueDatabase, KeyValueStore};
 use tokio::runtime::Handle;
 use tracing::error;
 
@@ -61,24 +61,24 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn with_protocol(&self, protocol: Protocol) -> String {
+    pub fn with_protocol(&self, protocol: &Protocol) -> String {
         let tls = if self.tls { "s" } else { "" };
         let (protocol, suffix) = match protocol {
             Protocol::Http => ("http", ""),
             Protocol::WebSocket => ("ws", "/ws"),
         };
         format!(
-            "{}{}://{}:{}{}",
-            protocol, tls, self.service_address, self.service_port, suffix
+            "{protocol}{tls}://{}:{}{suffix}",
+            self.service_address, self.service_port
         )
     }
 
     pub fn websocket(&self) -> String {
-        self.with_protocol(Protocol::WebSocket)
+        self.with_protocol(&Protocol::WebSocket)
     }
 
     pub fn http(&self) -> String {
-        self.with_protocol(Protocol::Http)
+        self.with_protocol(&Protocol::Http)
     }
 
     /// Gets one hashed value from the node service
@@ -123,14 +123,15 @@ pub struct Listener {
 
 impl Listener {
     /// Connects to the WebSocket of the service node for a particular chain
-    pub async fn listen<S>(
+    pub async fn listen<D>(
         &self,
-        indexer: &Indexer<S>,
+        indexer: &Indexer<D>,
         chain_id: ChainId,
     ) -> Result<ChainId, IndexerError>
     where
-        S: KeyValueStore + Clone + Send + Sync + 'static,
-        S::Error: Send + Sync + std::error::Error + 'static,
+        D: KeyValueDatabase + Clone + Send + Sync + 'static,
+        D::Store: KeyValueStore + Clone + Send + Sync + 'static,
+        D::Error: Send + Sync + std::error::Error + 'static,
     {
         let mut request = self.service.websocket().into_client_request()?;
         request.headers_mut().insert(
@@ -150,8 +151,11 @@ impl Listener {
                 Ok(response) => {
                     if let Some(data) = response.data {
                         if let Reason::NewBlock { hash, .. } = data.notifications.reason {
-                            if let Ok(value) = self.service.get_value(chain_id, Some(hash)).await {
-                                indexer.process(self, &value).await?;
+                            match self.service.get_value(chain_id, Some(hash)).await {
+                                Ok(value) => indexer.process(self, &value).await?,
+                                Err(error) => {
+                                    error!("failed to fetch block {hash}: {error}")
+                                }
                             }
                         }
                     } else {

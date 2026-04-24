@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ConfirmedBlock } from '../../gql/service'
+import { getOperations, getIncomingBundles } from './utils'
 
 defineProps<{blocks: ConfirmedBlock[]}>()
 </script>
@@ -19,6 +20,8 @@ defineProps<{blocks: ConfirmedBlock[]}>()
         <th>#InMessages</th>
         <th>#OutMessages</th>
         <th>#Operations</th>
+        <th>#Events</th>
+        <th>#OracleResponses</th>
         <th>JSON</th>
       </thead>
       <tbody>
@@ -27,12 +30,17 @@ defineProps<{blocks: ConfirmedBlock[]}>()
           <td :title="b.hash">
             <a @click="$root.route('block', [['block', b.hash]])" class="btn btn-link">{{ short_hash(b.hash) }}</a>
           </td>
-          <td>{{ (new Date(b.block.header.timestamp/1000)).toLocaleString() }}</td>
-          <td :title="b.block.header.authenticatedSigner">{{ b.block.header.authenticatedSigner }}</td>
+          <td>{{ (new Date(Number(b.block.header.timestamp)/1000)).toLocaleString() }}</td>
+          <td>
+            <a v-if="b.block.header.authenticatedOwner" class="btn btn-link btn-sm font-monospace" data-bs-toggle="collapse" :data-bs-target="'#signer-'+b.hash">{{ b.block.header.authenticatedOwner.slice(0, 10) }}…</a>
+            <div v-if="b.block.header.authenticatedOwner" class="collapse font-monospace small text-break" :id="'signer-'+b.hash">{{ b.block.header.authenticatedOwner }}</div>
+          </td>
           <td>{{ b.status }}</td>
-          <td>{{ b.block.body.incomingBundles.length }}</td>
+          <td>{{ getIncomingBundles(b.block.body.transactionMetadata).length }}</td>
           <td>{{ b.block.body.messages.length }}</td>
-          <td>{{ b.block.body.operations.length }}</td>
+          <td>{{ getOperations(b.block.body.transactionMetadata).length }}</td>
+          <td>{{ b.block.body.events.flat().length }}</td>
+          <td>{{ b.block.body.oracleResponses.flat().length }}</td>
           <td>
             <button class="btn btn-link btn-sm" data-bs-toggle="modal" :data-bs-target="'#'+b.hash+'-modal'" @click="json_load(b.hash+'-json', b)">
               <i class="bi bi-braces"></i>

@@ -11,9 +11,11 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 default = ["rocksdb"]
-benchmark = ["linera-base/test"]
 rocksdb = ["linera-views/rocksdb", "linera-indexer/rocksdb"]
 dynamodb = ["linera-views/dynamodb", "linera-indexer/dynamodb"]
 scylladb = ["linera-views/scylladb", "linera-indexer/scylladb"]

@@ -1,6 +1,7 @@
 import JSONFormatter from 'json-formatter-js'
 import { Scalars } from '../../gql/operations'
-import init, { short_crypto_hash, short_app_id } from "../../pkg/linera_explorer"
+import { TransactionMetadata, IncomingBundle, Operation } from '../../gql/service'
+import { initSync, short_crypto_hash, short_app_id } from "../../pkg/linera_explorer"
 import { config } from '@vue/test-utils'
 
 export function json_load(id: string, data: any) {
@@ -14,7 +15,14 @@ export function operation_id(key: Scalars['OperationKey']['output']): string {
 }
 
 async function set_test_config_aux() {
-  await init()
+  // Use synchronous init for tests to avoid HTTP fetch.
+  // Dynamic import to avoid bundling Node.js modules in production.
+  const fs = await import('fs')
+  const path = await import('path')
+  const wasmPath = path.join(__dirname, '../../pkg/linera_explorer_bg.wasm')
+  const wasmBytes = fs.readFileSync(wasmPath)
+  initSync({ module: wasmBytes })
+
   config.global.mocks.short_hash = short_crypto_hash
   config.global.mocks.short_app_id = short_app_id
   config.global.mocks.json_load = json_load
@@ -31,4 +39,18 @@ export function set_test_config() : Promise<void> {
     await timeout(2000)
     await set_test_config_aux()
   })
+}
+
+// Extract operations from transaction metadata
+export function getOperations(transactionMetadata: TransactionMetadata[]): Operation[] {
+  return transactionMetadata
+    .filter(tx => tx.transactionType === "ExecuteOperation" && tx.operation)
+    .map(tx => tx.operation!)
+}
+
+// Extract incoming bundles from transaction metadata  
+export function getIncomingBundles(transactionMetadata: TransactionMetadata[]): IncomingBundle[] {
+  return transactionMetadata
+    .filter(tx => tx.transactionType === "ReceiveMessages" && tx.incomingBundle)
+    .map(tx => tx.incomingBundle!)
 }

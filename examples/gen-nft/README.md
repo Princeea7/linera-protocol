@@ -49,6 +49,12 @@ linera_spawn linera net up --with-faucet --faucet-port $FAUCET_PORT
 #   FAUCET_URL=https://faucet.testnet-XXX.linera.net  # for some value XXX
 ```
 
+Enable logs for user applications:
+
+```bash
+export LINERA_APPLICATION_LOGS=true
+```
+
 Create the user wallet and add chains to it:
 
 ```bash
@@ -62,8 +68,8 @@ INFO_1=($(linera wallet request-chain --faucet $FAUCET_URL))
 INFO_2=($(linera wallet request-chain --faucet $FAUCET_URL))
 CHAIN_1="${INFO_1[0]}"
 CHAIN_2="${INFO_2[0]}"
-OWNER_1="${INFO_1[2]}"
-OWNER_2="${INFO_2[2]}"
+OWNER_1="${INFO_1[1]}"
+OWNER_2="${INFO_2[1]}"
 ```
 
 Next, compile the `non-fungible` application WebAssembly binaries, and publish them as an application module:

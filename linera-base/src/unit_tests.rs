@@ -11,47 +11,49 @@ use test_case::test_case;
 use crate::{
     crypto::{AccountPublicKey, CryptoHash},
     data_types::{Amount, BlockHeight, Resources, SendMessageRequest, TimeDelta, Timestamp},
-    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, ModuleId},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId, ModuleId},
     ownership::{ChainOwnership, TimeoutConfig},
     vm::VmRuntime,
 };
 
 /// Test roundtrip of types used in the WIT interface.
-#[test_case(CryptoHash::test_hash("hash"); "of_crypto_hash")]
-#[test_case(AccountPublicKey::test_key(255); "of_public_key")]
-#[test_case(Amount::from_tokens(500); "of_amount")]
-#[test_case(BlockHeight(1095); "of_block_height")]
-#[test_case(Timestamp::from(6_400_003); "of_timestamp")]
-#[test_case(resources_test_case(); "of_resources")]
-#[test_case(send_message_request_test_case(); "of_send_message_request")]
-#[test_case(AccountOwner::from(CryptoHash::test_hash("owner")); "of_owner")]
-#[test_case(account_test_case(); "of_account")]
-#[test_case(ChainId(CryptoHash::test_hash("chain_id")); "of_chain_id")]
-#[test_case(message_id_test_case(); "of_message_id")]
-#[test_case(application_id_test_case(); "of_application_id")]
-#[test_case(module_id_test_case(); "of_module_id")]
-#[test_case(timeout_config_test_case(); "of_timeout_config")]
-#[test_case(chain_ownership_test_case(); "of_chain_ownership")]
-fn test_wit_roundtrip<T>(input: T)
+#[test_case(&CryptoHash::test_hash("hash"); "of_crypto_hash")]
+#[test_case(&AccountPublicKey::test_key(255); "of_public_key")]
+#[test_case(&Amount::from_tokens(500); "of_amount")]
+#[test_case(&BlockHeight(1095); "of_block_height")]
+#[test_case(&Timestamp::from(6_400_003); "of_timestamp")]
+#[test_case(&resources_test_case(); "of_resources")]
+#[test_case(&send_message_request_test_case(); "of_send_message_request")]
+#[test_case(&AccountOwner::from(CryptoHash::test_hash("owner")); "of_owner")]
+#[test_case(&account_test_case(); "of_account")]
+#[test_case(&ChainId(CryptoHash::test_hash("chain_id")); "of_chain_id")]
+#[test_case(&application_id_test_case(); "of_application_id")]
+#[test_case(&module_id_test_case(); "of_module_id")]
+#[test_case(&timeout_config_test_case(); "of_timeout_config")]
+#[test_case(&chain_ownership_test_case(); "of_chain_ownership")]
+#[test_case(&[5u8; 20]; "array20")]
+fn test_wit_roundtrip<T>(input: &T)
 where
     T: Debug + Eq + WitLoad + WitStore,
     <T::Layout as Layout>::Flat: Copy + Debug + Eq,
 {
-    linera_witty::test::test_memory_roundtrip(&input).expect("Memory WIT roundtrip test failed");
-    linera_witty::test::test_flattening_roundtrip(&input)
+    linera_witty::test::test_memory_roundtrip(input).expect("Memory WIT roundtrip test failed");
+    linera_witty::test::test_flattening_roundtrip(input)
         .expect("Flattening WIT roundtrip test failed");
 }
 
 /// Creates a dummy [`Resources`] instance to use for the WIT roundtrip test.
 fn resources_test_case() -> Resources {
     Resources {
+        bytes_runtime: 40,
         bytes_to_read: 1_474_560,
         bytes_to_write: 571,
         blobs_to_read: 71,
         blobs_to_publish: 73,
         blob_bytes_to_read: 67,
         blob_bytes_to_publish: 71,
-        fuel: 1_000,
+        wasm_fuel: 1_000,
+        evm_fuel: 1_000,
         message_size: 4,
         messages: 93,
         read_operations: 12,
@@ -69,13 +71,15 @@ fn send_message_request_test_case() -> SendMessageRequest<Vec<u8>> {
         is_tracked: false,
         destination: ChainId(CryptoHash::test_hash("chain_id_0")),
         grant: Resources {
+            bytes_runtime: 0,
             bytes_to_read: 200,
             bytes_to_write: 0,
             blobs_to_read: 100,
             blobs_to_publish: 1000,
             blob_bytes_to_read: 10,
             blob_bytes_to_publish: 100,
-            fuel: 8,
+            wasm_fuel: 8,
+            evm_fuel: 8,
             message_size: 1,
             messages: 0,
             read_operations: 1,
@@ -93,15 +97,6 @@ fn account_test_case() -> Account {
     Account {
         chain_id: ChainId(CryptoHash::test_hash("chain_id_10")),
         owner: AccountOwner::from(CryptoHash::test_hash("account")),
-    }
-}
-
-/// Creates a dummy [`MessageId`] instance to use for the WIT roundtrip test.
-fn message_id_test_case() -> MessageId {
-    MessageId {
-        chain_id: ChainId(CryptoHash::test_hash("chain_id_3")),
-        height: BlockHeight(9_812_394),
-        index: 7,
     }
 }
 
@@ -149,6 +144,7 @@ fn chain_ownership_test_case() -> ChainOwnership {
 
     ChainOwnership {
         super_owners,
+        first_leader: Some(AccountOwner::from(CryptoHash::test_hash("Fred"))),
         owners,
         multi_leader_rounds: 5,
         open_multi_leader_rounds: false,
@@ -159,4 +155,15 @@ fn chain_ownership_test_case() -> ChainOwnership {
             fallback_duration: TimeDelta::from_secs(10_000),
         },
     }
+}
+
+#[test]
+fn account_owner_debug_format() {
+    assert_eq!(&format!("{:?}", AccountOwner::Reserved(10)), "Reserved(10)");
+    let addr32 = AccountOwner::Address32(CryptoHash::from([10u8; 32]));
+    let debug32 = "Address32(0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a)";
+    assert_eq!(&format!("{addr32:?}"), debug32);
+    let addr20 = AccountOwner::Address20([10u8; 20]);
+    let debug20 = "Address20(0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a)";
+    assert_eq!(&format!("{addr20:?}"), debug20);
 }

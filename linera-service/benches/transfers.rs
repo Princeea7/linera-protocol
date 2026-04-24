@@ -1,6 +1,8 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![recursion_limit = "256"]
+
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::{
     stream::{self, FuturesUnordered},
@@ -12,15 +14,14 @@ use linera_base::{
     identifiers::{Account, AccountOwner},
     time::{Duration, Instant},
 };
-use linera_execution::system::Recipient;
 use linera_sdk::test::{ActiveChain, TestValidator};
 use tokio::runtime::Runtime;
 
 /// Benchmarks several transactions transferring tokens across chains.
 fn cross_chain_native_token_transfers(criterion: &mut Criterion) {
-    let chain_count = 100;
+    let chain_count = 40;
     let accounts_per_chain = 1;
-    let transfers_per_account = 100;
+    let transfers_per_account = 40;
 
     criterion.bench_function("same_chain_native_token_transfers", |bencher| {
         bencher
@@ -29,11 +30,11 @@ fn cross_chain_native_token_transfers(criterion: &mut Criterion) {
                 let mut total_time = Duration::ZERO;
 
                 for _ in 0..iterations {
-                    let chains = setup_native_token_balances(
+                    let chains = Box::pin(setup_native_token_balances(
                         chain_count,
                         accounts_per_chain,
                         transfers_per_account,
-                    )
+                    ))
                     .await;
 
                     let transfers = prepare_transfers(chains, transfers_per_account);
@@ -78,10 +79,10 @@ async fn setup_native_token_balances(
     let admin_chain = validator.get_chain(&validator.admin_chain_id());
 
     for chain in &chains {
-        let recipient = Recipient::Account(Account {
+        let recipient = Account {
             chain_id: chain.id(),
             owner: AccountOwner::from(chain.public_key()),
-        });
+        };
 
         // TODO: Support benchmarking chains with multiple owner accounts
         assert_eq!(accounts_per_chain, 1);
@@ -114,10 +115,10 @@ fn prepare_transfers(
         })
         .collect::<Vec<_>>();
 
-    let chain_transfers = chains
+    chains
         .into_iter()
         .enumerate()
-        .map(|(index, chain)| {
+        .map(move |(index, chain)| {
             let chain_id = chain.id();
             let sender = AccountOwner::from(chain.public_key());
 
@@ -128,16 +129,11 @@ fn prepare_transfers(
                 .cycle()
                 .skip(index)
                 .take(transfers_per_account)
-                .map(Recipient::Account)
                 .map(move |recipient| (sender, recipient))
                 .collect::<Vec<_>>();
 
             (chain, transfers)
         })
-        .collect::<Vec<_>>();
-
-    chain_transfers
-        .into_iter()
         .map(move |(chain, transfers)| async move {
             tokio::spawn(async move {
                 for (sender, recipient) in transfers {

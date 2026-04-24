@@ -5,68 +5,37 @@
 
 use std::{fmt::Debug, future::Future};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Serialize};
 
 #[cfg(with_testing)]
 use crate::random::generate_test_namespace;
 use crate::{
-    batch::Batch,
+    batch::{Batch, SimplifiedBatch},
     common::from_bytes_option,
-    lru_caching::{StorageCacheConfig, DEFAULT_STORAGE_CACHE_CONFIG},
-    views::ViewError,
+    ViewError,
 };
 
-/// The common initialization parameters for the `KeyValueStore`
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommonStoreInternalConfig {
-    /// The number of concurrent to a database
-    pub max_concurrent_queries: Option<usize>,
-    /// The number of streams used for the async streams.
-    pub max_stream_queries: usize,
-}
-
-/// The common initialization parameters for the `KeyValueStore`
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommonStoreConfig {
-    /// The number of concurrent to a database
-    pub max_concurrent_queries: Option<usize>,
-    /// The number of streams used for the async streams.
-    pub max_stream_queries: usize,
-    /// The cache size being used.
-    pub storage_cache_config: StorageCacheConfig,
-}
-
-impl CommonStoreConfig {
-    /// Gets the reduced `CommonStoreInternalConfig`.
-    pub fn reduced(&self) -> CommonStoreInternalConfig {
-        CommonStoreInternalConfig {
-            max_concurrent_queries: self.max_concurrent_queries,
-            max_stream_queries: self.max_stream_queries,
-        }
-    }
-}
-
-impl Default for CommonStoreConfig {
-    fn default() -> Self {
-        CommonStoreConfig {
-            max_concurrent_queries: None,
-            max_stream_queries: 10,
-            storage_cache_config: DEFAULT_STORAGE_CACHE_CONFIG,
-        }
-    }
-}
-
 /// The error type for the key-value stores.
-pub trait KeyValueStoreError: std::error::Error + Debug + From<bcs::Error> {
+pub trait KeyValueStoreError:
+    std::error::Error + From<bcs::Error> + Debug + Send + Sync + 'static
+{
     /// The name of the backend.
     const BACKEND: &'static str;
+
+    /// Returns `true` if this error represents a journal resolution failure,
+    /// which may leave storage in an inconsistent state requiring a view reload.
+    fn must_reload_view(&self) -> bool {
+        false
+    }
 }
 
 impl<E: KeyValueStoreError> From<E> for ViewError {
     fn from(error: E) -> Self {
+        let must_reload_view = error.must_reload_view();
         Self::StoreError {
-            backend: E::BACKEND.to_string(),
-            error: error.to_string(),
+            backend: E::BACKEND,
+            error: Box::new(error),
+            must_reload_view,
         }
     }
 }
@@ -77,20 +46,17 @@ pub trait WithError {
     type Error: KeyValueStoreError;
 }
 
-/// Low-level, asynchronous read key-value operations. Useful for storage APIs not based on views.
-#[trait_variant::make(ReadableKeyValueStore: Send)]
-pub trait LocalReadableKeyValueStore: WithError {
+/// Asynchronous read key-value operations.
+#[cfg_attr(not(web), trait_variant::make(Send + Sync))]
+pub trait ReadableKeyValueStore: WithError {
     /// The maximal size of keys that can be stored.
     const MAX_KEY_SIZE: usize;
 
-    /// Returns type for key search operations.
-    type Keys: KeyIterable<Self::Error>;
-
-    /// Returns type for key-value search operations.
-    type KeyValues: KeyValueIterable<Self::Error>;
-
     /// Retrieve the number of stream queries.
     fn max_stream_queries(&self) -> usize;
+
+    /// Gets the root key of the store.
+    fn root_key(&self) -> Result<Vec<u8>, Self::Error>;
 
     /// Retrieves a `Vec<u8>` from the database using the provided `key`.
     async fn read_value_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
@@ -99,22 +65,22 @@ pub trait LocalReadableKeyValueStore: WithError {
     async fn contains_key(&self, key: &[u8]) -> Result<bool, Self::Error>;
 
     /// Tests whether a list of keys exist in the database
-    async fn contains_keys(&self, keys: Vec<Vec<u8>>) -> Result<Vec<bool>, Self::Error>;
+    async fn contains_keys(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, Self::Error>;
 
     /// Retrieves multiple `Vec<u8>` from the database using the provided `keys`.
     async fn read_multi_values_bytes(
         &self,
-        keys: Vec<Vec<u8>>,
+        keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, Self::Error>;
 
     /// Finds the `key` matching the prefix. The prefix is not included in the returned keys.
-    async fn find_keys_by_prefix(&self, key_prefix: &[u8]) -> Result<Self::Keys, Self::Error>;
+    async fn find_keys_by_prefix(&self, key_prefix: &[u8]) -> Result<Vec<Vec<u8>>, Self::Error>;
 
     /// Finds the `(key,value)` pairs matching the prefix. The prefix is not included in the returned keys.
     async fn find_key_values_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::KeyValues, Self::Error>;
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Self::Error>;
 
     // We can't use `async fn` here in the below implementations due to
     // https://github.com/rust-lang/impl-trait-utils/issues/17, but once that bug is fixed
@@ -124,34 +90,28 @@ pub trait LocalReadableKeyValueStore: WithError {
     fn read_value<V: DeserializeOwned>(
         &self,
         key: &[u8],
-    ) -> impl Future<Output = Result<Option<V>, Self::Error>>
-    where
-        Self: Sync,
-    {
-        async { from_bytes_option(&self.read_value_bytes(key).await?) }
+    ) -> impl Future<Output = Result<Option<V>, Self::Error>> {
+        async { Ok(from_bytes_option(&self.read_value_bytes(key).await?)?) }
     }
 
     /// Reads multiple `keys` and deserializes the results if present.
-    fn read_multi_values<V: DeserializeOwned + Send>(
+    fn read_multi_values<V: DeserializeOwned + Send + Sync>(
         &self,
-        keys: Vec<Vec<u8>>,
-    ) -> impl Future<Output = Result<Vec<Option<V>>, Self::Error>>
-    where
-        Self: Sync,
-    {
+        keys: &[Vec<u8>],
+    ) -> impl Future<Output = Result<Vec<Option<V>>, Self::Error>> {
         async {
             let mut values = Vec::with_capacity(keys.len());
             for entry in self.read_multi_values_bytes(keys).await? {
-                values.push(from_bytes_option::<_, bcs::Error>(&entry)?);
+                values.push(from_bytes_option(&entry)?);
             }
             Ok(values)
         }
     }
 }
 
-/// Low-level, asynchronous write key-value operations. Useful for storage APIs not based on views.
-#[trait_variant::make(WritableKeyValueStore: Send)]
-pub trait LocalWritableKeyValueStore: WithError {
+/// Asynchronous write key-value operations.
+#[cfg_attr(not(web), trait_variant::make(Send + Sync))]
+pub trait WritableKeyValueStore: WithError {
     /// The maximal size of values that can be stored.
     const MAX_VALUE_SIZE: usize;
 
@@ -163,29 +123,60 @@ pub trait LocalWritableKeyValueStore: WithError {
     async fn clear_journal(&self) -> Result<(), Self::Error>;
 }
 
-/// Low-level trait for the administration of stores and their namespaces.
-#[trait_variant::make(AdminKeyValueStore: Send)]
-pub trait LocalAdminKeyValueStore: WithError + Sized {
-    /// The configuration needed to interact with a new store.
+/// Asynchronous direct write key-value operations with simplified batch.
+///
+/// Some backend cannot implement `WritableKeyValueStore` directly and will require
+/// journaling.
+#[cfg_attr(not(web), trait_variant::make(Send + Sync))]
+pub trait DirectWritableKeyValueStore: WithError {
+    /// The maximal number of items in a batch.
+    const MAX_BATCH_SIZE: usize;
+
+    /// The maximal number of bytes of a batch.
+    const MAX_BATCH_TOTAL_SIZE: usize;
+
+    /// The maximal size of values that can be stored.
+    const MAX_VALUE_SIZE: usize;
+
+    /// The batch type.
+    type Batch: SimplifiedBatch + Serialize + DeserializeOwned + Default;
+
+    /// Writes the batch to the database.
+    async fn write_batch(&self, batch: Self::Batch) -> Result<(), Self::Error>;
+}
+
+/// The definition of a key-value database.
+#[cfg_attr(not(web), trait_variant::make(Send + Sync))]
+pub trait KeyValueDatabase: WithError + linera_base::util::traits::AutoTraits + Sized {
+    /// The configuration needed to interact with a new backend.
     type Config: Send + Sync;
-    /// The name of this class of stores
+
+    /// The result of opening a partition.
+    type Store;
+
+    /// The name of this database.
     fn get_name() -> String;
 
     /// Connects to an existing namespace using the given configuration.
     async fn connect(config: &Self::Config, namespace: &str) -> Result<Self, Self::Error>;
 
-    /// Takes a connection and creates a new one with a different `root_key`.
-    fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, Self::Error>;
+    /// Opens a shared partition starting at `root_key`. It is understood that the
+    /// partition MAY be read and written simultaneously from other clients.
+    fn open_shared(&self, root_key: &[u8]) -> Result<Self::Store, Self::Error>;
+
+    /// Opens an exclusive partition starting at `root_key`. It is assumed that the
+    /// partition WILL NOT be read and written simultaneously by other clients.
+    ///
+    /// IMPORTANT: This assumption is not enforced at the moment. However, future
+    /// implementations may choose to return an error if another client is detected.
+    fn open_exclusive(&self, root_key: &[u8]) -> Result<Self::Store, Self::Error>;
 
     /// Obtains the list of existing namespaces.
     async fn list_all(config: &Self::Config) -> Result<Vec<String>, Self::Error>;
 
     /// Lists the root keys of the namespace.
     /// It is possible that some root keys have no keys.
-    async fn list_root_keys(
-        config: &Self::Config,
-        namespace: &str,
-    ) -> Result<Vec<Vec<u8>>, Self::Error>;
+    async fn list_root_keys(&self) -> Result<Vec<Vec<u8>>, Self::Error>;
 
     /// Deletes all the existing namespaces.
     fn delete_all(config: &Self::Config) -> impl Future<Output = Result<(), Self::Error>> {
@@ -235,163 +226,132 @@ pub trait LocalAdminKeyValueStore: WithError + Sized {
     }
 }
 
-/// Low-level, asynchronous write and read key-value operations. Useful for storage APIs not based on views.
-pub trait RestrictedKeyValueStore: ReadableKeyValueStore + WritableKeyValueStore {}
+/// A key-value store that can perform both read and direct write operations.
+///
+/// This trait combines the capabilities of [`ReadableKeyValueStore`] and
+/// [`DirectWritableKeyValueStore`], providing a full interface for stores
+/// that can handle simplified batches directly without journaling.
+pub trait DirectKeyValueStore: ReadableKeyValueStore + DirectWritableKeyValueStore {}
 
-impl<T> RestrictedKeyValueStore for T where T: ReadableKeyValueStore + WritableKeyValueStore {}
+impl<T> DirectKeyValueStore for T where T: ReadableKeyValueStore + DirectWritableKeyValueStore {}
 
-/// Low-level, asynchronous write and read key-value operations, without a `Send` bound. Useful for storage APIs not based on views.
-pub trait LocalRestrictedKeyValueStore:
-    LocalReadableKeyValueStore + LocalWritableKeyValueStore
-{
-}
+/// A key-value store that can perform both read and write operations.
+///
+/// This trait combines the capabilities of [`ReadableKeyValueStore`] and
+/// [`WritableKeyValueStore`], providing a full interface for stores that
+/// can handle complex batches with journaling support.
+pub trait KeyValueStore: ReadableKeyValueStore + WritableKeyValueStore {}
 
-impl<T> LocalRestrictedKeyValueStore for T where
-    T: LocalReadableKeyValueStore + LocalWritableKeyValueStore
-{
-}
-
-/// Low-level, asynchronous write and read key-value operations. Useful for storage APIs not based on views.
-pub trait KeyValueStore:
-    ReadableKeyValueStore + WritableKeyValueStore + AdminKeyValueStore
-{
-}
-
-impl<T> KeyValueStore for T where
-    T: ReadableKeyValueStore + WritableKeyValueStore + AdminKeyValueStore
-{
-}
-
-/// Low-level, asynchronous write and read key-value operations, without a `Send` bound. Useful for storage APIs not based on views.
-pub trait LocalKeyValueStore:
-    LocalReadableKeyValueStore + LocalWritableKeyValueStore + LocalAdminKeyValueStore
-{
-}
-
-impl<T> LocalKeyValueStore for T where
-    T: LocalReadableKeyValueStore + LocalWritableKeyValueStore + LocalAdminKeyValueStore
-{
-}
+impl<T> KeyValueStore for T where T: ReadableKeyValueStore + WritableKeyValueStore {}
 
 /// The functions needed for testing purposes
 #[cfg(with_testing)]
-pub trait TestKeyValueStore: KeyValueStore {
+pub trait TestKeyValueDatabase: KeyValueDatabase {
     /// Obtains a test config
-    fn new_test_config(
-    ) -> impl std::future::Future<Output = Result<Self::Config, Self::Error>> + Send;
+    async fn new_test_config() -> Result<Self::Config, Self::Error>;
+
+    /// Creates a database for testing purposes
+    async fn connect_test_namespace() -> Result<Self, Self::Error> {
+        let config = Self::new_test_config().await?;
+        let namespace = generate_test_namespace();
+        Self::recreate_and_connect(&config, &namespace).await
+    }
 
     /// Creates a store for testing purposes
-    fn new_test_store() -> impl std::future::Future<Output = Result<Self, Self::Error>> + Send {
-        async {
-            let config = Self::new_test_config().await?;
-            let namespace = generate_test_namespace();
-            Self::recreate_and_connect(&config, &namespace).await
-        }
+    async fn new_test_store() -> Result<Self::Store, Self::Error> {
+        let database = Self::connect_test_namespace().await?;
+        database.open_shared(&[])
     }
 }
 
-#[doc(hidden)]
-/// Iterates keys by reference in a vector of keys.
-/// Inspired by https://depth-first.com/articles/2020/06/22/returning-rust-iterators/
-pub struct SimpleKeyIterator<'a, E> {
-    iter: std::slice::Iter<'a, Vec<u8>>,
-    _error_type: std::marker::PhantomData<E>,
-}
+/// A module containing a dummy store used for caching views.
+pub mod inactive_store {
+    use super::*;
 
-impl<'a, E> Iterator for SimpleKeyIterator<'a, E> {
-    type Item = Result<&'a [u8], E>;
+    /// A store which does not actually store anything - used for caching views.
+    pub struct InactiveStore;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|key| Result::Ok(key.as_ref()))
-    }
-}
+    /// An error struct for the inactive store.
+    #[derive(Clone, Copy, Debug)]
+    pub struct InactiveStoreError;
 
-impl<E> KeyIterable<E> for Vec<Vec<u8>> {
-    type Iterator<'a> = SimpleKeyIterator<'a, E>;
-
-    fn iterator(&self) -> Self::Iterator<'_> {
-        SimpleKeyIterator {
-            iter: self.iter(),
-            _error_type: std::marker::PhantomData,
-        }
-    }
-}
-
-#[doc(hidden)]
-/// Same as `SimpleKeyIterator` but for key-value pairs.
-pub struct SimpleKeyValueIterator<'a, E> {
-    iter: std::slice::Iter<'a, (Vec<u8>, Vec<u8>)>,
-    _error_type: std::marker::PhantomData<E>,
-}
-
-impl<'a, E> Iterator for SimpleKeyValueIterator<'a, E> {
-    type Item = Result<(&'a [u8], &'a [u8]), E>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter
-            .next()
-            .map(|entry| Ok((&entry.0[..], &entry.1[..])))
-    }
-}
-
-#[doc(hidden)]
-/// Same as `SimpleKeyValueIterator` but key-value pairs are passed by value.
-pub struct SimpleKeyValueIteratorOwned<E> {
-    iter: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
-    _error_type: std::marker::PhantomData<E>,
-}
-
-impl<E> Iterator for SimpleKeyValueIteratorOwned<E> {
-    type Item = Result<(Vec<u8>, Vec<u8>), E>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(Result::Ok)
-    }
-}
-
-impl<E> KeyValueIterable<E> for Vec<(Vec<u8>, Vec<u8>)> {
-    type Iterator<'a> = SimpleKeyValueIterator<'a, E>;
-    type IteratorOwned = SimpleKeyValueIteratorOwned<E>;
-
-    fn iterator(&self) -> Self::Iterator<'_> {
-        SimpleKeyValueIterator {
-            iter: self.iter(),
-            _error_type: std::marker::PhantomData,
+    impl std::fmt::Display for InactiveStoreError {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "inactive store error")
         }
     }
 
-    fn into_iterator_owned(self) -> Self::IteratorOwned {
-        SimpleKeyValueIteratorOwned {
-            iter: self.into_iter(),
-            _error_type: std::marker::PhantomData,
+    impl From<bcs::Error> for InactiveStoreError {
+        fn from(_other: bcs::Error) -> Self {
+            Self
         }
     }
-}
 
-/// How to iterate over the keys returned by a search query.
-pub trait KeyIterable<Error> {
-    /// The iterator returning keys by reference.
-    type Iterator<'a>: Iterator<Item = Result<&'a [u8], Error>>
-    where
-        Self: 'a;
+    impl std::error::Error for InactiveStoreError {}
 
-    /// Iterates keys by reference.
-    fn iterator(&self) -> Self::Iterator<'_>;
-}
+    impl KeyValueStoreError for InactiveStoreError {
+        const BACKEND: &'static str = "inactive";
+    }
 
-/// How to iterate over the key-value pairs returned by a search query.
-pub trait KeyValueIterable<Error> {
-    /// The iterator that returns key-value pairs by reference.
-    type Iterator<'a>: Iterator<Item = Result<(&'a [u8], &'a [u8]), Error>>
-    where
-        Self: 'a;
+    impl WithError for InactiveStore {
+        type Error = InactiveStoreError;
+    }
 
-    /// The iterator that returns key-value pairs by value.
-    type IteratorOwned: Iterator<Item = Result<(Vec<u8>, Vec<u8>), Error>>;
+    impl ReadableKeyValueStore for InactiveStore {
+        const MAX_KEY_SIZE: usize = 0;
 
-    /// Iterates keys and values by reference.
-    fn iterator(&self) -> Self::Iterator<'_>;
+        fn max_stream_queries(&self) -> usize {
+            0
+        }
 
-    /// Iterates keys and values by value.
-    fn into_iterator_owned(self) -> Self::IteratorOwned;
+        fn root_key(&self) -> Result<Vec<u8>, Self::Error> {
+            panic!("attempt to read from an inactive store!")
+        }
+
+        async fn read_value_bytes(&self, _key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            panic!("attempt to read from an inactive store!")
+        }
+
+        async fn contains_key(&self, _key: &[u8]) -> Result<bool, Self::Error> {
+            panic!("attempt to read from an inactive store!")
+        }
+
+        async fn contains_keys(&self, _keys: &[Vec<u8>]) -> Result<Vec<bool>, Self::Error> {
+            panic!("attempt to read from an inactive store!")
+        }
+
+        async fn read_multi_values_bytes(
+            &self,
+            _keys: &[Vec<u8>],
+        ) -> Result<Vec<Option<Vec<u8>>>, Self::Error> {
+            panic!("attempt to read from an inactive store!")
+        }
+
+        async fn find_keys_by_prefix(
+            &self,
+            _key_prefix: &[u8],
+        ) -> Result<Vec<Vec<u8>>, Self::Error> {
+            panic!("attempt to read from an inactive store!")
+        }
+
+        /// Finds the `(key,value)` pairs matching the prefix. The prefix is not included in the returned keys.
+        async fn find_key_values_by_prefix(
+            &self,
+            _key_prefix: &[u8],
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Self::Error> {
+            panic!("attempt to read from an inactive store!")
+        }
+    }
+
+    impl WritableKeyValueStore for InactiveStore {
+        const MAX_VALUE_SIZE: usize = 0;
+
+        async fn write_batch(&self, _batch: Batch) -> Result<(), Self::Error> {
+            panic!("attempt to write to an inactive store!")
+        }
+
+        async fn clear_journal(&self) -> Result<(), Self::Error> {
+            panic!("attempt to write to an inactive store!")
+        }
+    }
 }

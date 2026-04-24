@@ -19,48 +19,45 @@ mod tests;
 /// The name is either obtained from a custom `#[wit_name = ""]` attribute, or as the
 /// kebab-case version of the Rust type name.
 pub fn discover_wit_name(attributes: &[Attribute], rust_name: &Ident) -> LitStr {
-    let custom_name = attributes
-        .iter()
-        .filter_map(|attribute| {
-            let Meta::List(meta) = &attribute.meta else {
-                return None;
-            };
-            let MacroDelimiter::Paren(_) = meta.delimiter else {
-                return None;
-            };
-            if !meta.path.is_ident("witty") {
-                return None;
-            }
+    let custom_name = attributes.iter().find_map(|attribute| {
+        let Meta::List(meta) = &attribute.meta else {
+            return None;
+        };
+        let MacroDelimiter::Paren(_) = meta.delimiter else {
+            return None;
+        };
+        if !meta.path.is_ident("witty") {
+            return None;
+        }
 
-            let mut wit_name = None;
-            meta.parse_nested_meta(|witty_attribute| {
-                if witty_attribute.path.is_ident("name") {
-                    if wit_name.is_some() {
-                        abort!(
-                            witty_attribute.path,
-                            "Multiple attributes configuring the WIT type name"
-                        );
-                    }
-
-                    let value = witty_attribute.value()?;
-                    let name = value.parse::<LitStr>()?;
-
-                    wit_name = Some(name.clone());
+        let mut wit_name = None;
+        meta.parse_nested_meta(|witty_attribute| {
+            if witty_attribute.path.is_ident("name") {
+                if wit_name.is_some() {
+                    abort!(
+                        witty_attribute.path,
+                        "Multiple attributes configuring the WIT type name"
+                    );
                 }
 
-                Ok(())
-            })
-            .unwrap_or_else(|_| {
-                abort!(
-                    meta,
-                    "Failed to parse WIT type name attribute. \
-                    Expected `#[witty(name = \"custom-wit-type-name\")]`."
-                );
-            });
+                let value = witty_attribute.value()?;
+                let name = value.parse::<LitStr>()?;
 
-            wit_name
+                wit_name = Some(name.clone());
+            }
+
+            Ok(())
         })
-        .next();
+        .unwrap_or_else(|_| {
+            abort!(
+                meta,
+                "Failed to parse WIT type name attribute. \
+                    Expected `#[witty(name = \"custom-wit-type-name\")]`."
+            );
+        });
+
+        wit_name
+    });
 
     custom_name
         .unwrap_or_else(|| LitStr::new(&rust_name.to_string().to_kebab_case(), rust_name.span()))
@@ -69,7 +66,7 @@ pub fn discover_wit_name(attributes: &[Attribute], rust_name: &Ident) -> LitStr 
 /// Returns the body of the `WitType` implementation for the Rust `struct` with the specified
 /// `fields`.
 pub fn derive_for_struct<'input>(
-    wit_name: LitStr,
+    wit_name: &LitStr,
     fields: impl Into<FieldsInformation<'input>>,
 ) -> TokenStream {
     let fields = fields.into();
@@ -108,7 +105,7 @@ pub fn derive_for_struct<'input>(
 /// `variants`.
 pub fn derive_for_enum<'variants>(
     name: &Ident,
-    wit_name: LitStr,
+    wit_name: &LitStr,
     variants: impl DoubleEndedIterator<Item = &'variants Variant> + Clone,
 ) -> TokenStream {
     let variant_count = variants.clone().count();
@@ -125,7 +122,7 @@ pub fn derive_for_enum<'variants>(
         quote! { u8 }
     } else if variant_count <= u16::MAX.into() {
         quote! { u16 }
-    } else if variant_count <= u32::MAX as usize {
+    } else if u32::try_from(variant_count).is_ok() {
         quote! { u32 }
     } else {
         abort!(name, "Too many variants in `enum`");

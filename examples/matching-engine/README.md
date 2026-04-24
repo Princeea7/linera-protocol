@@ -61,6 +61,12 @@ linera_spawn linera net up --with-faucet --faucet-port $FAUCET_PORT
 #   FAUCET_URL=https://faucet.testnet-XXX.linera.net  # for some value XXX
 ```
 
+Enable logs for user applications:
+
+```bash
+export LINERA_APPLICATION_LOGS=true
+```
+
 Create the user wallet and add chains to it:
 
 ```bash
@@ -76,9 +82,9 @@ INFO_3=($(linera wallet request-chain --faucet $FAUCET_URL))
 CHAIN_1="${INFO_1[0]}"
 CHAIN_2="${INFO_2[0]}"
 CHAIN_3="${INFO_3[0]}"
-OWNER_1="${INFO_1[2]}"
-OWNER_2="${INFO_2[2]}"
-OWNER_3="${INFO_3[2]}"
+OWNER_1="${INFO_1[1]}"
+OWNER_2="${INFO_2[1]}"
+OWNER_3="${INFO_3[1]}"
 ```
 
 Publish and create two `fungible` applications whose IDs will be used as a
@@ -112,7 +118,7 @@ Now, we publish and deploy the Matching Engine application:
 ```bash
 MATCHING_ENGINE=$(linera --wait-for-outgoing-messages \
     project publish-and-create examples/matching-engine \
-    --json-parameters "{\"tokens\":["\"$FUN1_APP_ID\"","\"$FUN2_APP_ID\""]}" \
+    --json-parameters "{\"tokens\":["\"$FUN1_APP_ID\"","\"$FUN2_APP_ID\""], \"price_decimals\": 2}" \
     --required-application-ids $FUN1_APP_ID $FUN2_APP_ID)
 ```
 
@@ -137,12 +143,12 @@ To create a `Bid` order as owner 1, offering to buy 1 FUN1 for 5 FUN2:
 mutation {
   executeOrder(
     order: {
-        Insert : {
+      Insert : {
         owner: "$OWNER_1",
-        amount: "1",
+        quantity: "1",
         nature: Bid,
         price: {
-            price:5
+            price: 500
         }
       }
     }
@@ -177,11 +183,11 @@ Engine to close the chain.
 kill %% && sleep 1    # Kill the service so we can use CLI commands for chain 1.
 
 linera --wait-for-outgoing-messages change-ownership \
-    --owners $OWNER_1 $OWNER_2
+    --owners "{\"$OWNER_1\":100,\"$OWNER_2\":100}"
 
 linera --wait-for-outgoing-messages change-application-permissions \
-    --execute-operations $MATCHING_ENGINE \
-    --close-chain $MATCHING_ENGINE
+    --execute-operations "[\"$MATCHING_ENGINE\"]" \
+    --manage-chain "[\"$MATCHING_ENGINE\"]"
 
 linera service --port $PORT &
 ```
@@ -231,10 +237,10 @@ mutation {
     order: {
       Insert : {
         owner: "$OWNER_2",
-        amount: "2",
+        quantity: "2",
         nature: Ask,
         price: {
-            price:5
+            price: 500
         }
       }
     }

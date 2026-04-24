@@ -1,54 +1,205 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, iter, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use linera_base::{
-    data_types::{Amount, Epoch, Timestamp},
-    identifiers::{AccountOwner, ApplicationId, ChainId},
-    listen_for_shutdown_signals,
+    data_types::{Amount, Timestamp},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId},
     time::Instant,
 };
-use linera_chain::{
-    data_types::{BlockProposal, ProposedBlock},
-    types::ConfirmedBlock,
+use linera_core::{
+    client::chain_client::{self, ChainClient},
+    data_types::ClientOutcome,
+    Environment,
 };
-use linera_core::{client::ChainClient, local_node::LocalNodeClient, Environment};
-use linera_execution::{
-    committee::Committee,
-    system::{Recipient, SystemOperation},
-    Operation,
-};
-use linera_sdk::abis::fungible;
+use linera_execution::{system::SystemOperation, Operation};
+use linera_sdk::abis::fungible::FungibleOperation;
 use num_format::{Locale, ToFormattedString};
 use prometheus_parse::{HistogramCount, Scrape, Value};
+use rand::{rngs::SmallRng, seq::SliceRandom, thread_rng, SeedableRng};
+use serde::{Deserialize, Serialize};
 use tokio::{
-    runtime::Handle,
-    sync::{mpsc, Barrier},
+    sync::{mpsc, Barrier, Notify},
     task, time,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Instrument as _};
+
+use crate::chain_listener::{ChainListener, ClientContext};
+
+/// Trait for generating benchmark operations.
+///
+/// Implement this trait to create custom operation generators for different
+/// application benchmarks (e.g., prediction markets, custom tokens, etc.).
+///
+/// Each benchmark chain gets its own generator instance. The generator is responsible
+/// for producing operations to include in blocks, including any destination chain
+/// selection logic.
+pub trait OperationGenerator: Send + 'static {
+    /// Generate a batch of operations for a single block.
+    fn generate_operations(&mut self, owner: AccountOwner, count: usize) -> Vec<Operation>;
+}
+
+/// Generates native fungible token transfer operations between chains.
+pub struct NativeFungibleTransferGenerator {
+    source_chain_id: ChainId,
+    destination_chains: Vec<ChainId>,
+    destination_index: usize,
+    rng: SmallRng,
+    single_destination_per_block: bool,
+}
+
+impl NativeFungibleTransferGenerator {
+    pub fn new(
+        source_chain_id: ChainId,
+        mut destination_chains: Vec<ChainId>,
+        single_destination_per_block: bool,
+    ) -> Result<Self, BenchmarkError> {
+        // With a single chain, send to self.
+        if destination_chains.is_empty() {
+            destination_chains.push(source_chain_id);
+        }
+        let mut rng = SmallRng::from_rng(thread_rng())?;
+        destination_chains.shuffle(&mut rng);
+        Ok(Self {
+            source_chain_id,
+            destination_chains,
+            destination_index: 0,
+            rng,
+            single_destination_per_block,
+        })
+    }
+
+    fn next_destination(&mut self) -> ChainId {
+        if self.destination_index >= self.destination_chains.len() {
+            self.destination_chains.shuffle(&mut self.rng);
+            self.destination_index = 0;
+        }
+        let destination_chain_id = self.destination_chains[self.destination_index];
+        self.destination_index += 1;
+        // Skip self when there are other destinations available.
+        if destination_chain_id == self.source_chain_id && self.destination_chains.len() > 1 {
+            self.next_destination()
+        } else {
+            destination_chain_id
+        }
+    }
+}
+
+impl OperationGenerator for NativeFungibleTransferGenerator {
+    fn generate_operations(&mut self, _owner: AccountOwner, count: usize) -> Vec<Operation> {
+        let amount = Amount::from_attos(1);
+        if self.single_destination_per_block {
+            let recipient = self.next_destination();
+            (0..count)
+                .map(|_| {
+                    Operation::system(SystemOperation::Transfer {
+                        owner: AccountOwner::CHAIN,
+                        recipient: Account::chain(recipient),
+                        amount,
+                    })
+                })
+                .collect()
+        } else {
+            (0..count)
+                .map(|_| {
+                    let recipient = self.next_destination();
+                    Operation::system(SystemOperation::Transfer {
+                        owner: AccountOwner::CHAIN,
+                        recipient: Account::chain(recipient),
+                        amount,
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
+/// Generates fungible token transfer operations between chains.
+pub struct FungibleTransferGenerator {
+    application_id: ApplicationId,
+    source_chain_id: ChainId,
+    destination_chains: Vec<ChainId>,
+    destination_index: usize,
+    rng: SmallRng,
+    single_destination_per_block: bool,
+}
+
+impl FungibleTransferGenerator {
+    pub fn new(
+        application_id: ApplicationId,
+        source_chain_id: ChainId,
+        mut destination_chains: Vec<ChainId>,
+        single_destination_per_block: bool,
+    ) -> Result<Self, BenchmarkError> {
+        // With a single chain, send to self (matching old behavior).
+        if destination_chains.is_empty() {
+            destination_chains.push(source_chain_id);
+        }
+        let mut rng = SmallRng::from_rng(thread_rng())?;
+        destination_chains.shuffle(&mut rng);
+        Ok(Self {
+            application_id,
+            source_chain_id,
+            destination_chains,
+            destination_index: 0,
+            rng,
+            single_destination_per_block,
+        })
+    }
+
+    fn next_destination(&mut self) -> ChainId {
+        if self.destination_index >= self.destination_chains.len() {
+            self.destination_chains.shuffle(&mut self.rng);
+            self.destination_index = 0;
+        }
+        let destination_chain_id = self.destination_chains[self.destination_index];
+        self.destination_index += 1;
+        // Skip self when there are other destinations available.
+        if destination_chain_id == self.source_chain_id && self.destination_chains.len() > 1 {
+            self.next_destination()
+        } else {
+            destination_chain_id
+        }
+    }
+}
+
+impl OperationGenerator for FungibleTransferGenerator {
+    fn generate_operations(&mut self, owner: AccountOwner, count: usize) -> Vec<Operation> {
+        let amount = Amount::from_attos(1);
+        if self.single_destination_per_block {
+            let recipient = self.next_destination();
+            (0..count)
+                .map(|_| fungible_transfer(self.application_id, recipient, owner, owner, amount))
+                .collect()
+        } else {
+            (0..count)
+                .map(|_| {
+                    let recipient = self.next_destination();
+                    fungible_transfer(self.application_id, recipient, owner, owner, amount)
+                })
+                .collect()
+        }
+    }
+}
 
 const PROXY_LATENCY_P99_THRESHOLD: f64 = 400.0;
 const LATENCY_METRIC_PREFIX: &str = "linera_proxy_request_latency";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BenchmarkError {
-    #[error("Proxy of validator {0} unhealthy! Latency p99 is too high: {1} ms")]
-    ProxyUnhealthy(String, f64),
-    #[error("Failed to send message: {0}")]
-    CrossbeamSendError(#[from] crossbeam_channel::SendError<()>),
     #[error("Failed to join task: {0}")]
     JoinError(#[from] task::JoinError),
-    #[error("Failed to parse validator metrics port: {0}")]
-    ParseValidatorMetricsPort(#[from] std::num::ParseIntError),
-    #[error("Failed to parse validator metrics address: {0}")]
-    ParseValidatorMetricsAddress(String),
-    #[error("Local node error: {0}")]
-    LocalNode(#[from] linera_core::local_node::LocalNodeError),
     #[error("Chain client error: {0}")]
-    ChainClient(#[from] linera_core::client::ChainClientError),
+    ChainClient(#[from] chain_client::Error),
     #[error("Current histogram count is less than previous histogram count")]
     HistogramCountMismatch,
     #[error("Expected histogram value, got {0:?}")]
@@ -59,8 +210,6 @@ pub enum BenchmarkError {
     IncompleteHistogramData,
     #[error("Could not compute quantile")]
     CouldNotComputeQuantile,
-    #[error("Bucket count is 0")]
-    BucketCountIsZero,
     #[error("Bucket boundaries do not match: {0} vs {1}")]
     BucketBoundariesDoNotMatch(f64, f64),
     #[error("Reqwest error: {0}")]
@@ -73,8 +222,18 @@ pub enum BenchmarkError {
     NoDataYetForP99Calculation,
     #[error("Unexpected empty bucket")]
     UnexpectedEmptyBucket,
-    #[error("Failed to send message: {0}")]
-    TokioSendError(#[from] mpsc::error::SendError<()>),
+    #[error("Failed to send unit message: {0}")]
+    TokioSendUnitError(#[from] mpsc::error::SendError<()>),
+    #[error("Config file not found: {0}")]
+    ConfigFileNotFound(std::path::PathBuf),
+    #[error("Failed to load config file: {0}")]
+    ConfigLoadError(#[from] anyhow::Error),
+    #[error("Could not find enough chains in wallet alone: needed {0}, but only found {1}")]
+    NotEnoughChainsInWallet(usize, usize),
+    #[error("Random number generator error: {0}")]
+    RandError(#[from] rand::Error),
+    #[error("Chain listener startup error")]
+    ChainListenerStartupError,
 }
 
 #[derive(Debug)]
@@ -84,169 +243,208 @@ struct HistogramSnapshot {
     sum: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct BenchmarkConfig {
+    pub chain_ids: Vec<ChainId>,
+}
+
+impl BenchmarkConfig {
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let config = serde_yaml::from_str(&content)?;
+        Ok(config)
+    }
+
+    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
+        let content = serde_yaml::to_string(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+}
+
 pub struct Benchmark<Env: Environment> {
     _phantom: std::marker::PhantomData<Env>,
 }
 
 impl<Env: Environment> Benchmark<Env> {
+    /// Runs a benchmark with the given chain clients and operation generators.
+    ///
+    /// Each chain client is paired with an operation generator (one per chain).
+    /// The generators produce the operations to include in each block.
     #[expect(clippy::too_many_arguments)]
-    pub async fn run_benchmark(
-        num_chains: usize,
+    pub async fn run_benchmark<C: ClientContext<Environment = Env> + 'static>(
+        bps: usize,
+        chain_clients: Vec<ChainClient<Env>>,
+        generators: Vec<Box<dyn OperationGenerator>>,
         transactions_per_block: usize,
-        bps: Option<usize>,
-        chain_clients: HashMap<ChainId, ChainClient<Env>>,
-        epoch: Epoch,
-        blocks_infos: Vec<(ChainId, Vec<Operation>, AccountOwner)>,
-        committee: Committee,
-        local_node: LocalNodeClient<Env::Storage>,
         health_check_endpoints: Option<String>,
+        runtime_in_seconds: Option<u64>,
+        delay_between_chains_ms: Option<u64>,
+        chain_listener: ChainListener<C>,
+        shutdown_notifier: &CancellationToken,
     ) -> Result<(), BenchmarkError> {
-        let shutdown_notifier = CancellationToken::new();
-        tokio::spawn(listen_for_shutdown_signals(shutdown_notifier.clone()));
+        assert_eq!(
+            chain_clients.len(),
+            generators.len(),
+            "Must have one generator per chain client"
+        );
+        let num_chains = chain_clients.len();
+        let bps_counts = (0..num_chains)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
+        let notifier = Arc::new(Notify::new());
+        let barrier = Arc::new(Barrier::new(num_chains + 1));
 
-        let handle = Handle::current();
-        // The bps control task will control the BPS from the threads. `crossbeam_channel` is used
-        // for two reasons:
-        // 1. it allows bounded channels with zero sized buffers.
-        // 2. it blocks the current thread if the message can't be sent, which is exactly
-        //    what we want to happen here. `tokio::sync::mpsc` doesn't do that. `std::sync::mpsc`
-        //    does, but it is slower than `crossbeam_channel`.
-        // Number 1 is the main reason. `tokio::sync::mpsc` doesn't allow 0 sized buffers.
-        // With a channel with a buffer of size 1 or larger, even if we have already reached
-        // the desired BPS, the tasks would continue sending block proposals until the channel's
-        // buffer is filled, which would cause us to not properly control the BPS rate.
-        let (sender, receiver) = crossbeam_channel::bounded(0);
-        let bps_control_task = task::spawn_blocking(move || {
-            handle.block_on(async move {
-                let mut recv_count = 0;
-                let mut start = time::Instant::now();
-                while let Ok(()) = receiver.recv() {
-                    recv_count += 1;
-                    if recv_count == num_chains {
-                        let elapsed = start.elapsed();
-                        if let Some(bps) = bps {
-                            let tps =
-                                (bps * transactions_per_block).to_formatted_string(&Locale::en);
-                            let bps = bps.to_formatted_string(&Locale::en);
-                            if elapsed > time::Duration::from_secs(1) {
-                                warn!(
-                                    "Failed to achieve {} BPS/{} TPS in {} ms",
-                                    bps,
-                                    tps,
-                                    elapsed.as_millis(),
-                                );
-                            } else {
-                                time::sleep(time::Duration::from_secs(1) - elapsed).await;
-                                info!(
-                                    "Achieved {} BPS/{} TPS in {} ms",
-                                    bps,
-                                    tps,
-                                    elapsed.as_millis(),
-                                );
-                            }
-                        } else {
-                            let achieved_bps = num_chains as f64 / elapsed.as_secs_f64();
-                            info!(
-                                "Achieved {} BPS/{} TPS in {} ms",
-                                achieved_bps,
-                                achieved_bps * transactions_per_block as f64,
-                                elapsed.as_millis(),
-                            );
-                        }
+        let chain_listener_future = chain_listener
+            .run()
+            .await
+            .map_err(|_| BenchmarkError::ChainListenerStartupError)?;
+        let chain_listener_handle = tokio::spawn(chain_listener_future.in_current_span());
 
-                        recv_count = 0;
-                        start = time::Instant::now();
-                    }
-                }
+        let bps_control_task = Self::bps_control_task(
+            &barrier,
+            shutdown_notifier,
+            &bps_counts,
+            &notifier,
+            transactions_per_block,
+            bps,
+        );
 
-                info!("Exiting logging task...");
-            })
-        });
+        let (runtime_control_task, runtime_control_sender) =
+            Self::runtime_control_task(shutdown_notifier, runtime_in_seconds, num_chains);
 
-        let (bps_tasks_logger_sender, mut bps_tasks_logger_receiver) = mpsc::channel(num_chains);
-        let bps_tasks_logger_task = task::spawn(async move {
-            let mut tasks_running = 0;
-            while let Some(()) = bps_tasks_logger_receiver.recv().await {
-                tasks_running += 1;
-                info!("{}/{} tasks ready to start", tasks_running, num_chains);
-                if tasks_running == num_chains {
-                    info!("All tasks are ready to start");
-                    break;
-                }
-            }
-        });
-
-        let mut bps_remainder = bps.unwrap_or_default() % num_chains;
-        let bps_share = bps.map(|bps| bps / num_chains);
-
-        let barrier = Arc::new(Barrier::new(num_chains));
+        let bps_initial_share = bps / num_chains;
+        let mut bps_remainder = bps % num_chains;
         let mut join_set = task::JoinSet::<Result<(), BenchmarkError>>::new();
-        for (chain_id, operations, chain_owner) in blocks_infos {
+        for (chain_idx, (chain_client, generator)) in
+            chain_clients.into_iter().zip(generators).enumerate()
+        {
+            let chain_id = chain_client.chain_id();
+            let shutdown_notifier_clone = shutdown_notifier.clone();
+            let barrier_clone = barrier.clone();
+            let bps_count_clone = bps_counts[chain_idx].clone();
+            let notifier_clone = notifier.clone();
+            let runtime_control_sender_clone = runtime_control_sender.clone();
             let bps_share = if bps_remainder > 0 {
                 bps_remainder -= 1;
-                bps_share.map(|share| share + 1)
+                bps_initial_share + 1
             } else {
-                bps_share
+                bps_initial_share
             };
+            join_set.spawn(
+                async move {
+                    Box::pin(Self::run_benchmark_internal(
+                        chain_idx,
+                        chain_id,
+                        bps_share,
+                        chain_client,
+                        generator,
+                        transactions_per_block,
+                        shutdown_notifier_clone,
+                        bps_count_clone,
+                        barrier_clone,
+                        notifier_clone,
+                        runtime_control_sender_clone,
+                        delay_between_chains_ms,
+                    ))
+                    .await?;
 
-            let shutdown_notifier = shutdown_notifier.clone();
-            let sender = sender.clone();
-            let handle = Handle::current();
-            let committee = committee.clone();
-            let local_node = local_node.clone();
-            let chain_client = chain_clients[&chain_id].clone();
-            let bps_tasks_logger_sender = bps_tasks_logger_sender.clone();
-            let inner_barrier = barrier.clone();
-            chain_client.process_inbox().await?;
-            join_set.spawn_blocking(move || {
-                handle.block_on(
-                    async move {
-                        Box::pin(Self::run_benchmark_internal(
-                            chain_owner,
-                            bps_share,
-                            operations,
-                            epoch,
-                            chain_client,
-                            shutdown_notifier,
-                            sender,
-                            committee,
-                            local_node,
-                            bps_tasks_logger_sender,
-                            inner_barrier,
-                        ))
-                        .await?;
-
-                        Ok(())
-                    }
-                    .instrument(tracing::info_span!(
-                        "benchmark_chain_id",
-                        chain_id = format!("{:?}", chain_id)
-                    )),
-                )
-            });
+                    Ok(())
+                }
+                .instrument(tracing::info_span!("chain_id", chain_id = ?chain_id)),
+            );
         }
 
         let metrics_watcher =
-            Self::create_metrics_watcher(health_check_endpoints, shutdown_notifier.clone()).await?;
-        join_set
-            .join_all()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(sender);
-        info!("All benchmark tasks completed");
+            Self::metrics_watcher(health_check_endpoints, shutdown_notifier).await?;
+
+        // Wait for tasks and fail immediately if any task returns an error or panics
+        while let Some(result) = join_set.join_next().await {
+            let inner_result = result?;
+            if let Err(e) = inner_result {
+                error!("Benchmark task failed: {}", e);
+                shutdown_notifier.cancel();
+                join_set.abort_all();
+                return Err(e);
+            }
+        }
+        info!("All benchmark tasks completed successfully");
+
         bps_control_task.await?;
         if let Some(metrics_watcher) = metrics_watcher {
             metrics_watcher.await??;
         }
-        bps_tasks_logger_task.await?;
+        if let Some(runtime_control_task) = runtime_control_task {
+            runtime_control_task.await?;
+        }
+
+        if let Err(e) = chain_listener_handle.await? {
+            tracing::error!("chain listener error: {e}");
+        }
 
         Ok(())
     }
 
-    async fn create_metrics_watcher(
+    // The bps control task will control the BPS from the threads.
+    fn bps_control_task(
+        barrier: &Arc<Barrier>,
+        shutdown_notifier: &CancellationToken,
+        bps_counts: &[Arc<AtomicUsize>],
+        notifier: &Arc<Notify>,
+        transactions_per_block: usize,
+        bps: usize,
+    ) -> task::JoinHandle<()> {
+        let shutdown_notifier = shutdown_notifier.clone();
+        let bps_counts = bps_counts.to_vec();
+        let notifier = notifier.clone();
+        let barrier = barrier.clone();
+        task::spawn(
+            async move {
+                barrier.wait().await;
+                let mut one_second_interval = time::interval(time::Duration::from_secs(1));
+                loop {
+                    if shutdown_notifier.is_cancelled() {
+                        info!("Shutdown signal received in bps control task");
+                        break;
+                    }
+                    one_second_interval.tick().await;
+                    let current_bps_count: usize = bps_counts
+                        .iter()
+                        .map(|count| count.swap(0, Ordering::Relaxed))
+                        .sum();
+                    notifier.notify_waiters();
+                    let formatted_current_bps = current_bps_count.to_formatted_string(&Locale::en);
+                    let formatted_current_tps = (current_bps_count * transactions_per_block)
+                        .to_formatted_string(&Locale::en);
+                    let formatted_tps_goal =
+                        (bps * transactions_per_block).to_formatted_string(&Locale::en);
+                    let formatted_bps_goal = bps.to_formatted_string(&Locale::en);
+                    if current_bps_count >= bps {
+                        info!(
+                            "Achieved {} BPS/{} TPS",
+                            formatted_current_bps, formatted_current_tps
+                        );
+                    } else {
+                        warn!(
+                            "Failed to achieve {} BPS/{} TPS, only achieved {} BPS/{} TPS",
+                            formatted_bps_goal,
+                            formatted_tps_goal,
+                            formatted_current_bps,
+                            formatted_current_tps,
+                        );
+                    }
+                }
+
+                info!("Exiting bps control task");
+            }
+            .instrument(tracing::info_span!("bps_control")),
+        )
+    }
+
+    async fn metrics_watcher(
         health_check_endpoints: Option<String>,
-        shutdown_notifier: CancellationToken,
+        shutdown_notifier: &CancellationToken,
     ) -> Result<Option<task::JoinHandle<Result<(), BenchmarkError>>>, BenchmarkError> {
         if let Some(health_check_endpoints) = health_check_endpoints {
             let metrics_addresses = health_check_endpoints
@@ -264,6 +462,7 @@ impl<Env: Environment> Benchmark<Env> {
                 );
             }
 
+            let shutdown_notifier = shutdown_notifier.clone();
             let metrics_watcher: task::JoinHandle<Result<(), BenchmarkError>> = tokio::spawn(
                 async move {
                     let mut health_interval = time::interval(time::Duration::from_secs(5));
@@ -293,12 +492,42 @@ impl<Env: Environment> Benchmark<Env> {
                     }
 
                     Ok(())
-                },
+                }
+                .instrument(tracing::info_span!("metrics_watcher")),
             );
 
             Ok(Some(metrics_watcher))
         } else {
             Ok(None)
+        }
+    }
+
+    fn runtime_control_task(
+        shutdown_notifier: &CancellationToken,
+        runtime_in_seconds: Option<u64>,
+        num_chain_groups: usize,
+    ) -> (Option<task::JoinHandle<()>>, Option<mpsc::Sender<()>>) {
+        if let Some(runtime_in_seconds) = runtime_in_seconds {
+            let (runtime_control_sender, mut runtime_control_receiver) =
+                mpsc::channel(num_chain_groups);
+            let shutdown_notifier = shutdown_notifier.clone();
+            let runtime_control_task = task::spawn(
+                async move {
+                    let mut chains_started = 0;
+                    while runtime_control_receiver.recv().await.is_some() {
+                        chains_started += 1;
+                        if chains_started == num_chain_groups {
+                            break;
+                        }
+                    }
+                    time::sleep(time::Duration::from_secs(runtime_in_seconds)).await;
+                    shutdown_notifier.cancel();
+                }
+                .instrument(tracing::info_span!("runtime_control")),
+            );
+            (Some(runtime_control_task), Some(runtime_control_sender))
+        } else {
+            (None, None)
         }
     }
 
@@ -491,84 +720,58 @@ impl<Env: Environment> Benchmark<Env> {
 
     #[expect(clippy::too_many_arguments)]
     async fn run_benchmark_internal(
-        signer: AccountOwner,
-        bps: Option<usize>,
-        operations: Vec<Operation>,
-        epoch: Epoch,
+        chain_idx: usize,
+        chain_id: ChainId,
+        bps: usize,
         chain_client: ChainClient<Env>,
+        mut generator: Box<dyn OperationGenerator>,
+        transactions_per_block: usize,
         shutdown_notifier: CancellationToken,
-        sender: crossbeam_channel::Sender<()>,
-        committee: Committee,
-        local_node: LocalNodeClient<Env::Storage>,
-        bps_tasks_logger_sender: mpsc::Sender<()>,
+        bps_count: Arc<AtomicUsize>,
         barrier: Arc<Barrier>,
+        notifier: Arc<Notify>,
+        runtime_control_sender: Option<mpsc::Sender<()>>,
+        delay_between_chains_ms: Option<u64>,
     ) -> Result<(), BenchmarkError> {
-        let chain_id = chain_client.chain_id();
-        bps_tasks_logger_sender.send(()).await?;
         barrier.wait().await;
-        info!(
-            "Starting benchmark at target BPS of {:?}, for chain {:?}",
-            bps, chain_id
-        );
-        let cross_chain_message_delivery = chain_client.options().cross_chain_message_delivery;
-        let mut num_sent_proposals = 0;
-        let authenticated_signer = Some(signer);
-        loop {
-            if shutdown_notifier.is_cancelled() {
-                info!("Shutdown signal received, stopping benchmark");
-                break;
-            }
-            let proposed_block = ProposedBlock {
-                epoch,
-                chain_id,
-                incoming_bundles: Vec::new(),
-                operations: operations.clone(),
-                previous_block_hash: chain_client.block_hash(),
-                height: chain_client.next_block_height(),
-                authenticated_signer,
-                timestamp: chain_client.timestamp().max(Timestamp::now()),
-            };
-            let block = local_node
-                .stage_block_execution(proposed_block.clone(), None, Vec::new())
-                .await
-                .map_err(BenchmarkError::LocalNode)?
-                .0;
+        if let Some(delay_between_chains_ms) = delay_between_chains_ms {
+            time::sleep(time::Duration::from_millis(
+                (chain_idx as u64) * delay_between_chains_ms,
+            ))
+            .await;
+        }
+        info!("Starting benchmark for chain {:?}", chain_id);
 
-            let value = ConfirmedBlock::new(block);
-            let proposal = BlockProposal::new_initial(
-                signer,
-                linera_base::data_types::Round::Fast,
-                proposed_block,
-                chain_client.signer(),
-            )
+        if let Some(runtime_control_sender) = runtime_control_sender {
+            runtime_control_sender.send(()).await?;
+        }
+
+        let owner = chain_client
+            .identity()
             .await
-            .expect("Signer failure");
+            .map_err(BenchmarkError::ChainClient)?;
 
-            chain_client
-                .submit_block_proposal(&committee, Box::new(proposal), value)
-                .await
-                .map_err(BenchmarkError::ChainClient)?;
-            let next_block_height = chain_client.next_block_height();
-            // We assume the committee will not change during the benchmark.
-            chain_client
-                .communicate_chain_updates(
-                    &committee,
-                    chain_id,
-                    next_block_height,
-                    cross_chain_message_delivery,
-                )
-                .await
-                .map_err(BenchmarkError::ChainClient)?;
+        loop {
+            tokio::select! {
+                biased;
 
-            num_sent_proposals += 1;
-            if let Some(bps) = bps {
-                if num_sent_proposals == bps {
-                    sender.send(())?;
-                    num_sent_proposals = 0;
+                _ = shutdown_notifier.cancelled() => {
+                    info!("Shutdown signal received, stopping benchmark");
+                    break;
                 }
-            } else {
-                sender.send(())?;
-                break;
+                result = chain_client.execute_operations(
+                    generator.generate_operations(owner, transactions_per_block),
+                    vec![]
+                ) => {
+                    result
+                        .map_err(BenchmarkError::ChainClient)?
+                        .expect("should execute block with operations");
+
+                    let current_bps_count = bps_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if current_bps_count >= bps {
+                        notifier.notified().await;
+                    }
+                }
             }
         }
 
@@ -581,10 +784,32 @@ impl<Env: Environment> Benchmark<Env> {
         chain_client: &ChainClient<Env>,
     ) -> Result<(), BenchmarkError> {
         let start = Instant::now();
-        chain_client
-            .execute_operation(Operation::system(SystemOperation::CloseChain))
-            .await?
-            .expect("Close chain operation should not fail!");
+        loop {
+            let result = chain_client
+                .execute_operation(Operation::system(SystemOperation::CloseChain))
+                .await?;
+            match result {
+                ClientOutcome::Committed(_) => break,
+                ClientOutcome::Conflict(certificate) => {
+                    info!(
+                        "Conflict while closing chain {:?}: {}. Retrying...",
+                        chain_client.chain_id(),
+                        certificate.hash()
+                    );
+                }
+                ClientOutcome::WaitForTimeout(timeout) => {
+                    info!(
+                        "Waiting for timeout while closing chain {:?}: {}",
+                        chain_client.chain_id(),
+                        timeout
+                    );
+                    linera_base::time::timer::sleep(
+                        timeout.timestamp.duration_since(Timestamp::now()),
+                    )
+                    .await;
+                }
+            }
+        }
 
         debug!(
             "Closed chain {:?} in {} ms",
@@ -595,58 +820,46 @@ impl<Env: Environment> Benchmark<Env> {
         Ok(())
     }
 
-    /// Generates information related to one block per chain, up to `num_chains` blocks.
-    pub fn make_benchmark_block_info(
-        keys: HashMap<ChainId, AccountOwner>,
-        transactions_per_block: usize,
-        fungible_application_id: Option<ApplicationId>,
-    ) -> Vec<(ChainId, Vec<Operation>, AccountOwner)> {
-        let mut blocks_infos = Vec::new();
-        let mut previous_chain_id = *keys
-            .iter()
-            .last()
-            .expect("There should be a last element")
-            .0;
-        let amount = Amount::from(1);
-        for (chain_id, owner) in keys {
-            let operation = match fungible_application_id {
-                Some(application_id) => {
-                    Self::fungible_transfer(application_id, previous_chain_id, owner, owner, amount)
-                }
-                None => Operation::system(SystemOperation::Transfer {
-                    owner: AccountOwner::CHAIN,
-                    recipient: Recipient::chain(previous_chain_id),
-                    amount,
-                }),
-            };
-            let operations = iter::repeat_n(operation, transactions_per_block).collect();
-            blocks_infos.push((chain_id, operations, owner));
-            previous_chain_id = chain_id;
-        }
-        blocks_infos
-    }
-
-    /// Creates a fungible token transfer operation.
-    pub fn fungible_transfer(
-        application_id: ApplicationId,
-        chain_id: ChainId,
-        sender: AccountOwner,
-        receiver: AccountOwner,
-        amount: Amount,
-    ) -> Operation {
-        let target_account = fungible::Account {
-            chain_id,
-            owner: receiver,
+    pub fn get_all_chains(
+        chains_config_path: Option<&Path>,
+        benchmark_chains: &[(ChainId, AccountOwner)],
+    ) -> Result<Vec<ChainId>, BenchmarkError> {
+        let all_chains = if let Some(config_path) = chains_config_path {
+            if !config_path.exists() {
+                return Err(BenchmarkError::ConfigFileNotFound(
+                    config_path.to_path_buf(),
+                ));
+            }
+            let config = BenchmarkConfig::load_from_file(config_path)
+                .map_err(BenchmarkError::ConfigLoadError)?;
+            config.chain_ids
+        } else {
+            benchmark_chains.iter().map(|(id, _)| *id).collect()
         };
-        let bytes = bcs::to_bytes(&fungible::Operation::Transfer {
-            owner: sender,
-            amount,
-            target_account,
-        })
-        .expect("should serialize fungible token operation");
-        Operation::User {
-            application_id,
-            bytes,
-        }
+
+        Ok(all_chains)
+    }
+}
+
+pub fn fungible_transfer(
+    application_id: ApplicationId,
+    chain_id: ChainId,
+    sender: AccountOwner,
+    receiver: AccountOwner,
+    amount: Amount,
+) -> Operation {
+    let target_account = Account {
+        chain_id,
+        owner: receiver,
+    };
+    let bytes = bcs::to_bytes(&FungibleOperation::Transfer {
+        owner: sender,
+        amount,
+        target_account,
+    })
+    .expect("should serialize fungible token operation");
+    Operation::User {
+        application_id,
+        bytes,
     }
 }

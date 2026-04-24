@@ -4,7 +4,7 @@
 //! This module defines the trait for indexer runners.
 
 use linera_base::identifiers::ChainId;
-use linera_views::store::KeyValueStore;
+use linera_views::store::{KeyValueDatabase, KeyValueStore};
 use tokio::select;
 use tracing::{info, warn};
 
@@ -16,7 +16,9 @@ pub enum IndexerCommand {
     Schema {
         plugin: Option<String>,
     },
-    Run {
+    /// Legacy mode: Run GraphQL server with WebSocket client (deprecated)
+    #[deprecated(note = "Use RunGrpc instead")]
+    RunGraphQL {
         #[command(flatten)]
         listener: Listener,
         /// The port of the indexer server
@@ -35,27 +37,31 @@ pub struct IndexerConfig<Config: clap::Args> {
     pub command: IndexerCommand,
 }
 
-pub struct Runner<S, Config: clap::Args> {
-    pub store: S,
+pub struct Runner<D, Config: clap::Args>
+where
+    D: KeyValueDatabase,
+{
+    pub database: D,
     pub config: IndexerConfig<Config>,
-    pub indexer: Indexer<S>,
+    pub indexer: Indexer<D>,
 }
 
-impl<S, Config> Runner<S, Config>
+impl<D, Config> Runner<D, Config>
 where
     Self: Send,
     Config: Clone + std::fmt::Debug + Send + Sync + clap::Parser + clap::Args,
-    S: KeyValueStore + Clone + Send + Sync + 'static,
-    S::Error: Send + Sync + std::error::Error + 'static,
+    D: KeyValueDatabase + Clone + Send + Sync + 'static,
+    D::Store: KeyValueStore + Clone + Send + Sync + 'static,
+    D::Error: Send + Sync + std::error::Error + 'static,
 {
     /// Loads a new runner
-    pub async fn new(config: IndexerConfig<Config>, store: S) -> Result<Self, IndexerError>
+    pub async fn new(config: IndexerConfig<Config>, database: D) -> Result<Self, IndexerError>
     where
         Self: Sized,
     {
-        let indexer = Indexer::load(store.clone()).await?;
+        let indexer = Indexer::load(database.clone()).await?;
         Ok(Self {
-            store,
+            database,
             config,
             indexer,
         })
@@ -64,19 +70,19 @@ where
     /// Registers a new plugin to the indexer
     pub async fn add_plugin(
         &mut self,
-        plugin: impl Plugin<S> + 'static,
+        plugin: impl Plugin<D> + 'static,
     ) -> Result<(), IndexerError> {
         self.indexer.add_plugin(plugin).await
     }
 
     /// Runs a server from the indexer and the plugins
-    async fn server(port: u16, indexer: &Indexer<S>) -> Result<(), IndexerError> {
+    async fn server(port: u16, indexer: &Indexer<D>) -> Result<(), IndexerError> {
         let mut app = indexer.route(None);
         for plugin in indexer.plugins.values() {
             app = plugin.route(app);
         }
         axum::serve(
-            tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?,
+            tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?,
             app,
         )
         .await?;
@@ -85,18 +91,20 @@ where
 
     /// Runs a server and the chains listener
     pub async fn run(&mut self) -> Result<(), IndexerError> {
-        let config = self.config.clone();
-        match config.clone().command {
+        let command = self.config.command.clone();
+        match command {
             IndexerCommand::Schema { plugin } => {
                 println!("{}", self.indexer.sdl(plugin)?);
                 Ok(())
             }
-            IndexerCommand::Run {
+            #[allow(deprecated)]
+            IndexerCommand::RunGraphQL {
                 chains,
                 listener,
                 port,
             } => {
-                info!("config: {:?}", config);
+                warn!("Running in legacy GraphQL mode. Consider migrating to RunGrpc.");
+                info!("config: {:?}", self.config);
                 let chains = if chains.is_empty() {
                     listener.service.get_chains().await?
                 } else {
@@ -106,11 +114,9 @@ where
                     .iter()
                     .map(|chain_id| self.indexer.init(&listener, *chain_id));
                 futures::future::try_join_all(initialize_chains).await?;
-                let connections = {
-                    chains
-                        .into_iter()
-                        .map(|chain_id| listener.listen(&self.indexer, chain_id))
-                };
+                let connections = chains
+                    .into_iter()
+                    .map(|chain_id| listener.listen(&self.indexer, chain_id));
                 select! {
                     result = Self::server(port, &self.indexer) => {
                         result.map(|()| warn!("GraphQL server stopped"))

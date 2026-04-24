@@ -1,50 +1,50 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(with_testing)]
-use std::num::NonZeroUsize;
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
-use async_trait::async_trait;
-use futures::Future;
+#[cfg(not(web))]
+use futures::StreamExt as _;
+use futures::{Future, TryStreamExt as _};
 use linera_base::{
-    crypto::{CryptoHash, Signer, ValidatorPublicKey},
-    data_types::{BlockHeight, ChainDescription, Timestamp},
-    identifiers::{Account, AccountOwner, BlobId, BlobType, ChainId},
+    crypto::{CryptoHash, ValidatorPublicKey},
+    data_types::{ChainDescription, Epoch, Timestamp},
+    identifiers::{Account, AccountOwner, ChainId},
     ownership::ChainOwnership,
     time::{Duration, Instant},
+    util::future::FutureSyncExt as _,
 };
-use linera_chain::types::ConfirmedBlockCertificate;
+use linera_chain::{manager::LockingBlock, types::ConfirmedBlockCertificate};
 use linera_core::{
-    client::{BlanketMessagePolicy, ChainClient, Client, MessagePolicy, PendingProposal},
-    data_types::{ChainInfoQuery, ClientOutcome},
+    client::{chain_client, ChainClient, Client, ListeningMode},
+    data_types::{ChainInfo, ChainInfoQuery, ClientOutcome},
     join_set_ext::JoinSet,
-    node::{CrossChainMessageDelivery, ValidatorNode},
-    Environment, JoinSetExt as _,
+    node::ValidatorNode,
+    wallet, Environment, JoinSetExt as _, Wallet as _,
 };
 use linera_rpc::node_provider::{NodeOptions, NodeProvider};
-use linera_storage::Storage;
+use linera_storage::Storage as _;
 use linera_version::VersionInfo;
-use linera_views::views::ViewError;
 use thiserror_context::Context;
-use tracing::{debug, info};
-#[cfg(feature = "benchmark")]
+use tracing::{debug, info, warn};
+#[cfg(not(web))]
 use {
-    crate::benchmark::{Benchmark, BenchmarkError},
-    futures::{stream, StreamExt, TryStreamExt},
+    crate::{
+        benchmark::{fungible_transfer, Benchmark, BenchmarkError},
+        client_metrics::ClientMetrics,
+    },
+    futures::stream,
     linera_base::{
         crypto::AccountPublicKey,
-        data_types::{Amount, Epoch},
-        identifiers::ApplicationId,
+        data_types::{Amount, BlockHeight},
+        identifiers::{ApplicationId, BlobType},
     },
-    linera_core::client::ChainClientError,
     linera_execution::{
-        committee::Committee,
         system::{OpenChainConfig, SystemOperation},
         Operation,
     },
-    std::{collections::HashMap, iter},
-    tokio::task,
+    std::{collections::HashSet, path::Path},
+    tokio::{sync::mpsc, task},
 };
 #[cfg(feature = "fs")]
 use {
@@ -57,53 +57,192 @@ use {
     std::{fs, path::PathBuf},
 };
 
-#[cfg(web)]
-use crate::persistent::{LocalPersist as Persist, LocalPersistExt as _};
-#[cfg(not(web))]
-use crate::persistent::{Persist, PersistExt as _};
 use crate::{
-    chain_listener,
-    client_options::{ChainOwnershipConfig, ClientContextOptions},
-    config::WalletState,
-    error, util,
-    wallet::{UserChain, Wallet},
-    Error,
+    chain_listener::{self, ClientContext as _},
+    client_options::{ChainOwnershipConfig, Options},
+    config::GenesisConfig,
+    error, util, Error,
 };
 
-pub struct ClientContext<Env: Environment, W> {
-    pub wallet: WalletState<W>,
+/// Results from querying a validator about version, network description, and chain info.
+pub struct ValidatorQueryResults {
+    /// The validator's version information.
+    pub version_info: Result<VersionInfo, Error>,
+    /// The validator's genesis config hash.
+    pub genesis_config_hash: Result<CryptoHash, Error>,
+    /// The validator's chain info (if valid and signature check passed).
+    pub chain_info: Result<ChainInfo, Error>,
+}
+
+impl ValidatorQueryResults {
+    /// Returns a vector of references to all errors in the query results.
+    pub fn errors(&self) -> Vec<&Error> {
+        let mut errors = Vec::new();
+        if let Err(e) = &self.version_info {
+            errors.push(e);
+        }
+        if let Err(e) = &self.genesis_config_hash {
+            errors.push(e);
+        }
+        if let Err(e) = &self.chain_info {
+            errors.push(e);
+        }
+        errors
+    }
+
+    /// Prints validator information to stdout.
+    ///
+    /// Prints public key, address, and optionally weight, version info, and chain info.
+    /// If `reference` is provided, only prints fields that differ from the reference.
+    pub fn print(
+        &self,
+        public_key: Option<&ValidatorPublicKey>,
+        address: Option<&str>,
+        weight: Option<u64>,
+        reference: Option<&ValidatorQueryResults>,
+    ) {
+        if let Some(key) = public_key {
+            println!("Public key: {}", key);
+        }
+        if let Some(address) = address {
+            println!("Address: {}", address);
+        }
+        if let Some(w) = weight {
+            println!("Weight: {}", w);
+        }
+
+        let ref_version = reference.and_then(|ref_results| ref_results.version_info.as_ref().ok());
+        match &self.version_info {
+            Ok(version_info) => {
+                if ref_version.is_none_or(|ref_v| ref_v.crate_version != version_info.crate_version)
+                {
+                    println!("Linera protocol: v{}", version_info.crate_version);
+                }
+                if ref_version.is_none_or(|ref_v| ref_v.rpc_hash != version_info.rpc_hash) {
+                    println!("RPC API hash: {}", version_info.rpc_hash);
+                }
+                if ref_version.is_none_or(|ref_v| ref_v.graphql_hash != version_info.graphql_hash) {
+                    println!("GraphQL API hash: {}", version_info.graphql_hash);
+                }
+                if ref_version.is_none_or(|ref_v| ref_v.wit_hash != version_info.wit_hash) {
+                    println!("WIT API hash: {}", version_info.wit_hash);
+                }
+                if ref_version.is_none_or(|ref_v| {
+                    (&ref_v.git_commit, ref_v.git_dirty)
+                        != (&version_info.git_commit, version_info.git_dirty)
+                }) {
+                    println!(
+                        "Source code: {}/tree/{}{}",
+                        env!("CARGO_PKG_REPOSITORY"),
+                        version_info.git_commit,
+                        if version_info.git_dirty {
+                            " (dirty)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            Err(err) => println!("Error getting version info: {err}"),
+        }
+
+        let ref_genesis_hash =
+            reference.and_then(|ref_results| ref_results.genesis_config_hash.as_ref().ok());
+        match &self.genesis_config_hash {
+            Ok(hash) if ref_genesis_hash.is_some_and(|ref_hash| ref_hash == hash) => {}
+            Ok(hash) => println!("Genesis config hash: {hash}"),
+            Err(err) => println!("Error getting genesis config: {err}"),
+        }
+
+        let ref_info = reference.and_then(|ref_results| ref_results.chain_info.as_ref().ok());
+        match &self.chain_info {
+            Ok(info) => {
+                if ref_info.is_none_or(|ref_info| info.block_hash != ref_info.block_hash) {
+                    if let Some(hash) = info.block_hash {
+                        println!("Block hash: {}", hash);
+                    } else {
+                        println!("Block hash: None");
+                    }
+                }
+                if ref_info
+                    .is_none_or(|ref_info| info.next_block_height != ref_info.next_block_height)
+                {
+                    println!("Next height: {}", info.next_block_height);
+                }
+                if ref_info.is_none_or(|ref_info| info.timestamp != ref_info.timestamp) {
+                    println!("Timestamp: {}", info.timestamp);
+                }
+                if ref_info.is_none_or(|ref_info| info.epoch != ref_info.epoch) {
+                    println!("Epoch: {}", info.epoch);
+                }
+                if ref_info.is_none_or(|ref_info| {
+                    info.manager.current_round != ref_info.manager.current_round
+                }) {
+                    println!("Round: {}", info.manager.current_round);
+                }
+                if let Some(locking) = &info.manager.requested_locking {
+                    match &**locking {
+                        LockingBlock::Fast(proposal) => {
+                            println!(
+                                "Locking fast block from {}",
+                                proposal.content.block.timestamp
+                            );
+                        }
+                        LockingBlock::Regular(validated) => {
+                            println!(
+                                "Locking block {} in {} from {}",
+                                validated.hash(),
+                                validated.round,
+                                validated.block().header.timestamp
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => println!("Error getting chain info: {err}"),
+        }
+        println!();
+    }
+}
+
+pub struct ClientContext<Env: Environment> {
     pub client: Arc<Client<Env>>,
+    // TODO(#5083): this doesn't really need to be stored
+    pub genesis_config: crate::config::GenesisConfig,
     pub send_timeout: Duration,
     pub recv_timeout: Duration,
     pub retry_delay: Duration,
     pub max_retries: u32,
+    pub max_backoff: Duration,
     pub chain_listeners: JoinSet,
-    pub blanket_message_policy: BlanketMessagePolicy,
-    pub restrict_chain_ids_to: Option<HashSet<ChainId>>,
+    // TODO(#5082): move this into the upstream UI layers (maybe just the CLI)
+    pub default_chain: Option<ChainId>,
+    #[cfg(not(web))]
+    pub client_metrics: Option<ClientMetrics>,
 }
 
-#[cfg_attr(not(web), async_trait)]
-#[cfg_attr(web, async_trait(?Send))]
-impl<Env: Environment, W> chain_listener::ClientContext for ClientContext<Env, W>
-where
-    W: Persist<Target = Wallet> + Sync + 'static,
-{
+impl<Env: Environment> chain_listener::ClientContext for ClientContext<Env> {
     type Environment = Env;
 
-    fn wallet(&self) -> &Wallet {
-        &self.wallet
+    fn wallet(&self) -> &Env::Wallet {
+        self.client.wallet()
     }
 
     fn storage(&self) -> &Env::Storage {
         self.client.storage_client()
     }
 
-    async fn make_chain_client(&self, chain_id: ChainId) -> Result<ChainClient<Env>, Error> {
-        self.make_chain_client(chain_id).await
+    fn client(&self) -> &Arc<Client<Env>> {
+        &self.client
     }
 
-    fn client(&self) -> &Client<Env> {
-        &self.client
+    #[cfg(not(web))]
+    fn timing_sender(
+        &self,
+    ) -> Option<mpsc::UnboundedSender<(u64, linera_core::client::TimingType)>> {
+        self.client_metrics
+            .as_ref()
+            .map(|metrics| metrics.timing_sender.clone())
     }
 
     async fn update_wallet_for_new_chain(
@@ -111,142 +250,124 @@ where
         chain_id: ChainId,
         owner: Option<AccountOwner>,
         timestamp: Timestamp,
+        epoch: Epoch,
     ) -> Result<(), Error> {
-        self.update_wallet_for_new_chain(chain_id, owner, timestamp)
+        self.update_wallet_for_new_chain(chain_id, owner, timestamp, epoch)
+            .make_sync()
             .await
     }
 
     async fn update_wallet(&mut self, client: &ChainClient<Env>) -> Result<(), Error> {
-        self.update_wallet_from_client(client).await
+        self.update_wallet_from_client(client).make_sync().await
     }
 }
 
-impl<S, W> ClientContext<linera_core::environment::Impl<S, NodeProvider>, W>
+impl<S, Si, W> ClientContext<linera_core::environment::Impl<S, NodeProvider, Si, W>>
 where
     S: linera_core::environment::Storage,
-    W: Persist<Target = Wallet>,
+    Si: linera_core::environment::Signer,
+    W: linera_core::environment::Wallet,
 {
-    pub fn new(
+    // not worth refactoring this because
+    // https://github.com/linera-io/linera-protocol/issues/5082
+    // https://github.com/linera-io/linera-protocol/issues/5083
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new(
         storage: S,
-        options: ClientContextOptions,
         wallet: W,
-        signer: Box<dyn Signer>,
-    ) -> Self {
+        signer: Si,
+        options: &Options,
+        default_chain: Option<ChainId>,
+        genesis_config: GenesisConfig,
+        block_cache_size: usize,
+        execution_state_cache_size: usize,
+    ) -> Result<Self, Error> {
+        #[cfg(not(web))]
+        let timing_config = options.to_timing_config();
         let node_provider = NodeProvider::new(NodeOptions {
             send_timeout: options.send_timeout,
             recv_timeout: options.recv_timeout,
             retry_delay: options.retry_delay,
             max_retries: options.max_retries,
+            max_backoff: options.max_backoff,
         });
-        let delivery = CrossChainMessageDelivery::new(options.wait_for_outgoing_messages);
-        let chain_ids = wallet.chain_ids();
-        let name = match chain_ids.len() {
+        let chain_modes: Vec<_> = wallet
+            .items()
+            .map_ok(|(id, chain)| {
+                let mode = if chain.is_follow_only() {
+                    ListeningMode::FollowChain
+                } else {
+                    ListeningMode::FullChain
+                };
+                (id, mode)
+            })
+            .try_collect()
+            .await
+            .map_err(error::Inner::wallet)?;
+        let name = match chain_modes.len() {
             0 => "Client node".to_string(),
-            1 => format!("Client node for {:.8}", chain_ids[0]),
-            n => format!("Client node for {:.8} and {} others", chain_ids[0], n - 1),
+            1 => format!("Client node for {:.8}", chain_modes[0].0),
+            n => format!(
+                "Client node for {:.8} and {} others",
+                chain_modes[0].0,
+                n - 1
+            ),
         };
+
         let client = Client::new(
             linera_core::environment::Impl {
                 network: node_provider,
                 storage,
+                signer,
+                wallet,
             },
-            signer,
-            options.max_pending_message_bundles,
-            delivery,
+            genesis_config.admin_chain_id(),
             options.long_lived_services,
-            chain_ids,
+            chain_modes,
             name,
-            options.max_loaded_chains,
-            options.grace_period,
-            options.blob_download_timeout,
+            util::non_zero_duration(options.chain_worker_ttl),
+            util::non_zero_duration(options.sender_chain_worker_ttl),
+            options.prioritize_bundles_from.clone().unwrap_or_default(),
+            options.to_chain_client_options(),
+            block_cache_size,
+            execution_state_cache_size,
+            &options.to_requests_scheduler_config(),
         );
 
-        ClientContext {
+        #[cfg(not(web))]
+        let client_metrics = if timing_config.enabled {
+            Some(ClientMetrics::new(timing_config))
+        } else {
+            None
+        };
+
+        Ok(ClientContext {
             client: Arc::new(client),
-            wallet: WalletState::new(wallet),
+            default_chain,
+            genesis_config,
             send_timeout: options.send_timeout,
             recv_timeout: options.recv_timeout,
             retry_delay: options.retry_delay,
             max_retries: options.max_retries,
+            max_backoff: options.max_backoff,
             chain_listeners: JoinSet::default(),
-            blanket_message_policy: options.blanket_message_policy,
-            restrict_chain_ids_to: options.restrict_chain_ids_to,
-        }
-    }
-
-    #[cfg(with_testing)]
-    pub fn new_test_client_context(storage: S, wallet: W, signer: Box<dyn Signer>) -> Self {
-        use linera_core::DEFAULT_GRACE_PERIOD;
-
-        let send_recv_timeout = Duration::from_millis(4000);
-        let retry_delay = Duration::from_millis(1000);
-        let max_retries = 10;
-
-        let node_options = NodeOptions {
-            send_timeout: send_recv_timeout,
-            recv_timeout: send_recv_timeout,
-            retry_delay,
-            max_retries,
-        };
-        let delivery = CrossChainMessageDelivery::new(true);
-        let chain_ids = wallet.chain_ids();
-        let name = match chain_ids.len() {
-            0 => "Client node".to_string(),
-            1 => format!("Client node for {:.8}", chain_ids[0]),
-            n => format!("Client node for {:.8} and {} others", chain_ids[0], n - 1),
-        };
-        let client = Client::new(
-            linera_core::environment::Impl {
-                storage,
-                network: NodeProvider::new(node_options),
-            },
-            signer,
-            10,
-            delivery,
-            false,
-            chain_ids,
-            name,
-            NonZeroUsize::new(20).expect("Chain worker limit should not be zero"),
-            DEFAULT_GRACE_PERIOD,
-            Duration::from_secs(1),
-        );
-
-        ClientContext {
-            client: Arc::new(client),
-            wallet: WalletState::new(wallet),
-            send_timeout: send_recv_timeout,
-            recv_timeout: send_recv_timeout,
-            retry_delay,
-            max_retries,
-            chain_listeners: JoinSet::default(),
-            blanket_message_policy: BlanketMessagePolicy::Accept,
-            restrict_chain_ids_to: None,
-        }
+            #[cfg(not(web))]
+            client_metrics,
+        })
     }
 }
 
-impl<Env: Environment, W> ClientContext<Env, W>
-where
-    W: Persist<Target = Wallet>,
-{
+impl<Env: Environment> ClientContext<Env> {
+    // TODO(#5084) this (and other injected dependencies) should not be re-exposed by the
+    // client interface
     /// Returns a reference to the wallet.
-    pub fn wallet(&self) -> &Wallet {
-        &self.wallet
+    pub fn wallet(&self) -> &Env::Wallet {
+        self.client.wallet()
     }
 
-    /// Returns the [`WalletState`] as a mutable reference.
-    pub fn wallet_mut(&mut self) -> &mut WalletState<W> {
-        &mut self.wallet
-    }
-
-    pub async fn mutate_wallet<R: Send>(
-        &mut self,
-        mutation: impl FnOnce(&mut Wallet) -> R + Send,
-    ) -> Result<R, Error> {
-        self.wallet
-            .mutate(mutation)
-            .await
-            .map_err(|e| error::Inner::Persistence(Box::new(e)).into())
+    /// Returns the ID of the admin chain.
+    pub fn admin_chain_id(&self) -> ChainId {
+        self.client.admin_chain_id()
     }
 
     /// Retrieve the default account. Current this is the common account of the default
@@ -257,57 +378,26 @@ where
 
     /// Retrieve the default chain.
     pub fn default_chain(&self) -> ChainId {
-        self.wallet
-            .default_chain()
-            .expect("No chain specified in wallet with no default chain")
+        self.default_chain
+            .expect("default chain requested but none set")
     }
 
-    pub async fn make_chain_client(&self, chain_id: ChainId) -> Result<ChainClient<Env>, Error> {
-        // We only create clients for chains we have in the wallet, or for the admin chain.
-        let chain: UserChain = match self.wallet.get(chain_id) {
-            Some(chain) => chain.clone(),
-            None => UserChain::make_other(chain_id, Timestamp::from(0)),
-        };
-
-        self.make_chain_client_internal(
-            chain_id,
-            chain.block_hash,
-            chain.timestamp,
-            chain.next_block_height,
-            chain.pending_proposal,
-            chain.owner,
-        )
-        .await
+    pub async fn first_non_admin_chain(&self) -> Result<ChainId, Error> {
+        let admin_chain_id = self.admin_chain_id();
+        let chain_ids = self
+            .wallet()
+            .chain_ids()
+            .try_filter(|chain_id| futures::future::ready(*chain_id != admin_chain_id))
+            .try_collect::<Vec<ChainId>>()
+            .await
+            .map_err(Error::wallet)?;
+        Ok(chain_ids
+            .into_iter()
+            .min()
+            .expect("No non-admin chain specified in wallet with no non-admin chain"))
     }
 
-    async fn make_chain_client_internal(
-        &self,
-        chain_id: ChainId,
-        block_hash: Option<CryptoHash>,
-        timestamp: Timestamp,
-        next_block_height: BlockHeight,
-        pending_proposal: Option<PendingProposal>,
-        preferred_owner: Option<AccountOwner>,
-    ) -> Result<ChainClient<Env>, Error> {
-        let mut chain_client = self
-            .client
-            .create_chain_client(
-                chain_id,
-                self.wallet.genesis_admin_chain(),
-                block_hash,
-                timestamp,
-                next_block_height,
-                pending_proposal,
-                preferred_owner,
-            )
-            .await?;
-        chain_client.options_mut().message_policy = MessagePolicy::new(
-            self.blanket_message_policy,
-            self.restrict_chain_ids_to.clone(),
-        );
-        Ok(chain_client)
-    }
-
+    // TODO(#5084) this should match the `NodeProvider` from the `Environment`
     pub fn make_node_provider(&self) -> NodeProvider {
         NodeProvider::new(self.make_node_options())
     }
@@ -318,22 +408,40 @@ where
             recv_timeout: self.recv_timeout,
             retry_delay: self.retry_delay,
             max_retries: self.max_retries,
+            max_backoff: self.max_backoff,
         }
     }
 
-    pub async fn save_wallet(&mut self) -> Result<(), Error> {
-        self.wallet
-            .persist()
-            .await
-            .map_err(|e| error::Inner::Persistence(Box::new(e)).into())
+    #[cfg(not(web))]
+    pub fn client_metrics(&self) -> Option<&ClientMetrics> {
+        self.client_metrics.as_ref()
     }
 
     pub async fn update_wallet_from_client<Env_: Environment>(
-        &mut self,
+        &self,
         client: &ChainClient<Env_>,
     ) -> Result<(), Error> {
-        self.wallet.as_mut().update_from_state(client);
-        self.save_wallet().await
+        let info = client.chain_info().await?;
+        let chain_id = info.chain_id;
+        let existing_owner = self
+            .wallet()
+            .get(chain_id)
+            .await
+            .map_err(error::Inner::wallet)?
+            .and_then(|chain| chain.owner);
+
+        let new_chain = wallet::Chain {
+            pending_proposal: client.pending_proposal().await,
+            owner: existing_owner,
+            ..info.as_ref().into()
+        };
+
+        self.wallet()
+            .insert(chain_id, new_chain)
+            .await
+            .map_err(error::Inner::wallet)?;
+
+        Ok(())
     }
 
     /// Remembers the new chain and its owner (if any) in the wallet.
@@ -342,21 +450,43 @@ where
         chain_id: ChainId,
         owner: Option<AccountOwner>,
         timestamp: Timestamp,
+        epoch: Epoch,
     ) -> Result<(), Error> {
-        if self.wallet.get(chain_id).is_none() {
-            self.mutate_wallet(|w| {
-                w.insert(UserChain {
-                    chain_id,
-                    owner,
-                    block_hash: None,
-                    timestamp,
-                    next_block_height: BlockHeight::ZERO,
-                    pending_proposal: None,
-                })
-            })
-            .await?;
-        }
+        self.wallet()
+            .try_insert(
+                chain_id,
+                linera_core::wallet::Chain::new(owner, epoch, timestamp),
+            )
+            .await
+            .map_err(error::Inner::wallet)?;
+        Ok(())
+    }
 
+    /// Registers a chain from its description: initializes local storage, adds to
+    /// wallet, and starts tracking it for cross-chain message delivery.
+    pub async fn extend_with_chain(
+        &mut self,
+        description: ChainDescription,
+        owner: Option<AccountOwner>,
+    ) -> Result<(), Error> {
+        let chain_id = description.id();
+        self.client
+            .storage_client()
+            .create_chain(description.clone())
+            .await?;
+        self.wallet()
+            .try_insert(
+                chain_id,
+                linera_core::wallet::Chain::new(
+                    owner,
+                    description.config().epoch,
+                    description.timestamp(),
+                ),
+            )
+            .await
+            .map_err(error::Inner::wallet)?;
+        self.client
+            .extend_chain_mode(chain_id, ListeningMode::FullChain);
         Ok(())
     }
 
@@ -370,14 +500,10 @@ where
             chain_client.synchronize_from_validators().await?;
             let result = chain_client.process_inbox_without_prepare().await;
             self.update_wallet_from_client(chain_client).await?;
-            if result.is_err() {
-                self.save_wallet().await?;
-            }
             result?
         };
         certificates.extend(new_certificates);
         if maybe_timeout.is_none() {
-            self.save_wallet().await?;
             return Ok(certificates);
         }
 
@@ -389,16 +515,12 @@ where
             let (new_certificates, maybe_timeout) = {
                 let result = chain_client.process_inbox().await;
                 self.update_wallet_from_client(chain_client).await?;
-                if result.is_err() {
-                    self.save_wallet().await?;
-                }
                 result?
             };
             certificates.extend(new_certificates);
             if let Some(timestamp) = maybe_timeout {
                 util::wait_for_next_round(&mut notification_stream, timestamp).await
             } else {
-                self.save_wallet().await?;
                 return Ok(certificates);
             }
         }
@@ -409,45 +531,36 @@ where
         chain_id: ChainId,
         owner: AccountOwner,
     ) -> Result<(), Error> {
-        self.client.track_chain(chain_id);
-        let chain_description_blob_id = BlobId::new(chain_id.0, BlobType::ChainDescription);
-        let chain_description_blob = match self
-            .client
-            .storage_client()
-            .read_blob(chain_description_blob_id)
+        self.client
+            .extend_chain_mode(chain_id, ListeningMode::FullChain);
+        let client = self.make_chain_client(chain_id).await?;
+        let info = client.prepare_for_owner(owner).await.map_err(|error| {
+            tracing::error!(%chain_id, %owner, %error, "Chain is not owned");
+            error::Inner::ChainOwnership
+        })?;
+
+        // Try to modify existing chain entry, setting the owner.
+        let modified = self
+            .wallet()
+            .modify(chain_id, |chain| chain.owner = Some(owner))
             .await
-        {
-            Ok(blob) => blob,
-            Err(ViewError::BlobsNotFound(blob_ids)) if blob_ids == [chain_description_blob_id] => {
-                // we're missing the blob describing the chain we're assigning - try to
-                // get it
-                self.client
-                    .ensure_has_chain_description(chain_id, self.wallet.genesis_admin_chain())
-                    .await?
-            }
-            Err(err) => {
-                return Err(err.into());
-            }
-        };
-        let chain_description: ChainDescription =
-            bcs::from_bytes(&chain_description_blob.into_bytes())
-                .map_err(|e| error::Inner::Persistence(Box::new(e)))?;
-
-        let config = chain_description.config();
-
-        if !config.ownership.verify_owner(&owner) {
-            tracing::error!(
-                "The chain with the ID returned by the faucet is not owned by you. \
-                Please make sure you are connecting to a genuine faucet."
-            );
-            return Err(error::Inner::ChainOwnership.into());
+            .map_err(error::Inner::wallet)?;
+        // If the chain didn't exist, insert a new entry.
+        if modified.is_none() {
+            self.wallet()
+                .insert(
+                    chain_id,
+                    wallet::Chain {
+                        owner: Some(owner),
+                        timestamp: info.timestamp,
+                        epoch: Some(info.epoch),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(error::Inner::wallet)
+                .context("assigning new chain")?;
         }
-
-        self.wallet_mut()
-            .mutate(|w| w.assign_new_chain_to_owner(owner, chain_id, chain_description.timestamp()))
-            .await
-            .map_err(|e| error::Inner::Persistence(Box::new(e)))?
-            .context("assigning new chain")?;
         Ok(())
     }
 
@@ -469,8 +582,12 @@ where
         // Try applying f optimistically without validator notifications. Return if committed.
         let result = f(client).await;
         self.update_wallet_from_client(client).await?;
-        if let ClientOutcome::Committed(t) = result? {
-            return Ok(t);
+        match result? {
+            ClientOutcome::Committed(t) => return Ok(t),
+            ClientOutcome::Conflict(certificate) => {
+                return Err(chain_client::Error::Conflict(certificate.hash()).into());
+            }
+            ClientOutcome::WaitForTimeout(_) => {}
         }
 
         // Start listening for notifications, so we learn about new rounds and blocks.
@@ -479,16 +596,25 @@ where
 
         loop {
             // Try applying f. Return if committed.
-            client.prepare_chain().await?;
             let result = f(client).await;
             self.update_wallet_from_client(client).await?;
             let timeout = match result? {
                 ClientOutcome::Committed(t) => return Ok(t),
+                ClientOutcome::Conflict(certificate) => {
+                    return Err(chain_client::Error::Conflict(certificate.hash()).into());
+                }
                 ClientOutcome::WaitForTimeout(timeout) => timeout,
             };
             // Otherwise wait and try again in the next round.
             util::wait_for_next_round(&mut notification_stream, timeout).await;
         }
+    }
+
+    pub async fn ownership(&mut self, chain_id: Option<ChainId>) -> Result<ChainOwnership, Error> {
+        let chain_id = chain_id.unwrap_or_else(|| self.default_chain());
+        let client = self.make_chain_client(chain_id).await?;
+        let info = client.chain_info().await?;
+        Ok(info.manager.ownership)
     }
 
     pub async fn change_ownership(
@@ -503,7 +629,13 @@ where
             "Changing ownership of a chain"
         );
         let time_start = Instant::now();
-        let ownership = ChainOwnership::try_from(ownership_config)?;
+        let mut ownership = chain_client.query_chain_ownership().await?;
+        ownership_config.update(&mut ownership)?;
+
+        if ownership.super_owners.is_empty() && ownership.owners.is_empty() {
+            tracing::error!("At least one owner or super owner of the chain has to be set.");
+            return Err(error::Inner::ChainOwnership.into());
+        }
 
         let certificate = self
             .apply_client_command(&chain_client, |chain_client| {
@@ -546,7 +678,7 @@ where
     ) -> Result<VersionInfo, Error> {
         match node.get_version_info().await {
             Ok(version_info) if version_info.is_compatible_with(&linera_version::VERSION_INFO) => {
-                info!(
+                debug!(
                     "Version information for validator {address}: {}",
                     version_info
                 );
@@ -570,7 +702,7 @@ where
         address: &str,
         node: &impl ValidatorNode,
     ) -> Result<CryptoHash, Error> {
-        let network_description = self.wallet().genesis_config().network_description();
+        let network_description = self.genesis_config.network_description();
         match node.get_network_description().await {
             Ok(description) => {
                 if description == network_description {
@@ -597,25 +729,27 @@ where
         address: &str,
         node: &impl ValidatorNode,
         chain_id: ChainId,
-    ) -> Result<(), Error> {
-        let query = ChainInfoQuery::new(chain_id);
+    ) -> Result<ChainInfo, Error> {
+        let query = ChainInfoQuery::new(chain_id).with_manager_values();
         match node.handle_chain_info_query(query).await {
             Ok(response) => {
-                info!(
+                debug!(
                     "Validator {address} sees chain {chain_id} at block height {} and epoch {:?}",
                     response.info.next_block_height, response.info.epoch,
                 );
                 if let Some(public_key) = public_key {
-                    if response.check(public_key).is_ok() {
-                        info!("Signature for public key {public_key} is OK.");
+                    if response.check(*public_key).is_ok() {
+                        debug!("Signature for public key {public_key} is OK.");
                     } else {
                         return Err(error::Inner::InvalidSignature {
                             public_key: *public_key,
                         }
                         .into());
                     }
+                } else {
+                    warn!("Not checking signature as public key was not given");
                 }
-                Ok(())
+                Ok(*response.info)
             }
             Err(error) => Err(error::Inner::UnavailableChainInfo {
                 address: address.to_string(),
@@ -625,13 +759,60 @@ where
             .into()),
         }
     }
+
+    /// Query a validator for version info, network description, and chain info.
+    ///
+    /// Returns a `ValidatorQueryResults` struct with the results of all three queries.
+    pub async fn query_validator(
+        &self,
+        address: &str,
+        node: &impl ValidatorNode,
+        chain_id: ChainId,
+        public_key: Option<&ValidatorPublicKey>,
+    ) -> ValidatorQueryResults {
+        let version_info = self.check_compatible_version_info(address, node).await;
+        let genesis_config_hash = self.check_matching_network_description(address, node).await;
+        let chain_info = self
+            .check_validator_chain_info_response(public_key, address, node, chain_id)
+            .await;
+
+        ValidatorQueryResults {
+            version_info,
+            genesis_config_hash,
+            chain_info,
+        }
+    }
+
+    /// Query the local node for version info, network description, and chain info.
+    ///
+    /// Returns a `ValidatorQueryResults` struct with the local node's information.
+    pub async fn query_local_node(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<ValidatorQueryResults, Error> {
+        let version_info = Ok(linera_version::VERSION_INFO.clone());
+        let genesis_config_hash = Ok(self
+            .genesis_config
+            .network_description()
+            .genesis_config_hash);
+        let chain_info = self
+            .make_chain_client(chain_id)
+            .await?
+            .chain_info_with_manager_values()
+            .await
+            .map(|info| *info)
+            .map_err(|e| e.into());
+
+        Ok(ValidatorQueryResults {
+            version_info,
+            genesis_config_hash,
+            chain_info,
+        })
+    }
 }
 
 #[cfg(feature = "fs")]
-impl<Env: Environment, W> ClientContext<Env, W>
-where
-    W: Persist<Target = Wallet>,
-{
+impl<Env: Environment> ClientContext<Env> {
     pub async fn publish_module(
         &mut self,
         chain_client: &ChainClient<Env>,
@@ -721,27 +902,17 @@ where
     }
 }
 
-#[cfg(feature = "benchmark")]
-impl<Env: Environment, W> ClientContext<Env, W>
-where
-    W: Persist<Target = Wallet>,
-{
+#[cfg(not(web))]
+impl<Env: Environment> ClientContext<Env> {
     pub async fn prepare_for_benchmark(
         &mut self,
         num_chains: usize,
-        transactions_per_block: usize,
         tokens_per_chain: Amount,
         fungible_application_id: Option<ApplicationId>,
         pub_keys: Vec<AccountPublicKey>,
-    ) -> Result<
-        (
-            HashMap<ChainId, ChainClient<Env>>,
-            Epoch,
-            Vec<(ChainId, Vec<Operation>, AccountOwner)>,
-            Committee,
-        ),
-        Error,
-    > {
+        chains_config_path: Option<&Path>,
+        close_chains: bool,
+    ) -> Result<Vec<ChainClient<Env>>, Error> {
         let start = Instant::now();
         // Below all block proposals are supposed to succeed without retries, we
         // must make sure that all incoming payments have been accepted on-chain
@@ -753,54 +924,67 @@ where
         );
 
         let start = Instant::now();
-        let (key_pairs, chain_clients) = self
-            .make_benchmark_chains(num_chains, tokens_per_chain, pub_keys)
+        let (benchmark_chains, chain_clients) = self
+            .make_benchmark_chains(
+                num_chains,
+                tokens_per_chain,
+                pub_keys,
+                chains_config_path.is_some(),
+                close_chains,
+            )
             .await?;
         info!(
             "Got {} chains in {} ms",
-            key_pairs.len(),
+            num_chains,
             start.elapsed().as_millis()
         );
 
         if let Some(id) = fungible_application_id {
             let start = Instant::now();
-            self.supply_fungible_tokens(&key_pairs, id).await?;
+            self.supply_fungible_tokens(&benchmark_chains, id).await?;
             info!(
                 "Supplied fungible tokens in {} ms",
                 start.elapsed().as_millis()
             );
+            // Need to process inboxes to make sure the chains receive the supplied tokens.
+            let start = Instant::now();
+            for chain_client in &chain_clients {
+                chain_client.process_inbox().await?;
+            }
+            info!(
+                "Processed inboxes after supplying fungible tokens in {} ms",
+                start.elapsed().as_millis()
+            );
         }
 
-        let default_chain_id = self
-            .wallet
-            .default_chain()
-            .expect("should have default chain");
-        let default_chain_client = self.make_chain_client(default_chain_id).await?;
-        let (epoch, mut committees) = default_chain_client
-            .epoch_and_committees(default_chain_id)
-            .await?;
-        let epoch = epoch.expect("default chain should have an epoch");
-        let committee = committees
-            .remove(&epoch)
-            .expect("current epoch should have a committee");
-        let blocks_infos = Benchmark::<Env>::make_benchmark_block_info(
-            key_pairs,
-            transactions_per_block,
-            fungible_application_id,
-        );
+        let all_chains = Benchmark::<Env>::get_all_chains(chains_config_path, &benchmark_chains)?;
+        let known_chain_ids: HashSet<_> = benchmark_chains.iter().map(|(id, _)| *id).collect();
+        let unknown_chain_ids: Vec<_> = all_chains
+            .iter()
+            .filter(|id| !known_chain_ids.contains(id))
+            .copied()
+            .collect();
+        if !unknown_chain_ids.is_empty() {
+            // The current client won't have the blobs for the chains in the other wallets. Even
+            // though it will eventually get those blobs, we're getting a head start here and
+            // fetching those blobs in advance.
+            for chain_id in &unknown_chain_ids {
+                self.client.get_chain_description(*chain_id).await?;
+            }
+        }
 
-        Ok((chain_clients, epoch, blocks_infos, committee))
+        Ok(chain_clients)
     }
 
     pub async fn wrap_up_benchmark(
         &mut self,
-        chain_clients: HashMap<ChainId, ChainClient<Env>>,
+        chain_clients: Vec<ChainClient<Env>>,
         close_chains: bool,
         wrap_up_max_in_flight: usize,
     ) -> Result<(), Error> {
         if close_chains {
             info!("Closing chains...");
-            let stream = stream::iter(chain_clients.values().cloned())
+            let stream = stream::iter(chain_clients)
                 .map(|chain_client| async move {
                     Benchmark::<Env>::close_benchmark_chain(&chain_client).await?;
                     info!("Closed chain {:?}", chain_client.chain_id());
@@ -810,36 +994,49 @@ where
             stream.try_collect::<Vec<_>>().await?;
         } else {
             info!("Processing inbox for all chains...");
-            let stream = stream::iter(chain_clients.values().cloned())
+            let stream = stream::iter(chain_clients.clone())
                 .map(|chain_client| async move {
                     chain_client.process_inbox().await?;
                     info!("Processed inbox for chain {:?}", chain_client.chain_id());
-                    Ok::<(), ChainClientError>(())
+                    Ok::<(), chain_client::Error>(())
                 })
                 .buffer_unordered(wrap_up_max_in_flight);
             stream.try_collect::<Vec<_>>().await?;
 
             info!("Updating wallet from chain clients...");
-            for chain_client in chain_clients.values() {
-                self.wallet.as_mut().update_from_state(chain_client);
+            for chain_client in chain_clients {
+                let info = chain_client.chain_info().await?;
+                let client_owner = chain_client.preferred_owner();
+                let pending_proposal = chain_client.pending_proposal().await;
+                self.wallet()
+                    .insert(
+                        info.chain_id,
+                        wallet::Chain {
+                            pending_proposal,
+                            owner: client_owner,
+                            ..info.as_ref().into()
+                        },
+                    )
+                    .await
+                    .map_err(error::Inner::wallet)?;
             }
-            self.save_wallet().await?;
         }
 
         Ok(())
     }
 
     async fn process_inboxes_and_force_validator_updates(&mut self) {
-        let mut chain_clients = vec![];
-        for chain_id in &self.wallet.owned_chain_ids() {
-            chain_clients.push(
-                self.make_chain_client(*chain_id)
-                    .await
-                    .expect("chains in the wallet must exist"),
-            );
-        }
-
         let mut join_set = task::JoinSet::new();
+
+        let chain_clients: Vec<_> = self
+            .wallet()
+            .owned_chain_ids()
+            .map_err(|e| error::Inner::wallet(e).into())
+            .and_then(|id| self.make_chain_client(id))
+            .try_collect()
+            .await
+            .unwrap();
+
         for chain_client in chain_clients {
             join_set.spawn(async move {
                 Self::process_inbox_without_updating_wallet(&chain_client)
@@ -849,9 +1046,8 @@ where
             });
         }
 
-        let chain_clients = join_set.join_all().await;
-        for chain_client in &chain_clients {
-            self.update_wallet_from_client(chain_client).await.unwrap();
+        for chain_client in join_set.join_all().await {
+            self.update_wallet_from_client(&chain_client).await.unwrap();
         }
     }
 
@@ -871,99 +1067,110 @@ where
 
     /// Creates chains if necessary, and returns a map of exactly `num_chains` chain IDs
     /// with key pairs, as well as a map of the chain clients.
+    ///
+    /// If `close_chains` is true, chains are not looked up from or stored in the wallet,
+    /// since they will be closed after the benchmark and shouldn't be reused.
     async fn make_benchmark_chains(
         &mut self,
         num_chains: usize,
         balance: Amount,
         pub_keys: Vec<AccountPublicKey>,
-    ) -> Result<
-        (
-            HashMap<ChainId, AccountOwner>,
-            HashMap<ChainId, ChainClient<Env>>,
-        ),
-        Error,
-    > {
-        let mut benchmark_chains = HashMap::new();
-        let mut chain_clients = HashMap::new();
+        wallet_only: bool,
+        close_chains: bool,
+    ) -> Result<(Vec<(ChainId, AccountOwner)>, Vec<ChainClient<Env>>), Error> {
+        let mut chains_found_in_wallet = 0;
+        let mut benchmark_chains = Vec::with_capacity(num_chains);
+        let mut chain_clients = Vec::with_capacity(num_chains);
         let start = Instant::now();
-        for chain_id in self.wallet.owned_chain_ids() {
-            if benchmark_chains.len() == num_chains {
-                break;
-            }
-            // This should never panic, because `owned_chain_ids` only returns the owned chains that
-            // we have a key pair for.
-            let owner = self
-                .wallet
-                .get(chain_id)
-                .and_then(|chain| chain.owner)
-                .unwrap();
-            let chain_client = self.make_chain_client(chain_id).await?;
-            let ownership = chain_client.chain_info().await?.manager.ownership;
-            if !ownership.owners.is_empty() || ownership.super_owners.len() != 1 {
-                continue;
-            }
-            benchmark_chains.insert(chain_client.chain_id(), owner);
-            chain_client.process_inbox().await?;
-            chain_clients.insert(chain_id, chain_client);
-        }
-        info!(
-            "Got {} chains from the wallet in {} ms",
-            benchmark_chains.len(),
-            start.elapsed().as_millis()
-        );
 
-        let chains_from_wallet = benchmark_chains.len();
-        let num_chains_to_create = num_chains - chains_from_wallet;
-
-        let default_chain_id = self
-            .wallet
-            .default_chain()
-            .expect("should have default chain");
-        let operations_per_block = 900; // Over this we seem to hit the block size limits.
-
-        let mut pub_keys_iter = pub_keys.into_iter().take(num_chains_to_create);
-        let default_chain_client = self.make_chain_client(default_chain_id).await?;
-
-        for i in (0..num_chains_to_create).step_by(operations_per_block) {
-            let num_new_chains = operations_per_block.min(num_chains_to_create - i);
-            let pub_key = pub_keys_iter.next().unwrap();
-
-            let certificate = Self::execute_open_chains_operations(
-                num_new_chains,
-                &default_chain_client,
-                balance,
-                pub_key.into(),
-            )
-            .await?;
-            info!("Block executed successfully");
-
-            let block = certificate.block();
-            for i in 0..num_new_chains {
-                let chain_id = block.body.blobs[i]
-                    .iter()
-                    .find(|blob| blob.id().blob_type == BlobType::ChainDescription)
-                    .map(|blob| ChainId(blob.id().hash))
-                    .expect("failed to create a new chain");
-                benchmark_chains.insert(chain_id, pub_key.into());
-                self.client.track_chain(chain_id);
-
-                let mut chain_client = self
-                    .make_chain_client_internal(
-                        chain_id,
-                        None,
-                        certificate.block().header.timestamp,
-                        BlockHeight::ZERO,
-                        None,
-                        Some(pub_key.into()),
-                    )
-                    .await?;
-                chain_client.set_preferred_owner(pub_key.into());
+        // When close_chains is true and we're creating our own chains (not wallet_only),
+        // skip wallet lookup to avoid picking up existing chains that would then be closed.
+        // When wallet_only is true, chains were pre-created by the parent process and must
+        // be read from the wallet.
+        if !close_chains || wallet_only {
+            let mut owned_chain_ids = std::pin::pin!(self.wallet().owned_chain_ids());
+            while let Some(chain_id) = owned_chain_ids.next().await {
+                let chain_id = chain_id.map_err(error::Inner::wallet)?;
+                if chains_found_in_wallet == num_chains {
+                    break;
+                }
+                let chain_client = self.make_chain_client(chain_id).await?;
+                let ownership = chain_client.chain_info().await?.manager.ownership;
+                if !ownership.owners.is_empty() || ownership.super_owners.len() != 1 {
+                    continue;
+                }
+                let owner = *ownership.super_owners.first().unwrap();
                 chain_client.process_inbox().await?;
-                chain_clients.insert(chain_id, chain_client);
+                benchmark_chains.push((chain_id, owner));
+                chain_clients.push(chain_client);
+                chains_found_in_wallet += 1;
             }
+            info!(
+                "Got {} chains from the wallet in {} ms",
+                benchmark_chains.len(),
+                start.elapsed().as_millis()
+            );
         }
+
+        let num_chains_to_create = num_chains - chains_found_in_wallet;
+
+        let default_chain_client = self.make_chain_client(self.default_chain()).await?;
 
         if num_chains_to_create > 0 {
+            if wallet_only {
+                return Err(
+                    error::Inner::Benchmark(BenchmarkError::NotEnoughChainsInWallet(
+                        num_chains,
+                        chains_found_in_wallet,
+                    ))
+                    .into(),
+                );
+            }
+            let mut pub_keys_iter = pub_keys.into_iter().take(num_chains_to_create);
+            let operations_per_block = 900; // Over this we seem to hit the block size limits.
+            for i in (0..num_chains_to_create).step_by(operations_per_block) {
+                let num_new_chains = operations_per_block.min(num_chains_to_create - i);
+                // Each chain gets its own unique owner (previously all chains in a batch
+                // shared one owner, which could cause conflicts during benchmarking).
+                let owners: Vec<AccountOwner> = (&mut pub_keys_iter)
+                    .take(num_new_chains)
+                    .map(|pk| pk.into())
+                    .collect();
+
+                let certificate = Self::execute_open_chains_operations(
+                    &default_chain_client,
+                    balance,
+                    owners.clone(),
+                )
+                .await?;
+                info!("Block executed successfully");
+
+                let block = certificate.block();
+                for (i, owner) in owners.into_iter().enumerate() {
+                    let chain_id = block.body.blobs[i]
+                        .iter()
+                        .find(|blob| blob.id().blob_type == BlobType::ChainDescription)
+                        .map(|blob| ChainId(blob.id().hash))
+                        .expect("failed to create a new chain");
+                    self.client
+                        .extend_chain_mode(chain_id, ListeningMode::FullChain);
+
+                    let mut chain_client = self.client.create_chain_client(
+                        chain_id,
+                        None,
+                        BlockHeight::ZERO,
+                        &None,
+                        Some(owner),
+                        self.timing_sender(),
+                        false,
+                    );
+                    chain_client.set_preferred_owner(owner);
+                    chain_client.process_inbox().await?;
+                    benchmark_chains.push((chain_id, owner));
+                    chain_clients.push(chain_client);
+                }
+            }
+
             info!(
                 "Created {} chains in {} ms",
                 num_chains_to_create,
@@ -971,9 +1178,12 @@ where
             );
         }
 
-        info!("Updating wallet from client");
-        self.update_wallet_from_client(&default_chain_client)
-            .await?;
+        // Only update wallet if chains will be reused (not closed after benchmark)
+        if !close_chains {
+            info!("Updating wallet from client");
+            self.update_wallet_from_client(&default_chain_client)
+                .await?;
+        }
         info!("Retrying pending outgoing messages");
         default_chain_client
             .retry_pending_outgoing_messages()
@@ -982,26 +1192,32 @@ where
         info!("Processing default chain inbox");
         default_chain_client.process_inbox().await?;
 
+        assert_eq!(
+            benchmark_chains.len(),
+            chain_clients.len(),
+            "benchmark_chains and chain_clients must have the same size"
+        );
+
         Ok((benchmark_chains, chain_clients))
     }
 
     async fn execute_open_chains_operations(
-        num_new_chains: usize,
         chain_client: &ChainClient<Env>,
         balance: Amount,
-        owner: AccountOwner,
+        owners: Vec<AccountOwner>,
     ) -> Result<ConfirmedBlockCertificate, Error> {
-        let config = OpenChainConfig {
-            ownership: ChainOwnership::single_super(owner),
-            balance,
-            application_permissions: Default::default(),
-        };
-        let operations = iter::repeat_n(
-            Operation::system(SystemOperation::OpenChain(config)),
-            num_new_chains,
-        )
-        .collect();
-        info!("Executing {} OpenChain operations", num_new_chains);
+        let operations: Vec<_> = owners
+            .iter()
+            .map(|owner| {
+                let config = OpenChainConfig {
+                    ownership: ChainOwnership::single_super(*owner),
+                    balance,
+                    application_permissions: Default::default(),
+                };
+                Operation::system(SystemOperation::OpenChain(config))
+            })
+            .collect();
+        info!("Executing {} OpenChain operations", operations.len());
         Ok(chain_client
             .execute_operations(operations, vec![])
             .await?
@@ -1011,25 +1227,24 @@ where
     /// Supplies fungible tokens to the chains.
     async fn supply_fungible_tokens(
         &mut self,
-        key_pairs: &HashMap<ChainId, AccountOwner>,
+        key_pairs: &[(ChainId, AccountOwner)],
         application_id: ApplicationId,
     ) -> Result<(), Error> {
-        let default_chain_id = self
-            .wallet
-            .default_chain()
-            .expect("should have default chain");
-        let default_key = self.wallet.get(default_chain_id).unwrap().owner.unwrap();
-        let amount = Amount::from(1_000_000);
-        let operations: Vec<_> = key_pairs
+        let default_chain_id = self.default_chain();
+        let default_key = self
+            .wallet()
+            .get(default_chain_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner
+            .unwrap();
+        // This should be enough to run the benchmark at 1M TPS for an hour.
+        let amount = Amount::from_nanos(4);
+        let operations: Vec<Operation> = key_pairs
             .iter()
             .map(|(chain_id, owner)| {
-                Benchmark::<Env>::fungible_transfer(
-                    application_id,
-                    *chain_id,
-                    default_key,
-                    *owner,
-                    amount,
-                )
+                fungible_transfer(application_id, *chain_id, default_key, *owner, amount)
             })
             .collect();
         let chain_client = self.make_chain_client(default_chain_id).await?;

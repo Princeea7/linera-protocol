@@ -1,11 +1,15 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, mem, vec};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    mem, vec,
+};
 
 use custom_debug_derive::Debug;
 use linera_base::{
-    data_types::{ArithmeticError, Blob, Event, OracleResponse, StreamUpdate, Timestamp},
+    data_types::{Blob, BlobContent, Event, OracleResponse, StreamUpdate, Timestamp},
     ensure,
     identifiers::{ApplicationId, BlobId, ChainId, StreamId},
 };
@@ -28,17 +32,30 @@ pub struct TransactionTracker {
     local_time: Timestamp,
     /// The index of the current transaction in the block.
     transaction_index: u32,
-    next_message_index: u32,
     next_application_index: u32,
     next_chain_index: u32,
     /// Events recorded by contracts' `emit` calls.
     events: Vec<Event>,
     /// Blobs created by contracts.
-    blobs: BTreeMap<BlobId, Blob>,
+    ///
+    /// As of right now, blobs created by the contracts are one of the following types:
+    /// - [`Data`]
+    /// - [`ContractBytecode`]
+    /// - [`ServiceBytecode`]
+    /// - [`EvmBytecode`]
+    /// - [`ApplicationDescription`]
+    /// - [`ChainDescription`]
+    blobs: BTreeMap<BlobId, BlobContent>,
+    /// The blobs created in the previous transactions.
+    previously_created_blobs: BTreeMap<BlobId, BlobContent>,
     /// Operation result.
     operation_result: Option<Vec<u8>>,
     /// Streams that have been updated but not yet processed during this transaction.
     streams_to_process: BTreeMap<ApplicationId, AppStreamUpdates>,
+    /// Published blobs this transaction refers to by [`BlobId`].
+    blobs_published: BTreeSet<BlobId>,
+    /// Blob IDs created or published by free apps (fees waived).
+    free_blob_ids: BTreeSet<BlobId>,
 }
 
 /// The [`TransactionTracker`] contents after a transaction has finished.
@@ -48,7 +65,6 @@ pub struct TransactionOutcome {
     pub oracle_responses: Vec<OracleResponse>,
     #[debug(skip_if = Vec::is_empty)]
     pub outgoing_messages: Vec<OutgoingMessage>,
-    pub next_message_index: u32,
     pub next_application_index: u32,
     pub next_chain_index: u32,
     /// Events recorded by contracts' `emit` calls.
@@ -57,29 +73,39 @@ pub struct TransactionOutcome {
     pub blobs: Vec<Blob>,
     /// Operation result.
     pub operation_result: Vec<u8>,
+    /// Blobs published by this transaction.
+    pub blobs_published: BTreeSet<BlobId>,
+    /// Blob IDs created or published by free apps (fees waived).
+    pub free_blob_ids: BTreeSet<BlobId>,
 }
 
 impl TransactionTracker {
     pub fn new(
         local_time: Timestamp,
         transaction_index: u32,
-        next_message_index: u32,
         next_application_index: u32,
         next_chain_index: u32,
         oracle_responses: Option<Vec<OracleResponse>>,
+        blobs: &[Vec<Blob>],
     ) -> Self {
+        let mut previously_created_blobs = BTreeMap::new();
+        for tx_blobs in blobs {
+            for blob in tx_blobs {
+                previously_created_blobs.insert(blob.id(), blob.content().clone());
+            }
+        }
         TransactionTracker {
             local_time,
             transaction_index,
-            next_message_index,
             next_application_index,
             next_chain_index,
             replaying_oracle_responses: oracle_responses.map(Vec::into_iter),
+            previously_created_blobs,
             ..Self::default()
         }
     }
 
-    pub fn with_blobs(mut self, blobs: BTreeMap<BlobId, Blob>) -> Self {
+    pub fn with_blobs(mut self, blobs: BTreeMap<BlobId, BlobContent>) -> Self {
         self.blobs = blobs;
         self
     }
@@ -96,8 +122,8 @@ impl TransactionTracker {
         self.transaction_index
     }
 
-    pub fn next_message_index(&self) -> u32 {
-        self.next_message_index
+    pub fn peek_application_index(&self) -> u32 {
+        self.next_application_index
     }
 
     pub fn next_application_index(&mut self) -> u32 {
@@ -112,26 +138,14 @@ impl TransactionTracker {
         index
     }
 
-    pub fn add_outgoing_message(
-        &mut self,
-        message: OutgoingMessage,
-    ) -> Result<(), ArithmeticError> {
-        self.next_message_index = self
-            .next_message_index
-            .checked_add(1)
-            .ok_or(ArithmeticError::Overflow)?;
+    pub fn add_outgoing_message(&mut self, message: OutgoingMessage) {
         self.outgoing_messages.push(message);
-        Ok(())
     }
 
-    pub fn add_outgoing_messages(
-        &mut self,
-        messages: impl IntoIterator<Item = OutgoingMessage>,
-    ) -> Result<(), ArithmeticError> {
+    pub fn add_outgoing_messages(&mut self, messages: impl IntoIterator<Item = OutgoingMessage>) {
         for message in messages {
-            self.add_outgoing_message(message)?;
+            self.add_outgoing_message(message);
         }
-        Ok(())
     }
 
     pub fn add_event(&mut self, stream_id: StreamId, index: u32, value: Vec<u8>) {
@@ -142,20 +156,48 @@ impl TransactionTracker {
         });
     }
 
+    pub fn get_blob_content(&self, blob_id: &BlobId) -> Option<&BlobContent> {
+        if let Some(content) = self.blobs.get(blob_id) {
+            return Some(content);
+        }
+        self.previously_created_blobs.get(blob_id)
+    }
+
     pub fn add_created_blob(&mut self, blob: Blob) {
-        self.blobs.insert(blob.id(), blob);
+        self.blobs.insert(blob.id(), blob.into_content());
     }
 
-    pub fn created_blobs(&self) -> &BTreeMap<BlobId, Blob> {
+    pub fn add_published_blob(&mut self, blob_id: BlobId) {
+        self.blobs_published.insert(blob_id);
+    }
+
+    /// Marks a blob as created/published by a free app, so its fees will be waived.
+    pub fn mark_blob_free(&mut self, blob_id: BlobId) {
+        self.free_blob_ids.insert(blob_id);
+    }
+
+    pub fn created_blobs(&self) -> &BTreeMap<BlobId, BlobContent> {
         &self.blobs
-    }
-
-    pub fn add_oracle_response(&mut self, oracle_response: OracleResponse) {
-        self.oracle_responses.push(oracle_response);
     }
 
     pub fn add_operation_result(&mut self, result: Option<Vec<u8>>) {
         self.operation_result = result
+    }
+
+    /// In replay mode, returns the next recorded oracle response. Otherwise executes `f` and
+    /// records and returns the result. `f` is the implementation of the actual oracle and is
+    /// only called in validation mode, so it does not have to be fully deterministic.
+    pub async fn oracle<F, G>(&mut self, f: F) -> Result<&OracleResponse, ExecutionError>
+    where
+        F: FnOnce() -> G,
+        G: Future<Output = Result<OracleResponse, ExecutionError>>,
+    {
+        let response = match self.next_replayed_oracle_response()? {
+            Some(response) => response,
+            None => f().await?,
+        };
+        self.oracle_responses.push(response);
+        Ok(self.oracle_responses.last().unwrap())
     }
 
     pub fn add_stream_to_process(
@@ -229,7 +271,7 @@ impl TransactionTracker {
         } else {
             false
         };
-        self.add_oracle_response(oracle_response);
+        self.oracle_responses.push(oracle_response);
         Ok(replaying)
     }
 
@@ -240,9 +282,7 @@ impl TransactionTracker {
     ///
     /// In both cases, the value (returned or obtained from the oracle) must be recorded using
     /// `add_oracle_response`.
-    pub fn next_replayed_oracle_response(
-        &mut self,
-    ) -> Result<Option<OracleResponse>, ExecutionError> {
+    fn next_replayed_oracle_response(&mut self) -> Result<Option<OracleResponse>, ExecutionError> {
         let Some(responses) = &mut self.replaying_oracle_responses else {
             return Ok(None); // Not in replay mode.
         };
@@ -259,13 +299,15 @@ impl TransactionTracker {
             outgoing_messages,
             local_time: _,
             transaction_index: _,
-            next_message_index,
             next_application_index,
             next_chain_index,
             events,
             blobs,
+            previously_created_blobs: _,
             operation_result,
             streams_to_process,
+            blobs_published,
+            free_blob_ids,
         } = self;
         ensure!(
             streams_to_process.is_empty(),
@@ -277,15 +319,20 @@ impl TransactionTracker {
                 ExecutionError::UnexpectedOracleResponse
             );
         }
+        let blobs = blobs
+            .into_iter()
+            .map(|(blob_id, content)| Blob::new_with_hash_unchecked(blob_id, content))
+            .collect::<Vec<_>>();
         Ok(TransactionOutcome {
             outgoing_messages,
             oracle_responses,
-            next_message_index,
             next_application_index,
             next_chain_index,
             events,
-            blobs: blobs.into_values().collect(),
+            blobs,
             operation_result: operation_result.unwrap_or_default(),
+            blobs_published,
+            free_blob_ids,
         })
     }
 }
@@ -295,7 +342,7 @@ impl TransactionTracker {
     /// Creates a new [`TransactionTracker`] for testing, with default values and the given
     /// oracle responses.
     pub fn new_replaying(oracle_responses: Vec<OracleResponse>) -> Self {
-        TransactionTracker::new(Timestamp::from(0), 0, 0, 0, 0, Some(oracle_responses))
+        TransactionTracker::new(Timestamp::from(0), 0, 0, 0, Some(oracle_responses), &[])
     }
 
     /// Creates a new [`TransactionTracker`] for testing, with default values and oracle responses

@@ -5,10 +5,8 @@ use std::num::ParseIntError;
 
 #[cfg(not(target_arch = "wasm32"))]
 use alloy::rpc::json_rpc;
-use alloy::{
-    primitives::{Address, B256, U256},
-    rpc::types::eth::Log,
-};
+use alloy::rpc::types::eth::Log;
+use alloy_primitives::{Address, B256, U256};
 use num_bigint::{BigInt, BigUint};
 use num_traits::cast::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -35,9 +33,6 @@ pub enum EthereumServiceError {
     #[error(transparent)]
     ParseIntError(#[from] ParseIntError),
 
-    #[error("Failed to deploy the smart contract")]
-    DeployError,
-
     #[error("Unsupported Ethereum type")]
     UnsupportedEthereumTypeError,
 
@@ -58,7 +53,7 @@ pub enum EthereumServiceError {
 
     /// Hex parsing error
     #[error(transparent)]
-    FromHexError(#[from] alloy::primitives::hex::FromHexError),
+    FromHexError(#[from] alloy_primitives::hex::FromHexError),
 
     /// `serde_json` error
     #[error(transparent)]
@@ -189,12 +184,12 @@ fn get_inner_event_type(event_name_expanded: &str) -> Result<String, EthereumSer
 
 pub fn parse_log(
     event_name_expanded: &str,
-    log: Log,
+    log: &Log,
 ) -> Result<EthereumEvent, EthereumServiceError> {
     let inner_types = get_inner_event_type(event_name_expanded)?;
     let ethereum_types = inner_types
         .split(',')
-        .map(|s| s.to_string())
+        .map(str::to_string)
         .collect::<Vec<_>>();
     let mut values = Vec::new();
     let mut topic_index = 0;

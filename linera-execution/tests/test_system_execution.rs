@@ -6,18 +6,17 @@
 use linera_base::{
     crypto::AccountSecretKey,
     data_types::{Amount, BlockHeight, Timestamp},
-    identifiers::{AccountOwner, MessageId},
+    identifiers::{Account, AccountOwner},
     ownership::ChainOwnership,
 };
 use linera_execution::{
-    system::Recipient,
     test_utils::{
         dummy_chain_description, dummy_chain_description_with_ownership_and_balance,
         SystemExecutionState,
     },
-    Message, MessageContext, Operation, OperationContext, Query, QueryContext, QueryOutcome,
-    QueryResponse, ResourceController, SystemMessage, SystemOperation, SystemQuery, SystemResponse,
-    TransactionTracker,
+    ExecutionStateActor, Message, MessageContext, Operation, OperationContext, Query, QueryContext,
+    QueryOutcome, QueryResponse, ResourceController, SystemMessage, SystemOperation, SystemQuery,
+    SystemResponse, TransactionTracker,
 };
 
 #[tokio::test]
@@ -39,29 +38,24 @@ async fn test_simple_system_operation() -> anyhow::Result<()> {
         ..SystemExecutionState::default()
     };
     let mut view = state.into_view().await;
+    let recipient = Account::burn_address(chain_id);
     let operation = SystemOperation::Transfer {
         owner: AccountOwner::CHAIN,
         amount: Amount::from_tokens(4),
-        recipient: Recipient::Burn,
+        recipient,
     };
     let context = OperationContext {
         chain_id,
         height: BlockHeight(0),
         round: Some(0),
-        authenticated_signer: Some(owner),
-        authenticated_caller_id: None,
+        authenticated_owner: Some(owner),
         timestamp: Default::default(),
     };
     let mut controller = ResourceController::default();
     let mut txn_tracker = TransactionTracker::new_replaying(Vec::new());
-    view.execute_operation(
-        context,
-        Operation::system(operation),
-        &mut txn_tracker,
-        &mut controller,
-    )
-    .await
-    .unwrap();
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(context, Operation::system(operation))
+        .await?;
     assert_eq!(view.system.balance.get(), &Amount::ZERO);
     let txn_outcome = txn_tracker.into_outcome().unwrap();
     assert!(txn_outcome.outgoing_messages.is_empty());
@@ -82,29 +76,19 @@ async fn test_simple_system_message() -> anyhow::Result<()> {
     };
     let context = MessageContext {
         chain_id,
+        origin: chain_id,
         is_bouncing: false,
         height: BlockHeight(0),
         round: Some(0),
-        message_id: MessageId {
-            chain_id: dummy_chain_description(1).id(),
-            height: BlockHeight(0),
-            index: 0,
-        },
-        authenticated_signer: None,
+        authenticated_owner: None,
         refund_grant_to: None,
         timestamp: Default::default(),
     };
     let mut controller = ResourceController::default();
     let mut txn_tracker = TransactionTracker::new_replaying(Vec::new());
-    view.execute_message(
-        context,
-        Message::System(message),
-        None,
-        &mut txn_tracker,
-        &mut controller,
-    )
-    .await
-    .unwrap();
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_message(context, Message::System(message), None)
+        .await?;
     assert_eq!(view.system.balance.get(), &Amount::from_tokens(4));
     let txn_outcome = txn_tracker.into_outcome().unwrap();
     assert!(txn_outcome.outgoing_messages.is_empty());

@@ -21,7 +21,6 @@ use crate::{
         contract_runtime_api::{self, WriteOperation},
     },
     service::wit::base_runtime_api as service_wit,
-    util::yield_once,
 };
 
 /// We need to have a maximum key size that handles all possible underlying
@@ -106,11 +105,13 @@ impl ReadableKeyValueStore for KeyValueStore {
     // The KeyValueStore of the system_api does not have limits
     // on the size of its values.
     const MAX_KEY_SIZE: usize = MAX_KEY_SIZE;
-    type Keys = Vec<Vec<u8>>;
-    type KeyValues = Vec<(Vec<u8>, Vec<u8>)>;
 
     fn max_stream_queries(&self) -> usize {
         1
+    }
+
+    fn root_key(&self) -> Result<Vec<u8>, KeyValueStoreError> {
+        Ok(Vec::new())
     }
 
     async fn contains_key(&self, key: &[u8]) -> Result<bool, KeyValueStoreError> {
@@ -119,34 +120,31 @@ impl ReadableKeyValueStore for KeyValueStore {
             KeyValueStoreError::KeyTooLong
         );
         let promise = self.wit_api.contains_key_new(key);
-        yield_once().await;
         Ok(self.wit_api.contains_key_wait(promise))
     }
 
-    async fn contains_keys(&self, keys: Vec<Vec<u8>>) -> Result<Vec<bool>, KeyValueStoreError> {
-        for key in &keys {
+    async fn contains_keys(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, KeyValueStoreError> {
+        for key in keys {
             ensure!(
                 key.len() <= Self::MAX_KEY_SIZE,
                 KeyValueStoreError::KeyTooLong
             );
         }
-        let promise = self.wit_api.contains_keys_new(&keys);
-        yield_once().await;
+        let promise = self.wit_api.contains_keys_new(keys);
         Ok(self.wit_api.contains_keys_wait(promise))
     }
 
     async fn read_multi_values_bytes(
         &self,
-        keys: Vec<Vec<u8>>,
+        keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, KeyValueStoreError> {
-        for key in &keys {
+        for key in keys {
             ensure!(
                 key.len() <= Self::MAX_KEY_SIZE,
                 KeyValueStoreError::KeyTooLong
             );
         }
-        let promise = self.wit_api.read_multi_values_bytes_new(&keys);
-        yield_once().await;
+        let promise = self.wit_api.read_multi_values_bytes_new(keys);
         Ok(self.wit_api.read_multi_values_bytes_wait(promise))
     }
 
@@ -156,33 +154,30 @@ impl ReadableKeyValueStore for KeyValueStore {
             KeyValueStoreError::KeyTooLong
         );
         let promise = self.wit_api.read_value_bytes_new(key);
-        yield_once().await;
         Ok(self.wit_api.read_value_bytes_wait(promise))
     }
 
     async fn find_keys_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::Keys, KeyValueStoreError> {
+    ) -> Result<Vec<Vec<u8>>, KeyValueStoreError> {
         ensure!(
             key_prefix.len() <= Self::MAX_KEY_SIZE,
             KeyValueStoreError::KeyTooLong
         );
         let promise = self.wit_api.find_keys_new(key_prefix);
-        yield_once().await;
         Ok(self.wit_api.find_keys_wait(promise))
     }
 
     async fn find_key_values_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::KeyValues, KeyValueStoreError> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KeyValueStoreError> {
         ensure!(
             key_prefix.len() <= Self::MAX_KEY_SIZE,
             KeyValueStoreError::KeyTooLong
         );
         let promise = self.wit_api.find_key_values_new(key_prefix);
-        yield_once().await;
         Ok(self.wit_api.find_key_values_wait(promise))
     }
 }
@@ -387,7 +382,7 @@ mod tests {
 
         // Check if keys exist
         let is_keys_existing = mock_store
-            .contains_keys(vec![b"foo".to_vec(), b"bar".to_vec()])
+            .contains_keys(&[b"foo".to_vec(), b"bar".to_vec()])
             .await?;
         assert!(!is_keys_existing[0]);
         assert!(!is_keys_existing[1]);

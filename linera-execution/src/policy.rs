@@ -2,30 +2,39 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module contains types related to fees and pricing.
+//! Defines the economic parameters and hard limits for resource consumption
+//! within the Linera network. It specifies prices for fundamental units like fuel,
+//! individual read/write operations, costs per byte read/written,
+//! base costs for messages and operations, and costs associated with publishing blobs.
+//! It also sets overarching limits such as the maximum fuel allowed per block,
+//! the maximum block size, and limits on concurrent operations.
 
 use std::{collections::BTreeSet, fmt};
 
-use async_graphql::InputObject;
+use allocative::Allocative;
 use linera_base::{
     data_types::{Amount, ArithmeticError, BlobContent, CompressedBytecode, Resources},
     ensure,
-    identifiers::BlobType,
+    identifiers::{ApplicationId, BlobType},
+    vm::VmRuntime,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::ExecutionError;
 
 /// A collection of prices and limits associated with block execution.
-#[derive(Eq, PartialEq, Hash, Clone, Debug, Serialize, Deserialize, InputObject)]
+#[derive(Eq, PartialEq, Hash, Clone, Debug, Serialize, Deserialize, Allocative)]
 pub struct ResourceControlPolicy {
-    /// The base price for creating a new block.
-    pub block: Amount,
-    /// The price per unit of fuel (aka gas) for VM execution.
-    pub fuel_unit: Amount,
+    /// The price per unit of fuel (aka gas) for Wasm execution.
+    pub wasm_fuel_unit: Amount,
+    /// The price per unit of fuel (aka gas) for EVM execution.
+    pub evm_fuel_unit: Amount,
     /// The price of one read operation.
     pub read_operation: Amount,
     /// The price of one write operation.
     pub write_operation: Amount,
+    /// The price of accessing one byte from the runtime.
+    pub byte_runtime: Amount,
     /// The price of reading a byte.
     pub byte_read: Amount,
     /// The price of writing a byte
@@ -56,8 +65,10 @@ pub struct ResourceControlPolicy {
 
     // TODO(#1538): Cap the number of transactions per block and the total size of their
     // arguments.
-    /// The maximum amount of fuel a block can consume.
-    pub maximum_fuel_per_block: u64,
+    /// The maximum amount of Wasm fuel a block can consume.
+    pub maximum_wasm_fuel_per_block: u64,
+    /// The maximum amount of EVM fuel a block can consume.
+    pub maximum_evm_fuel_per_block: u64,
     /// The maximum time in milliseconds that a block can spend executing services as oracles.
     pub maximum_service_oracle_execution_ms: u64,
     /// The maximum size of a block. This includes the block proposal itself as well as
@@ -83,15 +94,18 @@ pub struct ResourceControlPolicy {
     pub http_request_timeout_ms: u64,
     /// The list of hosts that contracts and services can send HTTP requests to.
     pub http_request_allow_list: BTreeSet<String>,
+    /// The list of application IDs for which all message- and event-related fees are waived.
+    pub free_application_ids: BTreeSet<ApplicationId>,
 }
 
 impl fmt::Display for ResourceControlPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let ResourceControlPolicy {
-            block,
-            fuel_unit,
+            wasm_fuel_unit,
+            evm_fuel_unit,
             read_operation,
             write_operation,
+            byte_runtime,
             byte_read,
             byte_written,
             blob_read,
@@ -105,7 +119,8 @@ impl fmt::Display for ResourceControlPolicy {
             message_byte,
             service_as_oracle_query,
             http_request,
-            maximum_fuel_per_block,
+            maximum_wasm_fuel_per_block,
+            maximum_evm_fuel_per_block,
             maximum_service_oracle_execution_ms,
             maximum_block_size,
             maximum_blob_size,
@@ -118,14 +133,16 @@ impl fmt::Display for ResourceControlPolicy {
             maximum_http_response_bytes,
             http_request_allow_list,
             http_request_timeout_ms,
+            free_application_ids,
         } = self;
         write!(
             f,
             "Resource control policy:\n\
-            {block:.2} base cost per block\n\
-            {fuel_unit:.2} cost per fuel unit\n\
+            {wasm_fuel_unit:.2} cost per Wasm fuel unit\n\
+            {evm_fuel_unit:.2} cost per EVM fuel unit\n\
             {read_operation:.2} cost per read operation\n\
             {write_operation:.2} cost per write operation\n\
+            {byte_runtime:.2} cost per runtime byte read operation\n\
             {byte_read:.2} cost per byte read\n\
             {byte_written:.2} cost per byte written\n\
             {blob_read:.2} base cost per read blob\n\
@@ -139,7 +156,8 @@ impl fmt::Display for ResourceControlPolicy {
             {message:.2} per outgoing messages\n\
             {message_byte:.2} per byte in the argument of an outgoing messages\n\
             {http_request:.2} per HTTP request performed\n\
-            {maximum_fuel_per_block} maximum fuel per block\n\
+            {maximum_wasm_fuel_per_block} maximum Wasm fuel per block\n\
+            {maximum_evm_fuel_per_block} maximum EVM fuel per block\n\
             {maximum_service_oracle_execution_ms} ms maximum service-as-oracle execution time per \
                 block\n\
             {maximum_block_size} maximum size of a block\n\
@@ -152,7 +170,8 @@ impl fmt::Display for ResourceControlPolicy {
             {maximum_oracle_response_bytes} maximum number of bytes of an oracle response\n\
             {maximum_http_response_bytes} maximum number of bytes of an HTTP response\n\
             {http_request_timeout_ms} ms timeout for HTTP requests\n\
-            HTTP hosts allowed for contracts and services: {http_request_allow_list:#?}\n",
+            HTTP hosts allowed for contracts and services: {http_request_allow_list:#?}\n\
+            Free application IDs: {free_application_ids:#?}\n",
         )?;
         Ok(())
     }
@@ -170,10 +189,11 @@ impl ResourceControlPolicy {
     /// This can be used in tests or benchmarks.
     pub fn no_fees() -> Self {
         Self {
-            block: Amount::ZERO,
-            fuel_unit: Amount::ZERO,
+            wasm_fuel_unit: Amount::ZERO,
+            evm_fuel_unit: Amount::ZERO,
             read_operation: Amount::ZERO,
             write_operation: Amount::ZERO,
+            byte_runtime: Amount::ZERO,
             byte_read: Amount::ZERO,
             byte_written: Amount::ZERO,
             blob_read: Amount::ZERO,
@@ -187,7 +207,8 @@ impl ResourceControlPolicy {
             message_byte: Amount::ZERO,
             service_as_oracle_query: Amount::ZERO,
             http_request: Amount::ZERO,
-            maximum_fuel_per_block: u64::MAX,
+            maximum_wasm_fuel_per_block: u64::MAX,
+            maximum_evm_fuel_per_block: u64::MAX,
             maximum_service_oracle_execution_ms: u64::MAX,
             maximum_block_size: u64::MAX,
             maximum_blob_size: u64::MAX,
@@ -200,6 +221,20 @@ impl ResourceControlPolicy {
             maximum_http_response_bytes: u64::MAX,
             http_request_timeout_ms: u64::MAX,
             http_request_allow_list: BTreeSet::new(),
+            free_application_ids: BTreeSet::new(),
+        }
+    }
+
+    /// Returns whether the given application has its message- and event-related fees waived.
+    pub fn is_free_app(&self, app_id: &ApplicationId) -> bool {
+        self.free_application_ids.contains(app_id)
+    }
+
+    /// The maximum fuel per block according to the `VmRuntime`.
+    pub fn maximum_fuel_per_block(&self, vm_runtime: VmRuntime) -> u64 {
+        match vm_runtime {
+            VmRuntime::Wasm => self.maximum_wasm_fuel_per_block,
+            VmRuntime::Evm => self.maximum_evm_fuel_per_block,
         }
     }
 
@@ -209,19 +244,8 @@ impl ResourceControlPolicy {
     #[cfg(with_testing)]
     pub fn only_fuel() -> Self {
         Self {
-            fuel_unit: Amount::from_micros(1),
-            ..Self::no_fees()
-        }
-    }
-
-    /// Creates a policy with no cost for anything except fuel, and 0.001 per block.
-    ///
-    /// This can be used in tests, and that keep track of how many blocks were created.
-    #[cfg(with_testing)]
-    pub fn fuel_and_block() -> Self {
-        Self {
-            block: Amount::from_millis(1),
-            fuel_unit: Amount::from_micros(1),
+            wasm_fuel_unit: Amount::from_micros(1),
+            evm_fuel_unit: Amount::from_micros(1),
             ..Self::no_fees()
         }
     }
@@ -230,8 +254,8 @@ impl ResourceControlPolicy {
     #[cfg(with_testing)]
     pub fn all_categories() -> Self {
         Self {
-            block: Amount::from_millis(1),
-            fuel_unit: Amount::from_nanos(1),
+            wasm_fuel_unit: Amount::from_nanos(1),
+            evm_fuel_unit: Amount::from_nanos(1),
             byte_read: Amount::from_attos(100),
             byte_written: Amount::from_attos(1_000),
             blob_read: Amount::from_nanos(1),
@@ -250,8 +274,9 @@ impl ResourceControlPolicy {
     /// Creates a policy that matches the Testnet.
     pub fn testnet() -> Self {
         Self {
-            block: Amount::from_millis(1),
-            fuel_unit: Amount::from_nanos(10),
+            wasm_fuel_unit: Amount::from_nanos(10),
+            evm_fuel_unit: Amount::from_nanos(10),
+            byte_runtime: Amount::from_nanos(1),
             byte_read: Amount::from_nanos(10),
             byte_written: Amount::from_nanos(100),
             blob_read: Amount::from_nanos(100),
@@ -267,7 +292,8 @@ impl ResourceControlPolicy {
             message: Amount::from_micros(10),
             service_as_oracle_query: Amount::from_millis(10),
             http_request: Amount::from_micros(50),
-            maximum_fuel_per_block: 100_000_000,
+            maximum_wasm_fuel_per_block: 100_000_000,
+            maximum_evm_fuel_per_block: 100_000_000,
             maximum_service_oracle_execution_ms: 10_000,
             maximum_block_size: 1_000_000,
             maximum_blob_size: 1_000_000,
@@ -280,17 +306,16 @@ impl ResourceControlPolicy {
             maximum_http_response_bytes: 10_000,
             http_request_timeout_ms: 20_000,
             http_request_allow_list: BTreeSet::new(),
+            free_application_ids: BTreeSet::new(),
         }
-    }
-
-    pub fn block_price(&self) -> Amount {
-        self.block
     }
 
     pub fn total_price(&self, resources: &Resources) -> Result<Amount, ArithmeticError> {
         let mut amount = Amount::ZERO;
-        amount.try_add_assign(self.fuel_price(resources.fuel)?)?;
+        amount.try_add_assign(self.fuel_price(resources.wasm_fuel, VmRuntime::Wasm)?)?;
+        amount.try_add_assign(self.fuel_price(resources.evm_fuel, VmRuntime::Evm)?)?;
         amount.try_add_assign(self.read_operations_price(resources.read_operations)?)?;
+        amount.try_add_assign(self.bytes_runtime_price(resources.bytes_runtime)?)?;
         amount.try_add_assign(self.write_operations_price(resources.write_operations)?)?;
         amount.try_add_assign(self.bytes_read_price(resources.bytes_to_read as u64)?)?;
         amount.try_add_assign(self.bytes_written_price(resources.bytes_to_write as u64)?)?;
@@ -333,6 +358,10 @@ impl ResourceControlPolicy {
         self.write_operation.try_mul(count as u128)
     }
 
+    pub(crate) fn bytes_runtime_price(&self, count: u32) -> Result<Amount, ArithmeticError> {
+        self.byte_runtime.try_mul(count as u128)
+    }
+
     pub(crate) fn bytes_read_price(&self, count: u64) -> Result<Amount, ArithmeticError> {
         self.byte_read.try_mul(count as u128)
     }
@@ -371,13 +400,25 @@ impl ResourceControlPolicy {
         self.http_request.try_mul(count as u128)
     }
 
-    pub(crate) fn fuel_price(&self, fuel: u64) -> Result<Amount, ArithmeticError> {
-        self.fuel_unit.try_mul(u128::from(fuel))
+    fn fuel_unit_price(&self, vm_runtime: VmRuntime) -> Amount {
+        match vm_runtime {
+            VmRuntime::Wasm => self.wasm_fuel_unit,
+            VmRuntime::Evm => self.evm_fuel_unit,
+        }
+    }
+
+    pub(crate) fn fuel_price(
+        &self,
+        fuel: u64,
+        vm_runtime: VmRuntime,
+    ) -> Result<Amount, ArithmeticError> {
+        self.fuel_unit_price(vm_runtime).try_mul(u128::from(fuel))
     }
 
     /// Returns how much fuel can be paid with the given balance.
-    pub(crate) fn remaining_fuel(&self, balance: Amount) -> u64 {
-        u64::try_from(balance.saturating_div(self.fuel_unit)).unwrap_or(u64::MAX)
+    pub(crate) fn remaining_fuel(&self, balance: Amount, vm_runtime: VmRuntime) -> u64 {
+        let fuel_unit = self.fuel_unit_price(vm_runtime);
+        u64::try_from(balance.saturating_ratio(fuel_unit)).unwrap_or(u64::MAX)
     }
 
     pub fn check_blob_size(&self, content: &BlobContent) -> Result<(), ExecutionError> {

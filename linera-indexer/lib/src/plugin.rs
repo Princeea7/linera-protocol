@@ -8,24 +8,29 @@ use std::sync::Arc;
 use async_graphql::{EmptyMutation, EmptySubscription, ObjectType, Schema};
 use axum::Router;
 use linera_chain::types::ConfirmedBlock;
-use linera_views::{context::ViewContext, store::KeyValueStore, views::View};
+use linera_views::{
+    context::ViewContext,
+    store::{KeyValueDatabase, KeyValueStore},
+    views::View,
+};
 use tokio::sync::Mutex;
 
 use crate::common::IndexerError;
 
 #[async_trait::async_trait]
-pub trait Plugin<S>: Send + Sync
+pub trait Plugin<D>: Send + Sync
 where
-    S: KeyValueStore + Clone + Send + Sync + 'static,
-    S::Error: From<bcs::Error> + Send + Sync + std::error::Error + 'static,
+    D: KeyValueDatabase + Clone + Send + Sync + 'static,
+    D::Store: KeyValueStore + Clone + Send + Sync + 'static,
+    D::Error: From<bcs::Error> + Send + Sync + std::error::Error + 'static,
 {
     /// Gets the name of the plugin
     fn name(&self) -> String
     where
         Self: Sized;
 
-    /// Loads the plugin from a store
-    async fn load(store: S) -> Result<Self, IndexerError>
+    /// Loads the plugin from a database
+    async fn load(database: D) -> Result<Self, IndexerError>
     where
         Self: Sized;
 
@@ -56,25 +61,26 @@ pub fn sdl<Q: ObjectType + 'static>(query: Q) -> String {
 
 pub fn route<Q: ObjectType + 'static>(name: &str, query: Q, app: axum::Router) -> axum::Router {
     app.route(
-        &format!("/{}", name),
+        &format!("/{name}"),
         axum::routing::get(crate::common::graphiql).post(handler::<Q>),
     )
     .layer(axum::extract::Extension(schema(query)))
     .layer(tower_http::cors::CorsLayer::permissive())
 }
 
-pub async fn load<S, V: View<ViewContext<(), S>>>(
-    store: S,
+pub async fn load<D, V: View<Context = ViewContext<(), D::Store>>>(
+    database: D,
     name: &str,
 ) -> Result<Arc<Mutex<V>>, IndexerError>
 where
-    S: KeyValueStore + Clone + Send + Sync + 'static,
-    S::Error: From<bcs::Error> + Send + Sync + std::error::Error + 'static,
+    D: KeyValueDatabase + Clone + Send + Sync + 'static,
+    D::Store: KeyValueStore + Clone + Send + Sync + 'static,
+    D::Error: From<bcs::Error> + Send + Sync + std::error::Error + 'static,
 {
     let root_key = name.as_bytes().to_vec();
-    let store = store
-        .clone_with_root_key(&root_key)
-        .map_err(|_e| IndexerError::CloneWithRootKeyError)?;
+    let store = database
+        .open_exclusive(&root_key)
+        .map_err(|_e| IndexerError::OpenExclusiveError)?;
     let context = ViewContext::create_root_context(store, ())
         .await
         .map_err(|e| IndexerError::ViewError(e.into()))?;

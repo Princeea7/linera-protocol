@@ -11,6 +11,9 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 default = ["macros"]
 log = ["dep:log"]
@@ -23,7 +26,6 @@ wasmtime = ["dep:wasmtime", "linera-witty-macros?/wasmtime"]
 anyhow.workspace = true
 either.workspace = true
 frunk.workspace = true
-genawaiter.workspace = true
 linera-witty-macros = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 thiserror.workspace = true

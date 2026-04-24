@@ -5,9 +5,15 @@
 
 // TODO(#3362): generate this code
 
-use linera_base::crypto::ValidatorPublicKey;
+use std::collections::BTreeMap;
+
+use linera_base::{
+    crypto::{CryptoHash, ValidatorPublicKey},
+    data_types::{Amount, ArithmeticError, ChainDescription, Timestamp},
+    identifiers::ChainId,
+};
 use linera_client::config::GenesisConfig;
-use linera_faucet::ClaimOutcome;
+use linera_execution::{committee::ValidatorState, Committee, ResourceControlPolicy};
 use linera_version::VersionInfo;
 use thiserror_context::Context;
 
@@ -20,9 +26,33 @@ pub enum ErrorInner {
     GraphQl(Vec<serde_json::Value>),
     #[error("HTTP error: {0:?}")]
     Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    ArithmeticError(#[from] ArithmeticError),
 }
 
 thiserror_context::impl_context!(Error(ErrorInner));
+
+/// The result of a successful claim mutation.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimOutcome {
+    /// The ID of the chain.
+    pub chain_id: ChainId,
+    /// The hash of the certificate containing the operation.
+    pub certificate_hash: CryptoHash,
+    /// The amount of tokens transferred.
+    pub amount: Amount,
+}
+
+/// Information about the initial chain claim.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitialClaim {
+    /// The chain ID that was created.
+    pub chain_id: ChainId,
+    /// The block timestamp when the chain was created.
+    pub timestamp: Timestamp,
+}
 
 /// A faucet instance that can be queried.
 #[derive(Debug, Clone)]
@@ -41,8 +71,10 @@ impl Faucet {
 
     async fn query<Response: serde::de::DeserializeOwned>(
         &self,
-        query: &str,
+        query: impl AsRef<str>,
     ) -> Result<Response, Error> {
+        let query = query.as_ref();
+
         #[derive(serde::Deserialize)]
         struct GraphQlResponse<T> {
             data: Option<T>,
@@ -52,7 +84,7 @@ impl Faucet {
         let builder = reqwest::ClientBuilder::new();
 
         #[cfg(not(target_arch = "wasm32"))]
-        let builder = builder.timeout(std::time::Duration::from_secs(30));
+        let builder = builder.timeout(linera_base::time::Duration::from_secs(30));
 
         let response: GraphQlResponse<Response> = builder
             .build()
@@ -69,7 +101,25 @@ impl Faucet {
             .await?;
 
         if let Some(errors) = response.errors {
-            Err(ErrorInner::GraphQl(errors).into())
+            // Extract just the error messages, ignore locations and path
+            let messages = errors
+                .iter()
+                .filter_map(|error| {
+                    error
+                        .get("message")
+                        .and_then(|msg| msg.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect::<Vec<_>>();
+
+            if messages.is_empty() {
+                Err(ErrorInner::GraphQl(errors).into())
+            } else {
+                Err(
+                    ErrorInner::GraphQl(vec![serde_json::Value::String(messages.join("; "))])
+                        .into(),
+                )
+            }
         } else {
             Ok(response
                 .data
@@ -102,19 +152,72 @@ impl Faucet {
     pub async fn claim(
         &self,
         owner: &linera_base::identifiers::AccountOwner,
-    ) -> Result<ClaimOutcome, Error> {
-        let query = format!(
-            "mutation {{ claim(owner: \"{owner}\") {{ \
-                chainId certificateHash \
-            }} }}"
-        );
-
+    ) -> Result<ChainDescription, Error> {
         #[derive(serde::Deserialize)]
         struct Response {
-            claim: ClaimOutcome,
+            claim: ChainDescription,
+        }
+        Ok(self
+            .query::<Response>(format!("mutation {{ claim(owner: \"{owner}\") }}"))
+            .await?
+            .claim)
+    }
+
+    /// Claims daily tokens for the given owner.
+    /// The user must have already claimed a chain. Each user can claim once per
+    /// 24-hour period.
+    pub async fn daily_claim(
+        &self,
+        owner: &linera_base::identifiers::AccountOwner,
+    ) -> Result<ClaimOutcome, Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            daily_claim: ClaimOutcome,
         }
 
-        Ok(self.query::<Response>(&query).await?.claim)
+        Ok(self
+            .query::<Response>(format!("mutation {{ dailyClaim(owner: \"{owner}\") }}"))
+            .await?
+            .daily_claim)
+    }
+
+    /// Returns the initial claim for the given owner, if any.
+    pub async fn initial_claim(
+        &self,
+        owner: &linera_base::identifiers::AccountOwner,
+    ) -> Result<Option<InitialClaim>, Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            initial_claim: Option<InitialClaim>,
+        }
+
+        Ok(self
+            .query::<Response>(format!(
+                "query {{ initialClaim(owner: \"{owner}\") {{ chainId timestamp }} }}"
+            ))
+            .await?
+            .initial_claim)
+    }
+
+    /// Returns the earliest time at which the owner can make a daily claim.
+    /// If the returned timestamp is in the past (or now), the user can claim immediately.
+    /// Returns `None` if the user has not yet completed the initial claim.
+    pub async fn next_daily_claim(
+        &self,
+        owner: &linera_base::identifiers::AccountOwner,
+    ) -> Result<Option<Timestamp>, Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            next_daily_claim: Option<Timestamp>,
+        }
+
+        Ok(self
+            .query::<Response>(format!("query {{ nextDailyClaim(owner: \"{owner}\") }}"))
+            .await?
+            .next_daily_claim)
     }
 
     pub async fn current_validators(&self) -> Result<Vec<(ValidatorPublicKey, String)>, Error> {
@@ -138,5 +241,35 @@ impl Faucet {
             .into_iter()
             .map(|validator| (validator.public_key, validator.network_address))
             .collect())
+    }
+
+    pub async fn current_committee(&self) -> Result<Committee, Error> {
+        #[derive(serde::Deserialize)]
+        struct CommitteeResponse {
+            validators: BTreeMap<ValidatorPublicKey, ValidatorState>,
+            policy: ResourceControlPolicy,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            current_committee: CommitteeResponse,
+        }
+
+        let response = self
+            .query::<Response>(
+                "query { currentCommittee { \
+                    validators \
+                    policy \
+                } }",
+            )
+            .await?;
+
+        let committee_response = response.current_committee;
+
+        Ok(Committee::new(
+            committee_response.validators,
+            committee_response.policy,
+        )?)
     }
 }

@@ -2,29 +2,28 @@
 source: linera-views-derive/src/lib.rs
 expression: pretty(generate_hash_view_code(input))
 ---
-#[linera_views::async_trait]
-impl linera_views::views::HashableView<custom::path::to::ContextType> for TestView
+impl linera_views::views::HashableView for TestView
 where
     RegisterView<
         custom::path::to::ContextType,
         usize,
-    >: linera_views::views::HashableView<custom::path::to::ContextType>,
+    >: linera_views::views::HashableView,
     CollectionView<
         custom::path::to::ContextType,
         usize,
         RegisterView<custom::path::to::ContextType, usize>,
-    >: linera_views::views::HashableView<custom::path::to::ContextType>,
-    Self: Send + Sync,
+    >: linera_views::views::HashableView,
+    Self: linera_views::views::View,
 {
     type Hasher = linera_views::sha3::Sha3_256;
     async fn hash_mut(
         &mut self,
     ) -> Result<
         <Self::Hasher as linera_views::views::Hasher>::Output,
-        linera_views::views::ViewError,
+        linera_views::ViewError,
     > {
-        use linera_views::views::{Hasher, HashableView};
-        use std::io::Write;
+        use linera_views::views::Hasher as _;
+        use std::io::Write as _;
         let mut hasher = Self::Hasher::default();
         hasher.write_all(self.register.hash_mut().await?.as_ref())?;
         hasher.write_all(self.collection.hash_mut().await?.as_ref())?;
@@ -34,10 +33,10 @@ where
         &self,
     ) -> Result<
         <Self::Hasher as linera_views::views::Hasher>::Output,
-        linera_views::views::ViewError,
+        linera_views::ViewError,
     > {
-        use linera_views::views::{Hasher, HashableView};
-        use std::io::Write;
+        use linera_views::views::Hasher as _;
+        use std::io::Write as _;
         let mut hasher = Self::Hasher::default();
         hasher.write_all(self.register.hash().await?.as_ref())?;
         hasher.write_all(self.collection.hash().await?.as_ref())?;

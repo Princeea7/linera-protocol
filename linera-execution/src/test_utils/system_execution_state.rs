@@ -4,7 +4,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Not,
-    sync::Arc,
 };
 
 use custom_debug_derive::Debug;
@@ -14,26 +13,20 @@ use linera_base::{
     identifiers::{AccountOwner, ApplicationId, BlobId, ChainId},
     ownership::ChainOwnership,
 };
-use linera_views::{
-    context::{Context, MemoryContext},
-    random::generate_test_namespace,
-    views::{CryptoHashView, View, ViewError},
-};
+use linera_views::{context::MemoryContext, views::View};
 
-use super::{dummy_chain_description, MockApplication, RegisterMockApplication};
+use super::{dummy_chain_description, dummy_committees, MockApplication, RegisterMockApplication};
 use crate::{
-    committee::Committee, execution::UserAction, ApplicationDescription, ExecutionError,
-    ExecutionRuntimeConfig, ExecutionRuntimeContext, ExecutionStateView, OperationContext,
-    ResourceControlPolicy, ResourceController, ResourceTracker, TestExecutionRuntimeContext,
-    UserContractCode,
+    committee::Committee, ApplicationDescription, ExecutionRuntimeConfig, ExecutionRuntimeContext,
+    ExecutionStateView, TestExecutionRuntimeContext,
 };
 
 /// A system execution state, not represented as a view but as a simple struct.
 #[derive(Default, Debug, PartialEq, Eq, Clone)]
 pub struct SystemExecutionState {
     pub description: Option<ChainDescription>,
-    pub epoch: Option<Epoch>,
-    pub admin_id: Option<ChainId>,
+    pub epoch: Epoch,
+    pub admin_chain_id: Option<ChainId>,
     pub committees: BTreeMap<Epoch, Committee>,
     pub ownership: ChainOwnership,
     pub balance: Amount,
@@ -55,26 +48,14 @@ impl SystemExecutionState {
         let ownership = description.config().ownership.clone();
         let balance = description.config().balance;
         let epoch = description.config().epoch;
-        let admin_id = Some(description.config().admin_id.unwrap_or(description.id()));
-        let committees = description
-            .config()
-            .committees
-            .iter()
-            .map(|(epoch, serialized_committee)| {
-                (
-                    *epoch,
-                    bcs::from_bytes::<Committee>(serialized_committee)
-                        .expect("should correctly deserialize a committee"),
-                )
-            })
-            .collect();
+        let admin_chain_id = Some(dummy_chain_description(0).id());
         SystemExecutionState {
-            epoch: Some(epoch),
+            epoch,
             description: Some(description),
-            admin_id,
+            admin_chain_id,
             ownership,
             balance,
-            committees,
+            committees: dummy_committees(),
             ..SystemExecutionState::default()
         }
     }
@@ -86,8 +67,8 @@ impl SystemExecutionState {
     }
 
     pub async fn into_hash(self) -> CryptoHash {
-        let view = self.into_view().await;
-        view.crypto_hash()
+        let mut view = self.into_view().await;
+        view.crypto_hash_mut()
             .await
             .expect("hashing from memory should not fail")
     }
@@ -111,7 +92,7 @@ impl SystemExecutionState {
         let SystemExecutionState {
             description,
             epoch,
-            admin_id,
+            admin_chain_id,
             committees,
             ownership,
             balance,
@@ -132,8 +113,23 @@ impl SystemExecutionState {
         for (id, mock_application) in mock_applications {
             extra
                 .user_contracts()
+                .pin()
                 .insert(id, mock_application.clone().into());
-            extra.user_services().insert(id, mock_application.into());
+            extra
+                .user_services()
+                .pin()
+                .insert(id, mock_application.into());
+        }
+
+        let mut committee_hashes = BTreeMap::new();
+        for (epoch, committee) in committees {
+            let blob = Blob::new_committee(bcs::to_bytes(&committee).expect("BCS should succeed"));
+            let hash = blob.id().hash;
+            extra
+                .add_blobs([blob])
+                .await
+                .expect("Adding committee blobs should not fail");
+            committee_hashes.insert(epoch, hash);
         }
 
         let context = MemoryContext::new_for_testing(extra);
@@ -142,8 +138,8 @@ impl SystemExecutionState {
             .expect("Loading from memory should work");
         view.system.description.set(description);
         view.system.epoch.set(epoch);
-        view.system.admin_id.set(admin_id);
-        view.system.committees.set(committees);
+        view.system.admin_chain_id.set(admin_chain_id);
+        view.system.committees.set(committee_hashes);
         view.system.ownership.set(ownership);
         view.system.balance.set(balance);
         for (account_owner, balance) in balances {
@@ -168,7 +164,7 @@ impl SystemExecutionState {
 }
 
 impl RegisterMockApplication for SystemExecutionState {
-    fn creator_chain_id(&self) -> ChainId {
+    async fn creator_chain_id(&self) -> ChainId {
         self.description.as_ref().expect(
             "Can't register applications on a system state with no associated `ChainDescription`",
         ).into()

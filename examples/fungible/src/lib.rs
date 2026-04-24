@@ -3,16 +3,17 @@
 
 /* ABI of the Fungible Token Example Application */
 
+pub mod state;
+
 pub use linera_sdk::abis::fungible::*;
-use linera_sdk::linera_base_types::{AccountOwner, Amount};
+use linera_sdk::linera_base_types::{Account, AccountOwner, Amount};
 use serde::{Deserialize, Serialize};
 #[cfg(all(any(test, feature = "test"), not(target_arch = "wasm32")))]
 use {
-    async_graphql::InputType,
     futures::{stream, StreamExt},
     linera_sdk::{
         linera_base_types::{ApplicationId, ModuleId},
-        test::{ActiveChain, QueryOutcome, TestValidator},
+        test::{ActiveChain, TestValidator},
     },
 };
 
@@ -79,7 +80,7 @@ pub async fn create_with_accounts(
             .add_block(|block| {
                 block.with_operation(
                     application_id,
-                    Operation::Claim {
+                    &FungibleOperation::Claim {
                         source_account: Account {
                             chain_id: token_chain.id(),
                             owner: *account,
@@ -94,9 +95,10 @@ pub async fn create_with_accounts(
             })
             .await;
 
+        let (claim_certificate, _) = claim_certificate;
         assert_eq!(claim_certificate.outgoing_message_count(), 1);
 
-        let transfer_certificate = token_chain
+        let (transfer_certificate, _) = token_chain
             .add_block(|block| {
                 block.with_messages_from(&claim_certificate);
             })
@@ -112,25 +114,4 @@ pub async fn create_with_accounts(
     }
 
     (application_id, accounts)
-}
-
-/// Queries the balance of an account owned by `account_owner` on a specific `chain`.
-#[cfg(all(any(test, feature = "test"), not(target_arch = "wasm32")))]
-pub async fn query_account(
-    application_id: ApplicationId<FungibleTokenAbi>,
-    chain: &ActiveChain,
-    account_owner: AccountOwner,
-) -> Option<Amount> {
-    let query = format!(
-        "query {{ accounts {{ entry(key: {}) {{ value }} }} }}",
-        account_owner.to_value()
-    );
-    let QueryOutcome { response, .. } = chain.graphql_query(application_id, query).await;
-    let balance = response.pointer("/accounts/entry/value")?.as_str()?;
-
-    Some(
-        balance
-            .parse()
-            .expect("Account balance cannot be parsed as a number"),
-    )
 }

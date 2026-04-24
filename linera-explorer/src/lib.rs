@@ -99,10 +99,11 @@ impl Config {
             node: "localhost:8080".to_string(),
             tls: false,
         };
-        match web_sys::window()
-            .expect("window object not found")
-            .local_storage()
-        {
+        // Return default if window doesn't exist (e.g., in test environment).
+        let Some(window) = web_sys::window() else {
+            return default;
+        };
+        match window.local_storage() {
             Ok(Some(st)) => match st.get_item("config") {
                 Ok(Some(s)) => serde_json::from_str::<Config>(&s).unwrap_or(default),
                 _ => default,
@@ -157,7 +158,7 @@ pub enum AddressKind {
     Indexer,
 }
 
-fn url(config: &Config, protocol: Protocol, kind: AddressKind) -> String {
+fn url(config: &Config, protocol: &Protocol, kind: &AddressKind) -> String {
     let protocol = match protocol {
         Protocol::Http => "http",
         Protocol::Websocket => "ws",
@@ -176,7 +177,6 @@ async fn get_chain(node: &str, chain_id: ChainId) -> Result<Box<Chain>> {
         chain_id,
         inboxes_input: None,
         outboxes_input: None,
-        previous_message_blocks_input: None,
     };
     let chain = request::<gql_service::Chain, _>(&client, node, variables)
         .await?
@@ -491,35 +491,48 @@ async fn plugin(plugin: &str, indexer: &str) -> Result<(Page, String)> {
 }
 
 fn format_bytes(value: &JsValue) -> JsValue {
-    let modified_value = value.clone();
-    if let Some(object) = js_sys::Object::try_from(value) {
-        js_sys::Object::keys(object)
-            .iter()
-            .for_each(|k: JsValue| match k.as_string() {
-                None => (),
-                Some(key_str) => {
-                    if &key_str == "bytes" {
-                        let array: Vec<u8> =
-                            js_sys::Uint8Array::from(getf(&modified_value, "bytes")).to_vec();
-                        let array_hex = hex::encode(array);
-                        let hex_len = array_hex.len();
-                        let hex_elided = if hex_len > 128 {
-                            // don't show all hex digits if the bytes array is too long
-                            format!("{}..{}", &array_hex[0..4], &array_hex[hex_len - 4..])
-                        } else {
-                            array_hex
-                        };
-                        setf(&modified_value, "bytes", &JsValue::from_str(&hex_elided))
-                    } else {
-                        setf(
-                            &modified_value,
-                            &key_str,
-                            &format_bytes(&getf(&modified_value, &key_str)),
-                        )
-                    }
-                }
-            });
+    // Skip non-object types (primitives, null, undefined, BigInt, etc.)
+    let object = match js_sys::Object::try_from(value) {
+        Some(obj) => obj,
+        None => return value.clone(),
     };
+    let modified_value = value.clone();
+    for k in js_sys::Object::keys(object).iter() {
+        let key_str = match k.as_string() {
+            Some(s) => s,
+            None => continue,
+        };
+        let child = match js_sys::Reflect::get(&modified_value, &k) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if key_str == "bytes" && js_sys::Array::is_array(&child) {
+            let js_arr = js_sys::Array::from(&child);
+            let mut valid = true;
+            let mut array = Vec::with_capacity(js_arr.length() as usize);
+            for v in js_arr.iter() {
+                if let Some(f) = v.as_f64() {
+                    array.push(f as u8);
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                let array_hex = hex::encode(array);
+                let hex_len = array_hex.len();
+                let hex_elided = if hex_len > 128 {
+                    format!("{}..{}", &array_hex[0..4], &array_hex[hex_len - 4..])
+                } else {
+                    array_hex
+                };
+                setf(&modified_value, "bytes", &JsValue::from_str(&hex_elided));
+            }
+        } else {
+            let formatted = format_bytes(&child);
+            let _ = js_sys::Reflect::set(&modified_value, &k, &formatted);
+        }
+    }
     modified_value
 }
 
@@ -625,7 +638,7 @@ async fn page(
             plugin(&name, indexer).await
         }
         "error" => {
-            let msg = find_arg(args, "msg").unwrap_or("unknown error".to_string());
+            let msg = find_arg(args, "msg").unwrap_or_else(|| "unknown error".to_string());
             Err(anyhow::Error::msg(msg))
         }
         _ => Err(anyhow!("unknown page")),
@@ -645,17 +658,18 @@ async fn route_aux(
         (Some(p), _) => (p, args.to_vec()),
         (_, p) => page_name_and_args(p),
     };
-    let node = url(&data.config, Protocol::Http, AddressKind::Node);
-    let indexer = url(&data.config, Protocol::Http, AddressKind::Indexer);
+    let node = url(&data.config, &Protocol::Http, &AddressKind::Node);
+    let indexer = url(&data.config, &Protocol::Http, &AddressKind::Indexer);
     let result = match chain_info {
         Err(e) => Err(e),
         Ok((chain_id, chain_changed)) => {
             let page_result = page(page_name, &node, &indexer, chain_id, &args).await;
             if chain_changed {
                 if let Some(ws) = WEBSOCKET.get() {
-                    let _ = ws.close().await;
+                    // Ignore close errors; we're switching to a new connection anyway.
+                    ws.close().await.ok();
                 }
-                let address = url(&data.config, Protocol::Websocket, AddressKind::Node);
+                let address = url(&data.config, &Protocol::Websocket, &AddressKind::Node);
                 subscribe_chain(app, &address, chain_id).await;
             };
             page_result
@@ -664,12 +678,19 @@ async fn route_aux(
     let (page, new_path) = result.unwrap_or_else(|e| error(&e));
     let page_js = format_bytes(&page.serialize(&SER).unwrap());
     setf(app, "page", &page_js);
-    web_sys::window()
+    let history = web_sys::window()
         .expect("window object not found")
         .history()
-        .expect("history object not found")
-        .push_state_with_url(&page_js, &new_path, Some(&new_path))
-        .expect("push_state failed");
+        .expect("history object not found");
+    if init {
+        history
+            .replace_state_with_url(&page_js, &new_path, Some(&new_path))
+            .expect("replace_state failed");
+    } else {
+        history
+            .push_state_with_url(&page_js, &new_path, Some(&new_path))
+            .expect("push_state failed");
+    }
 }
 
 #[wasm_bindgen]
@@ -683,14 +704,17 @@ pub async fn route(app: JsValue, path: JsValue, args: JsValue) {
 }
 
 #[wasm_bindgen]
-pub fn short_crypto_hash(s: String) -> String {
-    let hash = CryptoHash::from_str(&s).expect("not a crypto hash");
+pub fn short_crypto_hash(s: &str) -> String {
+    let hash = CryptoHash::from_str(s).expect("not a crypto hash");
     format!("{:?}", hash)
 }
 
 #[wasm_bindgen]
-pub fn short_app_id(s: String) -> String {
-    format!("{}..{}..{}..", &s[..4], &s[64..68], &s[152..156])
+pub fn short_app_id(s: &str) -> String {
+    if s.len() <= 12 {
+        return s.to_string();
+    }
+    format!("{}..{}", &s[..4], &s[s.len() - 4..])
 }
 
 fn set_onpopstate(app: JsValue) {
@@ -734,18 +758,28 @@ async fn subscribe_chain(app: &JsValue, address: &str, chain: ChainId) {
         while let Some(evt) = wsio.next().await {
             match evt {
                 WsMessage::Text(message) => {
-                    let graphql_message = serde_json::from_str::<
+                    let graphql_message = match serde_json::from_str::<
                         GQuery<Response<notifications::ResponseData>>,
                     >(&message)
-                    .expect("unexpected websocket response");
+                    {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            log_str(&format!("ignoring websocket message: {}", e));
+                            continue;
+                        }
+                    };
                     if let Some(payload) = graphql_message.payload {
                         if let Some(message_data) = payload.data {
                             let data =
                                 from_value::<Data>(app.clone()).expect("cannot parse vue data");
-                            if let Reason::NewBlock { .. } = message_data.notifications.reason {
-                                if message_data.notifications.chain_id == chain {
-                                    route_aux(&app, &data, &None, &Vec::new(), false).await
-                                }
+                            let should_refresh = matches!(
+                                &message_data.notifications.reason,
+                                Reason::NewBlock { .. }
+                                    | Reason::BlockExecuted { .. }
+                                    | Reason::NewEvents { .. }
+                            );
+                            if should_refresh && message_data.notifications.chain_id == chain {
+                                route_aux(&app, &data, &None, &Vec::new(), false).await
                             }
                         }
                         if let Some(errors) = payload.errors {
@@ -758,7 +792,8 @@ async fn subscribe_chain(app: &JsValue, address: &str, chain: ChainId) {
             }
         }
     });
-    let _ = WEBSOCKET.set(ws);
+    // Ignore if already set; this can happen during re-subscription.
+    WEBSOCKET.set(ws).ok();
 }
 
 /// Initializes pages and subscribes to notifications.
@@ -767,7 +802,7 @@ pub async fn start(app: JsValue) {
     console_error_panic_hook::set_once();
     set_onpopstate(app.clone());
     let data = from_value::<Data>(app.clone()).expect("cannot parse vue data");
-    let address = url(&data.config, Protocol::Http, AddressKind::Node);
+    let address = url(&data.config, &Protocol::Http, &AddressKind::Node);
     let default_chain = chains(&app, &address).await;
     match default_chain {
         Err(e) => {
@@ -781,8 +816,8 @@ pub async fn start(app: JsValue) {
             .await
         }
         Ok(default_chain) => {
-            let indexer = url(&data.config, Protocol::Http, AddressKind::Indexer);
-            let _ = plugins(&app, &indexer).await;
+            let indexer = url(&data.config, &Protocol::Http, &AddressKind::Indexer);
+            plugins(&app, &indexer).await;
             let uri = web_sys::window()
                 .expect("window object not found")
                 .location()

@@ -21,7 +21,7 @@ async fn hex_game() {
     let (validator, app_id, creation_chain) =
         TestValidator::with_current_application::<HexAbi, _, _>((), Timeouts::default()).await;
 
-    let certificate = creation_chain
+    let (certificate, _) = creation_chain
         .add_block(|block| {
             let operation = Operation::Start {
                 board_size: 2,
@@ -29,7 +29,7 @@ async fn hex_game() {
                 fee_budget: Amount::ZERO,
                 timeouts: None,
             };
-            block.with_operation(app_id, operation);
+            block.with_operation(app_id, &operation);
         })
         .await;
 
@@ -48,21 +48,21 @@ async fn hex_game() {
     chain
         .add_block(|block| {
             block.with_messages_from(&certificate);
-            block.with_operation(app_id, Operation::MakeMove { x: 0, y: 0 });
+            block.with_operation(app_id, &Operation::MakeMove { x: 0, y: 0 });
         })
         .await;
 
     chain.set_key_pair(key_pair2.copy());
     chain
         .add_block(|block| {
-            block.with_operation(app_id, Operation::MakeMove { x: 0, y: 1 });
+            block.with_operation(app_id, &Operation::MakeMove { x: 0, y: 1 });
         })
         .await;
 
     chain.set_key_pair(key_pair1.copy());
     chain
         .add_block(|block| {
-            block.with_operation(app_id, Operation::MakeMove { x: 1, y: 1 });
+            block.with_operation(app_id, &Operation::MakeMove { x: 1, y: 1 });
         })
         .await;
 
@@ -72,7 +72,7 @@ async fn hex_game() {
     chain.set_key_pair(key_pair2.copy());
     chain
         .add_block(|block| {
-            block.with_operation(app_id, Operation::MakeMove { x: 1, y: 0 });
+            block.with_operation(app_id, &Operation::MakeMove { x: 1, y: 0 });
         })
         .await;
 
@@ -102,7 +102,7 @@ async fn hex_game_clock() {
             .saturating_sub(TimeDelta::from_millis(1)),
     );
 
-    let certificate = creation_chain
+    let (certificate, _) = creation_chain
         .add_block(|block| {
             let operation = Operation::Start {
                 board_size: 2,
@@ -110,7 +110,9 @@ async fn hex_game_clock() {
                 fee_budget: Amount::ZERO,
                 timeouts: None,
             };
-            block.with_operation(app_id, operation).with_timestamp(time);
+            block
+                .with_operation(app_id, &operation)
+                .with_timestamp(time);
         })
         .await;
 
@@ -130,7 +132,7 @@ async fn hex_game_clock() {
         .add_block(|block| {
             block
                 .with_messages_from(&certificate)
-                .with_operation(app_id, Operation::MakeMove { x: 0, y: 0 })
+                .with_operation(app_id, &Operation::MakeMove { x: 0, y: 0 })
                 .with_timestamp(time);
         })
         .await;
@@ -142,7 +144,7 @@ async fn hex_game_clock() {
     assert!(chain
         .try_add_block(|block| {
             block
-                .with_operation(app_id, Operation::MakeMove { x: 0, y: 1 })
+                .with_operation(app_id, &Operation::MakeMove { x: 0, y: 1 })
                 .with_timestamp(time);
         })
         .await
@@ -155,7 +157,7 @@ async fn hex_game_clock() {
     assert!(chain
         .try_add_block(|block| {
             block
-                .with_operation(app_id, Operation::MakeMove { x: 0, y: 1 })
+                .with_operation(app_id, &Operation::MakeMove { x: 0, y: 1 })
                 .with_timestamp(time);
         })
         .await
@@ -165,7 +167,7 @@ async fn hex_game_clock() {
     chain
         .add_block(|block| {
             block
-                .with_operation(app_id, Operation::ClaimVictory)
+                .with_operation(app_id, &Operation::ClaimVictory)
                 .with_timestamp(time);
         })
         .await;

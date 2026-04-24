@@ -4,10 +4,7 @@
 use std::path::PathBuf;
 
 use linera_base::command::resolve_binary;
-use linera_views::{
-    lru_caching::LruCachingConfig,
-    store::{CommonStoreInternalConfig, KeyValueStoreError},
-};
+use linera_views::{lru_caching::LruCachingConfig, store::KeyValueStoreError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tonic::Status;
@@ -33,7 +30,7 @@ pub enum KeyPrefix {
 }
 
 #[derive(Debug, Error)]
-pub enum ServiceStoreError {
+pub enum StorageServiceStoreError {
     /// Store already exists during a create operation
     #[error("Store already exists during a create operation")]
     StoreAlreadyExists,
@@ -67,32 +64,34 @@ pub enum ServiceStoreError {
     BcsError(#[from] bcs::Error),
 }
 
-impl From<Status> for ServiceStoreError {
+impl From<Status> for StorageServiceStoreError {
     fn from(error: Status) -> Self {
         Box::new(error).into()
     }
 }
 
-impl KeyValueStoreError for ServiceStoreError {
+impl KeyValueStoreError for StorageServiceStoreError {
     const BACKEND: &'static str = "service";
 }
 
-pub fn storage_service_test_endpoint() -> Result<String, ServiceStoreError> {
+pub fn storage_service_test_endpoint() -> Result<String, StorageServiceStoreError> {
     Ok(std::env::var("LINERA_STORAGE_SERVICE")?)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ServiceStoreInternalConfig {
+pub struct StorageServiceStoreInternalConfig {
     /// The endpoint used by the shared store
     pub endpoint: String,
-    /// The common configuration code
-    pub common_config: CommonStoreInternalConfig,
+    /// Maximum number of concurrent database queries allowed for this client.
+    pub max_concurrent_queries: Option<usize>,
+    /// Preferred buffer size for async streams.
+    pub max_stream_queries: usize,
 }
 
 /// The config type
-pub type ServiceStoreConfig = LruCachingConfig<ServiceStoreInternalConfig>;
+pub type StorageServiceStoreConfig = LruCachingConfig<StorageServiceStoreInternalConfig>;
 
-impl ServiceStoreInternalConfig {
+impl StorageServiceStoreInternalConfig {
     pub fn http_address(&self) -> String {
         format!("http://{}", self.endpoint)
     }
@@ -101,7 +100,7 @@ impl ServiceStoreInternalConfig {
 /// Obtains the binary of the executable.
 /// The path depends whether the test are run in the directory "linera-storage-service"
 /// or in the main directory
-pub async fn get_service_storage_binary() -> Result<PathBuf, ServiceStoreError> {
+pub async fn get_service_storage_binary() -> Result<PathBuf, StorageServiceStoreError> {
     let binary = resolve_binary("linera-storage-server", "linera-storage-service").await;
     if let Ok(binary) = binary {
         return Ok(binary);
@@ -110,5 +109,5 @@ pub async fn get_service_storage_binary() -> Result<PathBuf, ServiceStoreError> 
     if let Ok(binary) = binary {
         return Ok(binary);
     }
-    Err(ServiceStoreError::FailedToFindStorageServerBinary)
+    Err(StorageServiceStoreError::FailedToFindStorageServerBinary)
 }

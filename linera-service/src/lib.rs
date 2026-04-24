@@ -4,13 +4,17 @@
 
 //! This module provides the executables needed to operate a Linera service, including a placeholder wallet acting as a GraphQL service for user interfaces.
 
-#![deny(clippy::large_futures)]
+#![recursion_limit = "256"]
 
+pub mod cli;
 pub mod cli_wrappers;
+pub mod config;
+pub mod controller;
 pub mod node_service;
 pub mod project;
-#[cfg(with_metrics)]
-pub mod prometheus_server;
+pub mod query_subscription;
 pub mod storage;
+pub mod task_processor;
+pub mod tracing;
 pub mod util;
-pub mod wallet;
+pub use linera_wallet_json::PersistentWallet as Wallet;

@@ -4,8 +4,8 @@
 
 use linera_base::{
     crypto::CryptoHash,
-    data_types::BlobContent,
-    identifiers::{BlobId, ChainId},
+    data_types::{BlobContent, BlockHeight, NetworkDescription},
+    identifiers::{BlobId, ChainId, EventId},
 };
 use linera_chain::{
     data_types::{BlockProposal, LiteVote},
@@ -14,15 +14,25 @@ use linera_chain::{
 use linera_core::{
     data_types::{ChainInfoQuery, ChainInfoResponse, CrossChainRequest},
     node::NodeError,
+    worker::Notification,
 };
-use linera_storage::NetworkDescription;
 use linera_version::VersionInfo;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    HandleConfirmedCertificateRequest, HandleLiteCertRequest, HandleTimeoutCertificateRequest,
-    HandleValidatedCertificateRequest,
+    config::ShardId, HandleConfirmedCertificateRequest, HandleLiteCertRequest,
+    HandleTimeoutCertificateRequest, HandleValidatedCertificateRequest,
 };
+
+/// Information about shard configuration for a specific chain.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[cfg_attr(with_testing, derive(Eq, PartialEq))]
+pub struct ShardInfo {
+    /// The ID of the shard assigned to the chain.
+    pub shard_id: ShardId,
+    /// The total number of shards in the validator network.
+    pub total_shards: usize,
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]
@@ -40,8 +50,10 @@ pub enum RpcMessage {
     HandlePendingBlob(Box<(ChainId, BlobContent)>),
     DownloadConfirmedBlock(Box<CryptoHash>),
     DownloadCertificates(Vec<CryptoHash>),
+    DownloadCertificatesByHeights(ChainId, Vec<BlockHeight>),
     BlobLastUsedBy(Box<BlobId>),
     MissingBlobIds(Vec<BlobId>),
+    EventBlockHeights(Vec<EventId>),
     VersionInfoQuery,
     NetworkDescriptionQuery,
 
@@ -56,11 +68,22 @@ pub enum RpcMessage {
     DownloadPendingBlobResponse(Box<BlobContent>),
     DownloadConfirmedBlockResponse(Box<ConfirmedBlock>),
     DownloadCertificatesResponse(Vec<ConfirmedBlockCertificate>),
+    DownloadCertificatesByHeightsResponse(Vec<ConfirmedBlockCertificate>),
     BlobLastUsedByResponse(Box<CryptoHash>),
     MissingBlobIdsResponse(Vec<BlobId>),
+    EventBlockHeightsResponse(Vec<Option<BlockHeight>>),
 
     // Internal to a validator
     CrossChainRequest(Box<CrossChainRequest>),
+
+    BlobLastUsedByCertificate(Box<BlobId>),
+    BlobLastUsedByCertificateResponse(Box<ConfirmedBlockCertificate>),
+    ShardInfoQuery(ChainId),
+    ShardInfoResponse(ShardInfo),
+
+    // Notification subscription
+    SubscribeNotifications(Vec<ChainId>),
+    Notification(Box<Notification>),
 }
 
 impl RpcMessage {
@@ -79,7 +102,9 @@ impl RpcMessage {
             ChainInfoQuery(query) => query.chain_id,
             CrossChainRequest(request) => request.target_chain_id(),
             DownloadPendingBlob(request) => request.0,
+            DownloadCertificatesByHeights(chain_id, _) => *chain_id,
             HandlePendingBlob(request) => request.0,
+            ShardInfoQuery(chain_id) => *chain_id,
             Vote(_)
             | Error(_)
             | ChainInfoResponse(_)
@@ -94,12 +119,20 @@ impl RpcMessage {
             | DownloadPendingBlobResponse(_)
             | DownloadConfirmedBlock(_)
             | DownloadConfirmedBlockResponse(_)
+            | DownloadCertificatesByHeightsResponse(_)
             | DownloadCertificates(_)
             | BlobLastUsedBy(_)
             | BlobLastUsedByResponse(_)
+            | BlobLastUsedByCertificate(_)
+            | BlobLastUsedByCertificateResponse(_)
             | MissingBlobIds(_)
             | MissingBlobIdsResponse(_)
-            | DownloadCertificatesResponse(_) => {
+            | EventBlockHeights(_)
+            | EventBlockHeightsResponse(_)
+            | ShardInfoResponse(_)
+            | DownloadCertificatesResponse(_)
+            | SubscribeNotifications(_)
+            | Notification(_) => {
                 return None;
             }
         };
@@ -115,12 +148,16 @@ impl RpcMessage {
         match self {
             VersionInfoQuery
             | NetworkDescriptionQuery
+            | ShardInfoQuery(_)
             | UploadBlob(_)
             | DownloadBlob(_)
             | DownloadConfirmedBlock(_)
             | BlobLastUsedBy(_)
+            | BlobLastUsedByCertificate(_)
             | MissingBlobIds(_)
-            | DownloadCertificates(_) => true,
+            | EventBlockHeights(_)
+            | DownloadCertificates(_)
+            | DownloadCertificatesByHeights(_, _) => true,
             BlockProposal(_)
             | LiteCertificate(_)
             | TimeoutCertificate(_)
@@ -133,6 +170,7 @@ impl RpcMessage {
             | ChainInfoResponse(_)
             | VersionInfoResponse(_)
             | NetworkDescriptionResponse(_)
+            | ShardInfoResponse(_)
             | UploadBlobResponse(_)
             | DownloadPendingBlob(_)
             | DownloadPendingBlobResponse(_)
@@ -140,8 +178,13 @@ impl RpcMessage {
             | DownloadBlobResponse(_)
             | DownloadConfirmedBlockResponse(_)
             | BlobLastUsedByResponse(_)
+            | BlobLastUsedByCertificateResponse(_)
             | MissingBlobIdsResponse(_)
-            | DownloadCertificatesResponse(_) => false,
+            | EventBlockHeightsResponse(_)
+            | DownloadCertificatesResponse(_)
+            | DownloadCertificatesByHeightsResponse(_)
+            | SubscribeNotifications(_)
+            | Notification(_) => false,
         }
     }
 }
@@ -191,11 +234,23 @@ impl TryFrom<RpcMessage> for ConfirmedBlock {
     }
 }
 
+impl TryFrom<RpcMessage> for ConfirmedBlockCertificate {
+    type Error = NodeError;
+    fn try_from(message: RpcMessage) -> Result<Self, Self::Error> {
+        match message {
+            RpcMessage::BlobLastUsedByCertificateResponse(certificate) => Ok(*certificate),
+            RpcMessage::Error(error) => Err(*error),
+            _ => Err(NodeError::UnexpectedMessage),
+        }
+    }
+}
+
 impl TryFrom<RpcMessage> for Vec<ConfirmedBlockCertificate> {
     type Error = NodeError;
     fn try_from(message: RpcMessage) -> Result<Self, Self::Error> {
         match message {
             RpcMessage::DownloadCertificatesResponse(certificates) => Ok(certificates),
+            RpcMessage::DownloadCertificatesByHeightsResponse(certificates) => Ok(certificates),
             RpcMessage::Error(error) => Err(*error),
             _ => Err(NodeError::UnexpectedMessage),
         }
@@ -223,6 +278,17 @@ impl TryFrom<RpcMessage> for NetworkDescription {
     }
 }
 
+impl TryFrom<RpcMessage> for Vec<Option<BlockHeight>> {
+    type Error = NodeError;
+    fn try_from(message: RpcMessage) -> Result<Self, Self::Error> {
+        match message {
+            RpcMessage::EventBlockHeightsResponse(heights) => Ok(heights),
+            RpcMessage::Error(error) => Err(*error),
+            _ => Err(NodeError::UnexpectedMessage),
+        }
+    }
+}
+
 impl TryFrom<RpcMessage> for Vec<BlobId> {
     type Error = NodeError;
     fn try_from(message: RpcMessage) -> Result<Self, Self::Error> {
@@ -239,6 +305,17 @@ impl TryFrom<RpcMessage> for BlobId {
     fn try_from(message: RpcMessage) -> Result<Self, Self::Error> {
         match message {
             RpcMessage::UploadBlobResponse(blob_id) => Ok(*blob_id),
+            RpcMessage::Error(error) => Err(*error),
+            _ => Err(NodeError::UnexpectedMessage),
+        }
+    }
+}
+
+impl TryFrom<RpcMessage> for ShardInfo {
+    type Error = NodeError;
+    fn try_from(message: RpcMessage) -> Result<Self, Self::Error> {
+        match message {
+            RpcMessage::ShardInfoResponse(shard_info) => Ok(shard_info),
             RpcMessage::Error(error) => Err(*error),
             _ => Err(NodeError::UnexpectedMessage),
         }

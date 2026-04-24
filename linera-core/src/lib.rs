@@ -5,27 +5,37 @@
 //! This module defines the core Linera protocol.
 
 #![recursion_limit = "256"]
-#![deny(clippy::large_futures)]
+// We conditionally add autotraits to the traits here.
+#![allow(async_fn_in_trait)]
 
-pub mod chain_worker;
+mod chain_worker;
+pub use chain_worker::ChainWorkerConfig;
 pub mod client;
+pub use client::Client;
 pub mod data_types;
 pub mod join_set_ext;
-pub mod local_node;
+mod local_node;
 pub mod node;
 pub mod notifier;
-pub mod remote_node;
+mod remote_node;
 #[cfg(with_testing)]
 #[path = "unit_tests/test_utils.rs"]
 pub mod test_utils;
 pub mod worker;
 
 pub(crate) mod updater;
-pub(crate) mod value_cache;
 
-pub use updater::DEFAULT_GRACE_PERIOD;
+pub use local_node::LocalNodeError;
+pub use updater::DEFAULT_QUORUM_GRACE_PERIOD;
 
 pub use crate::join_set_ext::{JoinSetExt, TaskHandle};
 
 pub mod environment;
-pub use environment::Environment;
+pub use environment::{
+    wallet::{self, Wallet},
+    Environment,
+};
+
+/// The maximum number of entries in a `received_log` included in a `ChainInfo` response.
+// TODO(#4638): Revisit the number.
+pub const CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES: usize = 20_000;

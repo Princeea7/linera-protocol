@@ -11,10 +11,13 @@ homepage.workspace = true
 license.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 linera-base.workspace = true
 linera-client.workspace = true
-linera-faucet = { version = "0.15.0", path = ".." }
+linera-execution.workspace = true
 linera-version.workspace = true
 reqwest.workspace = true
 serde.workspace = true

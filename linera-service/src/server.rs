@@ -2,12 +2,23 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![deny(clippy::large_futures)]
+#![recursion_limit = "256"]
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Configure jemalloc profiling infrastructure at startup with sampling disabled.
+/// Profiling is activated at runtime only when `--enable-memory-profiling` is passed.
+#[cfg(feature = "jemalloc")]
+#[export_name = "malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
 use std::{
     borrow::Cow,
-    num::{NonZeroU16, NonZeroUsize},
+    num::NonZeroU16,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,28 +29,28 @@ use linera_base::{
     crypto::{CryptoRng, Ed25519SecretKey},
     listen_for_shutdown_signals,
 };
-use linera_client::{
-    config::{CommitteeConfig, GenesisConfig, ValidatorConfig, ValidatorServerConfig},
-    persistent::{self, Persist},
+use linera_client::config::{CommitteeConfig, ValidatorConfig, ValidatorServerConfig};
+use linera_core::{
+    worker::WorkerState, ChainWorkerConfig, JoinSetExt as _, CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES,
 };
-use linera_core::{worker::WorkerState, JoinSetExt as _};
 use linera_execution::{WasmRuntime, WithWasmDefault};
+#[cfg(with_metrics)]
+use linera_metrics::monitoring_server;
+use linera_persistent::{self as persistent, Persist};
 use linera_rpc::{
     config::{
-        CrossChainConfig, ExporterServiceConfig, NetworkProtocol, NotificationConfig, ShardConfig,
-        ShardId, TlsConfig, ValidatorInternalNetworkConfig, ValidatorPublicNetworkConfig,
+        CrossChainConfig, ExporterServiceConfig, NetworkProtocol, NotificationConfig, ProxyConfig,
+        ShardConfig, ShardId, TlsConfig, ValidatorInternalNetworkConfig,
+        ValidatorPublicNetworkConfig,
     },
     grpc, simple,
 };
 use linera_sdk::linera_base_types::{AccountSecretKey, ValidatorKeypair};
-#[cfg(with_metrics)]
-use linera_service::prometheus_server;
 use linera_service::{
-    storage::{Runnable, StorageConfigNamespace},
+    storage::{CommonStorageOptions, Runnable, StorageConfig},
     util,
 };
 use linera_storage::Storage;
-use linera_views::{lru_caching::StorageCacheConfig, store::CommonStoreConfig};
 use serde::Deserialize;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -50,8 +61,16 @@ struct ServerContext {
     cross_chain_config: CrossChainConfig,
     notification_config: NotificationConfig,
     shard: Option<usize>,
-    grace_period: Duration,
-    max_loaded_chains: NonZeroUsize,
+    block_time_grace_period: Duration,
+    chain_worker_ttl: Duration,
+    block_cache_size: usize,
+    execution_state_cache_size: usize,
+    chain_info_max_received_log_entries: usize,
+    cross_chain_message_chunk_limit: usize,
+    allow_revert_confirm: bool,
+    reset_on_incorrect_outcome_mins: Option<u64>,
+    #[cfg(with_metrics)]
+    enable_memory_profiling: bool,
 }
 
 impl ServerContext {
@@ -70,24 +89,35 @@ impl ServerContext {
             "Public key: {}",
             self.server_config.validator_secret.public()
         );
-        let state = WorkerState::new(
-            format!("Shard {} @ {}:{}", shard_id, local_ip_addr, shard.port),
-            Some(self.server_config.validator_secret.copy()),
-            storage,
-            self.max_loaded_chains,
-        )
-        .with_allow_inactive_chains(false)
-        .with_allow_messages_from_deprecated_epochs(false)
-        .with_grace_period(self.grace_period);
+        let config = ChainWorkerConfig {
+            nickname: format!("Shard {} @ {}:{}", shard_id, local_ip_addr, shard.port),
+            key_pair: Some(Arc::new(self.server_config.validator_secret.copy())),
+            allow_inactive_chains: false,
+            allow_messages_from_deprecated_epochs: false,
+            block_time_grace_period: self.block_time_grace_period,
+            ttl: util::non_zero_duration(self.chain_worker_ttl),
+            chain_info_max_received_log_entries: self.chain_info_max_received_log_entries,
+            cross_chain_message_chunk_limit: self.cross_chain_message_chunk_limit,
+            block_cache_size: self.block_cache_size,
+            execution_state_cache_size: self.execution_state_cache_size,
+            allow_revert_confirm: self.allow_revert_confirm,
+            reset_on_incorrect_outcome: self
+                .reset_on_incorrect_outcome_mins
+                .map(|m| Duration::from_secs(m * 60)),
+            ..ChainWorkerConfig::default()
+        };
+        let state = WorkerState::new(storage, config, None);
         (state, shard_id, shard.clone())
     }
 
+    #[cfg_attr(not(with_metrics), allow(unused_variables))]
     fn spawn_simple<S>(
         &self,
         listen_address: &str,
         states: Vec<(WorkerState<S>, ShardId, ShardConfig)>,
         protocol: simple::TransportProtocol,
-        shutdown_signal: CancellationToken,
+        shutdown_signal: &CancellationToken,
+        enable_memory_profiling: bool,
     ) -> JoinSet<()>
     where
         S: Storage + Clone + Send + Sync + 'static,
@@ -107,7 +137,11 @@ impl ServerContext {
 
             #[cfg(with_metrics)]
             if let Some(port) = shard.metrics_port {
-                Self::start_metrics(&listen_address, port, shutdown_signal.clone());
+                monitoring_server::start_metrics(
+                    (listen_address.clone(), port),
+                    shutdown_signal.clone(),
+                    monitoring_server::MemoryProfiling::from(enable_memory_profiling),
+                );
             }
 
             let server_handle = simple::Server::new(
@@ -135,11 +169,13 @@ impl ServerContext {
         join_set
     }
 
+    #[cfg_attr(not(with_metrics), allow(unused_variables))]
     fn spawn_grpc<S>(
         &self,
         listen_address: &str,
         states: Vec<(WorkerState<S>, ShardId, ShardConfig)>,
-        shutdown_signal: CancellationToken,
+        shutdown_signal: &CancellationToken,
+        enable_memory_profiling: bool,
     ) -> JoinSet<()>
     where
         S: Storage + Clone + Send + Sync + 'static,
@@ -150,7 +186,11 @@ impl ServerContext {
         for (state, shard_id, shard) in states {
             #[cfg(with_metrics)]
             if let Some(port) = shard.metrics_port {
-                Self::start_metrics(listen_address, port, shutdown_signal.clone());
+                monitoring_server::start_metrics(
+                    (listen_address.to_string(), port),
+                    shutdown_signal.clone(),
+                    monitoring_server::MemoryProfiling::from(enable_memory_profiling),
+                );
             }
 
             let server_handle = grpc::GrpcServer::spawn(
@@ -159,8 +199,8 @@ impl ServerContext {
                 state,
                 shard_id,
                 self.server_config.internal_network.clone(),
-                self.cross_chain_config.clone(),
-                self.notification_config.clone(),
+                &self.cross_chain_config,
+                &self.notification_config,
                 shutdown_signal.clone(),
                 &mut join_set,
             );
@@ -180,12 +220,7 @@ impl ServerContext {
         join_set
     }
 
-    #[cfg(with_metrics)]
-    fn start_metrics(host: &str, port: u16, shutdown_signal: CancellationToken) {
-        prometheus_server::start_metrics((host.to_owned(), port), shutdown_signal);
-    }
-
-    fn get_listen_address(&self) -> String {
+    fn get_listen_address() -> String {
         // Allow local IP address to be different from the public one.
         "0.0.0.0".to_string()
     }
@@ -200,9 +235,20 @@ impl Runnable for ServerContext {
         S: Storage + Clone + Send + Sync + 'static,
     {
         let shutdown_notifier = CancellationToken::new();
-        let listen_address = self.get_listen_address();
+        let listen_address = Self::get_listen_address();
 
         tokio::spawn(listen_for_shutdown_signals(shutdown_notifier.clone()));
+
+        // Activate memory profiling once before per-shard start_metrics calls.
+        #[cfg(with_metrics)]
+        let enable_memory_profiling = {
+            let memory_profiling =
+                monitoring_server::MemoryProfiling::try_activate(self.enable_memory_profiling)
+                    .await;
+            memory_profiling == monitoring_server::MemoryProfiling::Enabled
+        };
+        #[cfg(not(with_metrics))]
+        let enable_memory_profiling = false;
 
         // Run the server
         let states = match self.shard {
@@ -220,11 +266,20 @@ impl Runnable for ServerContext {
         };
 
         let mut join_set = match self.server_config.internal_network.protocol {
-            NetworkProtocol::Simple(protocol) => {
-                self.spawn_simple(&listen_address, states, protocol, shutdown_notifier)
-            }
+            NetworkProtocol::Simple(protocol) => self.spawn_simple(
+                &listen_address,
+                states,
+                protocol,
+                &shutdown_notifier,
+                enable_memory_profiling,
+            ),
             NetworkProtocol::Grpc(tls_config) => match tls_config {
-                TlsConfig::ClearText => self.spawn_grpc(&listen_address, states, shutdown_notifier),
+                TlsConfig::ClearText => self.spawn_grpc(
+                    &listen_address,
+                    states,
+                    &shutdown_notifier,
+                    enable_memory_profiling,
+                ),
                 TlsConfig::Tls => bail!("TLS not supported between proxy and shards."),
             },
         };
@@ -238,7 +293,7 @@ impl Runnable for ServerContext {
 #[derive(clap::Parser)]
 #[command(
     name = "linera-server",
-    about = "A byzantine fault tolerant payments sidechain with low-latency finality and high throughput",
+    about = "Server implementation (aka validator shard) for the Linera blockchain",
     version = linera_version::VersionInfo::default_clap_str(),
 )]
 struct ServerOptions {
@@ -253,6 +308,37 @@ struct ServerOptions {
     /// The number of Tokio blocking threads to use.
     #[arg(long, env = "LINERA_SERVER_TOKIO_BLOCKING_THREADS")]
     tokio_blocking_threads: Option<usize>,
+
+    /// Size of the block cache (default: 5000)
+    #[arg(long, env = "LINERA_BLOCK_CACHE_SIZE", default_value = "5000")]
+    block_cache_size: usize,
+
+    /// Size of the execution state cache (default: 10000)
+    #[arg(
+        long,
+        env = "LINERA_EXECUTION_STATE_CACHE_SIZE",
+        default_value = "10000"
+    )]
+    execution_state_cache_size: usize,
+
+    /// Enable jemalloc memory profiling endpoints on the metrics server.
+    #[cfg(feature = "jemalloc")]
+    #[arg(long, env = "LINERA_ENABLE_MEMORY_PROFILING")]
+    enable_memory_profiling: bool,
+}
+
+impl ServerOptions {
+    #[cfg(with_metrics)]
+    fn enable_memory_profiling(&self) -> bool {
+        #[cfg(feature = "jemalloc")]
+        {
+            self.enable_memory_profiling
+        }
+        #[cfg(not(feature = "jemalloc"))]
+        {
+            false
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize)]
@@ -270,15 +356,6 @@ struct ValidatorOptions {
     #[serde(default)]
     block_exporters: Vec<ExporterServiceConfig>,
 
-    /// The port for the metrics endpoint
-    metrics_port: u16,
-
-    /// The host of the proxy in the internal network.
-    internal_host: String,
-
-    /// The port of the proxy on the internal network.
-    internal_port: u16,
-
     /// The network protocol for the frontend.
     external_protocol: NetworkProtocol,
 
@@ -287,6 +364,9 @@ struct ValidatorOptions {
 
     /// The public name and the port of each of the shards
     shards: Vec<ShardConfig>,
+
+    /// The name and the port of the proxies
+    proxies: Vec<ProxyConfig>,
 }
 
 fn make_server_config<R: CryptoRng>(
@@ -306,10 +386,8 @@ fn make_server_config<R: CryptoRng>(
         public_key,
         protocol: options.internal_protocol,
         shards: options.shards,
-        host: options.internal_host,
-        port: options.internal_port,
         block_exporters: options.block_exporters,
-        metrics_port: options.metrics_port,
+        proxies: options.proxies,
     };
     let validator = ValidatorConfig {
         network,
@@ -337,7 +415,11 @@ enum ServerCommand {
 
         /// Storage configuration for the blockchain history, chain states and binary blobs.
         #[arg(long = "storage")]
-        storage_config: StorageConfigNamespace,
+        storage_config: StorageConfig,
+
+        /// Common storage options.
+        #[command(flatten)]
+        common_storage_options: Box<CommonStorageOptions>,
 
         /// Configuration for cross-chain requests
         #[command(flatten)]
@@ -347,46 +429,61 @@ enum ServerCommand {
         #[command(flatten)]
         notification_config: NotificationConfig,
 
-        /// Path to the file describing the initial user chains (aka genesis state)
-        #[arg(long = "genesis")]
-        genesis_config_path: PathBuf,
-
         /// Runs a specific shard (from 0 to shards-1)
         #[arg(long)]
         shard: Option<usize>,
 
         /// Blocks with a timestamp this far in the future will still be accepted, but the validator
         /// will wait until that timestamp before voting.
-        #[arg(long = "grace-period-ms", default_value = "500", value_parser = util::parse_millis)]
-        grace_period: Duration,
+        #[arg(long = "block-time-grace-period-ms", default_value = "500", value_parser = util::parse_millis)]
+        block_time_grace_period: Duration,
 
         /// The WebAssembly runtime to use.
         #[arg(long)]
         wasm_runtime: Option<WasmRuntime>,
 
-        /// The maximal number of chains loaded in memory at a given time.
-        #[arg(long, default_value = "400")]
-        max_loaded_chains: NonZeroUsize,
+        /// The duration in milliseconds after which an idle chain worker will free its memory.
+        /// Use 0 to disable expiry.
+        #[arg(
+            long = "chain-worker-ttl-ms",
+            default_value = "30000",
+            value_parser = util::parse_millis
+        )]
+        chain_worker_ttl: Duration,
 
-        /// The maximal number of simultaneous queries to the database
+        /// Maximum size for received_log entries in chain info responses. This should
+        /// generally only be increased from the default value.
+        #[arg(
+            long,
+            default_value_t = CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES,
+            env = "LINERA_SERVER_CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES",
+        )]
+        chain_info_max_received_log_entries: usize,
+
+        /// Maximum estimated serialized size (in bytes) of bundles in a single
+        /// cross-chain `UpdateRecipient` message. Larger sets of bundles are split
+        /// into multiple messages.
+        #[arg(
+            long,
+            default_value_t = grpc::GRPC_CHUNKED_MESSAGE_FILL_LIMIT,
+        )]
+        cross_chain_message_chunk_limit: usize,
+
+        /// Enable the RevertConfirm recovery mechanism for inbox gaps caused by
+        /// lost persisted state.
+        #[arg(long, default_value_t = false)]
+        allow_revert_confirm: bool,
+
+        /// On IncorrectOutcome errors, reset the chain state and re-execute all
+        /// blocks from scratch. Sends RevertConfirm to all known senders. The
+        /// value is the minimum number of minutes since the last reset before
+        /// another reset is allowed (to prevent loops).
         #[arg(long)]
-        max_concurrent_queries: Option<usize>,
+        reset_on_incorrect_outcome_mins: Option<u64>,
 
-        /// The maximal number of stream queries to the database
-        #[arg(long, default_value = "10")]
-        max_stream_queries: usize,
-
-        /// The maximal memory used in the storage cache.
-        #[arg(long, default_value = "10000000")]
-        max_cache_size: usize,
-
-        /// The maximal size of an entry in the storage cache.
-        #[arg(long, default_value = "1000000")]
-        max_entry_size: usize,
-
-        /// The maximal number of entries in the storage cache.
-        #[arg(long, default_value = "1000")]
-        max_cache_entries: usize,
+        /// OpenTelemetry OTLP exporter endpoint (requires opentelemetry feature).
+        #[arg(long, env = "LINERA_OTLP_EXPORTER_ENDPOINT")]
+        otlp_exporter_endpoint: Option<String>,
     },
 
     /// Act as a trusted third-party and generate all server configurations
@@ -404,38 +501,6 @@ enum ServerCommand {
         /// TESTING ONLY.
         #[arg(long)]
         testing_prng_seed: Option<u64>,
-    },
-
-    /// Initialize the database
-    #[command(name = "initialize")]
-    Initialize {
-        /// Storage configuration for the blockchain history, chain states and binary blobs.
-        #[arg(long = "storage")]
-        storage_config: StorageConfigNamespace,
-
-        /// Path to the file describing the initial user chains (aka genesis state)
-        #[arg(long = "genesis")]
-        genesis_config_path: PathBuf,
-
-        /// The maximal number of simultaneous queries to the database
-        #[arg(long)]
-        max_concurrent_queries: Option<usize>,
-
-        /// The maximal number of stream queries to the database
-        #[arg(long, default_value = "10")]
-        max_stream_queries: usize,
-
-        /// The maximal memory used in the storage cache.
-        #[arg(long, default_value = "10000000")]
-        max_cache_size: usize,
-
-        /// The maximal size of an entry in the storage cache.
-        #[arg(long, default_value = "1000000")]
-        max_entry_size: usize,
-
-        /// The maximal number of entries in the storage cache.
-        #[arg(long, default_value = "1000")]
-        max_cache_entries: usize,
     },
 
     /// Replaces the configurations of the shards by following the given template.
@@ -471,8 +536,6 @@ enum ServerCommand {
 fn main() {
     let options = <ServerOptions as clap::Parser>::parse();
 
-    linera_base::tracing::init(&log_file_name_for(&options.command));
-
     let mut runtime = if options.tokio_threads == Some(1) {
         tokio::runtime::Builder::new_current_thread()
     } else {
@@ -497,6 +560,16 @@ fn main() {
 }
 
 /// Returns the log file name to use based on the [`ServerCommand`] that will run.
+fn otlp_exporter_endpoint_for(command: &ServerCommand) -> Option<&str> {
+    match command {
+        ServerCommand::Run {
+            otlp_exporter_endpoint,
+            ..
+        } => otlp_exporter_endpoint.as_deref(),
+        ServerCommand::Generate { .. } | ServerCommand::EditShards { .. } => None,
+    }
+}
+
 fn log_file_name_for(command: &ServerCommand) -> Cow<'static, str> {
     match command {
         ServerCommand::Run {
@@ -515,34 +588,37 @@ fn log_file_name_for(command: &ServerCommand) -> Cow<'static, str> {
             }
             .into()
         }
-        ServerCommand::Generate { .. }
-        | ServerCommand::Initialize { .. }
-        | ServerCommand::EditShards { .. } => "server".into(),
+        ServerCommand::Generate { .. } | ServerCommand::EditShards { .. } => "server".into(),
     }
 }
 
 async fn run(options: ServerOptions) {
+    linera_service::tracing::opentelemetry::init(
+        &log_file_name_for(&options.command),
+        otlp_exporter_endpoint_for(&options.command),
+    );
+
+    #[cfg(with_metrics)]
+    let enable_memory_profiling = options.enable_memory_profiling();
     match options.command {
         ServerCommand::Run {
             server_config_path,
             storage_config,
+            common_storage_options,
             cross_chain_config,
             notification_config,
-            genesis_config_path,
             shard,
-            grace_period,
+            block_time_grace_period,
             wasm_runtime,
-            max_loaded_chains,
-            max_concurrent_queries,
-            max_stream_queries,
-            max_cache_size,
-            max_entry_size,
-            max_cache_entries,
+            chain_worker_ttl,
+            chain_info_max_received_log_entries,
+            cross_chain_message_chunk_limit,
+            allow_revert_confirm,
+            reset_on_incorrect_outcome_mins,
+            otlp_exporter_endpoint: _,
         } => {
             linera_version::VERSION_INFO.log();
 
-            let genesis_config: GenesisConfig =
-                util::read_json(&genesis_config_path).expect("Failed to read initial chain config");
             let server_config: ValidatorServerConfig =
                 util::read_json(&server_config_path).expect("Failed to read server config");
 
@@ -551,26 +627,26 @@ async fn run(options: ServerOptions) {
                 cross_chain_config,
                 notification_config,
                 shard,
-                grace_period,
-                max_loaded_chains,
+                block_time_grace_period,
+                chain_worker_ttl,
+                block_cache_size: options.block_cache_size,
+                execution_state_cache_size: options.execution_state_cache_size,
+                chain_info_max_received_log_entries,
+                cross_chain_message_chunk_limit,
+                allow_revert_confirm,
+                reset_on_incorrect_outcome_mins,
+                #[cfg(with_metrics)]
+                enable_memory_profiling,
             };
             let wasm_runtime = wasm_runtime.with_wasm_default();
-            let storage_cache_config = StorageCacheConfig {
-                max_cache_size,
-                max_entry_size,
-                max_cache_entries,
-            };
-            let common_config = CommonStoreConfig {
-                max_concurrent_queries,
-                max_stream_queries,
-                storage_cache_config,
-            };
             let store_config = storage_config
-                .add_common_config(common_config)
-                .await
+                .add_common_storage_options(&common_storage_options)
                 .unwrap();
+            // Validators should not output contract logs.
+            let allow_application_logs = false;
+            let cache_sizes = common_storage_options.storage_cache_config();
             store_config
-                .run_with_storage(&genesis_config, wasm_runtime, job)
+                .run_with_storage(wasm_runtime, allow_application_logs, cache_sizes, job)
                 .boxed()
                 .await
                 .unwrap()
@@ -589,7 +665,9 @@ async fn run(options: ServerOptions) {
                     .await
                     .expect("Unable to read validator options file");
                 let options: ValidatorOptions =
-                    toml::from_str(&options_string).expect("Invalid options file format");
+                    toml::from_str(&options_string).unwrap_or_else(|_| {
+                        panic!("Invalid options file format: \n {}", options_string)
+                    });
                 let path = options.server_config_path.clone();
                 let mut server = make_server_config(&path, &mut rng, options)
                     .expect("Unable to open server config file");
@@ -618,38 +696,6 @@ async fn run(options: ServerOptions) {
             }
         }
 
-        ServerCommand::Initialize {
-            storage_config,
-            genesis_config_path,
-            max_concurrent_queries,
-            max_stream_queries,
-            max_cache_size,
-            max_entry_size,
-            max_cache_entries,
-        } => {
-            let genesis_config: GenesisConfig =
-                util::read_json(&genesis_config_path).expect("Failed to read initial chain config");
-            let storage_cache_config = StorageCacheConfig {
-                max_cache_size,
-                max_entry_size,
-                max_cache_entries,
-            };
-            let common_config = CommonStoreConfig {
-                max_concurrent_queries,
-                max_stream_queries,
-                storage_cache_config,
-            };
-            let store_config = storage_config
-                .add_common_config(common_config)
-                .await
-                .unwrap();
-            tracing::info!(
-                "server::ServerCommand::Initialize, storage_config={:?}",
-                storage_config
-            );
-            store_config.initialize(&genesis_config).await.unwrap();
-        }
-
         ServerCommand::EditShards {
             server_config_path,
             num_shards,
@@ -660,7 +706,7 @@ async fn run(options: ServerOptions) {
             let mut server_config =
                 persistent::File::<ValidatorServerConfig>::read(&server_config_path)
                     .expect("Failed to read server config");
-            let shards = generate_shard_configs(num_shards, host, port, metrics_port)
+            let shards = generate_shard_configs(&num_shards, &host, &port, &metrics_port)
                 .expect("Failed to generate shard configs");
             server_config.internal_network.shards = shards;
             Persist::persist(&mut server_config)
@@ -671,10 +717,10 @@ async fn run(options: ServerOptions) {
 }
 
 fn generate_shard_configs(
-    num_shards: String,
-    host: String,
-    port: String,
-    metrics_port: Option<String>,
+    num_shards: &str,
+    host: &str,
+    port: &str,
+    metrics_port: &Option<String>,
 ) -> anyhow::Result<Vec<ShardConfig>> {
     let mut shards = Vec::new();
     let len = num_shards.len();
@@ -720,11 +766,14 @@ mod test {
             server_config_path = "server.json"
             host = "host"
             port = 9000
-            internal_host = "internal_host"
-            internal_port = 10000
-            metrics_port = 5000
             external_protocol = { Simple = "Tcp" }
             internal_protocol = { Simple = "Udp" }
+
+            [[proxies]]
+            host = "proxy"
+            public_port = 20100
+            private_port = 20200
+            metrics_port = 21100
 
             [[shards]]
             host = "host1"
@@ -749,13 +798,16 @@ mod test {
                 internal_protocol: NetworkProtocol::Simple(TransportProtocol::Udp),
                 host: "host".into(),
                 port: 9000,
+                proxies: vec![ProxyConfig {
+                    host: "proxy".into(),
+                    public_port: 20100,
+                    private_port: 20200,
+                    metrics_port: 21100,
+                }],
                 block_exporters: vec![ExporterServiceConfig {
                     host: "exporter".into(),
                     port: 12000
                 }],
-                internal_host: "internal_host".into(),
-                internal_port: 10000,
-                metrics_port: 5000,
                 shards: vec![
                     ShardConfig {
                         host: "host1".into(),
@@ -775,13 +827,7 @@ mod test {
     #[test]
     fn test_generate_shard_configs() {
         assert_eq!(
-            generate_shard_configs(
-                "02".into(),
-                "host%%".into(),
-                "10%%".into(),
-                Some("11%%".into())
-            )
-            .unwrap(),
+            generate_shard_configs("02", "host%%", "10%%", &Some("11%%".into())).unwrap(),
             vec![
                 ShardConfig {
                     host: "host01".into(),
@@ -796,12 +842,6 @@ mod test {
             ],
         );
 
-        assert!(generate_shard_configs(
-            "2".into(),
-            "host%%".into(),
-            "10%%".into(),
-            Some("11%%".into())
-        )
-        .is_err());
+        assert!(generate_shard_configs("2", "host%%", "10%%", &Some("11%%".into())).is_err());
     }
 }

@@ -6,6 +6,9 @@
 //! - the block processing (indexer.rs)
 //! - the generic plugin trait (plugin.rs)
 //! - the runner struct (runner.rs)
+//! - the gRPC server implementation (grpc_server.rs)
+
+#![recursion_limit = "256"]
 
 pub mod common;
 pub mod indexer;
@@ -17,3 +20,11 @@ pub mod service;
 pub mod rocks_db;
 #[cfg(feature = "scylladb")]
 pub mod scylla_db;
+
+pub mod db;
+pub mod grpc;
+
+// Generated protobuf types
+pub mod indexer_api {
+    tonic::include_proto!("indexer.linera_indexer");
+}

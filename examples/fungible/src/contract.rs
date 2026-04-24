@@ -3,20 +3,15 @@
 
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
-mod state;
-
-use std::str::FromStr;
-
 use fungible::{
-    Account, FungibleResponse, FungibleTokenAbi, InitialState, Message, Operation, Parameters,
+    state::FungibleTokenState, FungibleOperation, FungibleResponse, FungibleTokenAbi, InitialState,
+    Message, Parameters,
 };
 use linera_sdk::{
-    linera_base_types::{AccountOwner, Amount, WithContractAbi},
+    linera_base_types::{Account, AccountOwner, Amount, WithContractAbi},
     views::{RootView, View},
     Contract, ContractRuntime,
 };
-
-use self::state::FungibleTokenState;
 
 pub struct FungibleTokenContract {
     state: FungibleTokenState,
@@ -42,34 +37,45 @@ impl Contract for FungibleTokenContract {
         FungibleTokenContract { state, runtime }
     }
 
-    async fn instantiate(&mut self, mut state: Self::InstantiationArgument) {
+    async fn instantiate(&mut self, state: Self::InstantiationArgument) {
         // Validate that the application parameters were configured correctly.
-        let _ = self.runtime.application_parameters();
+        self.runtime.application_parameters();
 
-        // If initial accounts are empty, creator gets 1M tokens to act like a faucet.
-        if state.accounts.is_empty() {
-            if let Some(owner) = self.runtime.authenticated_signer() {
-                state
-                    .accounts
-                    .insert(owner, Amount::from_str("1000000").unwrap());
-            }
+        let mut total_supply = Amount::ZERO;
+        for value in state.accounts.values() {
+            total_supply.saturating_add_assign(*value);
+        }
+        if total_supply == Amount::ZERO {
+            panic!("The total supply is zero, therefore we cannot instantiate the contract");
         }
         self.state.initialize_accounts(state).await;
     }
 
     async fn execute_operation(&mut self, operation: Self::Operation) -> Self::Response {
         match operation {
-            Operation::Balance { owner } => {
+            FungibleOperation::Balance { owner } => {
                 let balance = self.state.balance_or_default(&owner).await;
                 FungibleResponse::Balance(balance)
             }
 
-            Operation::TickerSymbol => {
+            FungibleOperation::TickerSymbol => {
                 let params = self.runtime.application_parameters();
                 FungibleResponse::TickerSymbol(params.ticker_symbol)
             }
 
-            Operation::Transfer {
+            FungibleOperation::Approve {
+                owner,
+                spender,
+                allowance,
+            } => {
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for Transfer operation");
+                self.state.approve(owner, spender, allowance).await;
+                FungibleResponse::Ok
+            }
+
+            FungibleOperation::Transfer {
                 owner,
                 amount,
                 target_account,
@@ -83,7 +89,24 @@ impl Contract for FungibleTokenContract {
                 FungibleResponse::Ok
             }
 
-            Operation::Claim {
+            FungibleOperation::TransferFrom {
+                owner,
+                spender,
+                amount,
+                target_account,
+            } => {
+                self.runtime
+                    .check_account_permission(spender)
+                    .expect("Permission for Transfer operation");
+                self.state
+                    .debit_for_transfer_from(owner, spender, amount)
+                    .await;
+                self.finish_transfer_to_account(amount, target_account, owner)
+                    .await;
+                FungibleResponse::Ok
+            }
+
+            FungibleOperation::Claim {
                 source_account,
                 amount,
                 target_account,
@@ -126,8 +149,11 @@ impl Contract for FungibleTokenContract {
         }
     }
 
-    async fn store(mut self) {
-        self.state.save().await.expect("Failed to save state");
+    async fn store(self) {
+        self.state
+            .save_and_drop()
+            .await
+            .expect("Failed to save state");
     }
 }
 

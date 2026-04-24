@@ -1,7 +1,7 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Implements [`crate::store::KeyValueStore`] in memory.
+//! Implements [`crate::store::KeyValueDatabase`] in memory.
 
 use std::{
     collections::BTreeMap,
@@ -12,59 +12,58 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(with_testing)]
-use crate::random::generate_test_namespace;
-#[cfg(with_testing)]
-use crate::store::TestKeyValueStore;
+use crate::store::TestKeyValueDatabase;
 use crate::{
     batch::{Batch, WriteOperation},
-    common::get_interval,
+    common::get_key_range_for_prefix,
     store::{
-        AdminKeyValueStore, CommonStoreInternalConfig, KeyValueStoreError, ReadableKeyValueStore,
-        WithError, WritableKeyValueStore,
+        KeyValueDatabase, KeyValueStoreError, ReadableKeyValueStore, WithError,
+        WritableKeyValueStore,
     },
 };
 
 /// The initial configuration of the system
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MemoryStoreConfig {
-    /// The common configuration of the key value store
-    pub common_config: CommonStoreInternalConfig,
-}
-
-impl MemoryStoreConfig {
-    /// Creates a `MemoryStoreConfig`. `max_concurrent_queries` and `cache_size` are not used.
-    pub fn new(max_stream_queries: usize) -> Self {
-        let common_config = CommonStoreInternalConfig {
-            max_concurrent_queries: None,
-            max_stream_queries,
-        };
-        Self { common_config }
-    }
+    /// Preferred buffer size for async streams.
+    pub max_stream_queries: usize,
+    /// Whether a namespace should be immediately cleaned up from memory when the
+    /// connection object is dropped.
+    pub kill_on_drop: bool,
 }
 
 /// The number of streams for the test
-pub const TEST_MEMORY_MAX_STREAM_QUERIES: usize = 10;
+#[cfg(with_testing)]
+const TEST_MEMORY_MAX_STREAM_QUERIES: usize = 10;
 
-/// The data is serialized in memory just like for RocksDB / DynamoDB
-/// The analog of the database is the `BTreeMap`
+/// The values in a partition.
 type MemoryStoreMap = BTreeMap<Vec<u8>, Vec<u8>>;
 
 /// The container for the `MemoryStoreMap`s by namespace and then root key
 #[derive(Default)]
-struct MemoryStores {
-    stores: BTreeMap<String, BTreeMap<Vec<u8>, Arc<RwLock<MemoryStoreMap>>>>,
+struct MemoryDatabases {
+    databases: BTreeMap<String, BTreeMap<Vec<u8>, Arc<RwLock<MemoryStoreMap>>>>,
 }
 
-impl MemoryStores {
-    fn sync_connect(
+/// A connection to a namespace of key-values in memory.
+#[derive(Clone, Debug)]
+pub struct MemoryDatabase {
+    /// The current namespace.
+    namespace: String,
+    /// The maximum number of queries used for a stream.
+    max_stream_queries: usize,
+    /// Whether to remove the namespace on drop.
+    kill_on_drop: bool,
+}
+
+impl MemoryDatabases {
+    fn sync_open(
         &mut self,
-        config: &MemoryStoreConfig,
         namespace: &str,
+        max_stream_queries: usize,
         root_key: &[u8],
-        kill_on_drop: bool,
     ) -> Result<MemoryStore, MemoryStoreError> {
-        let max_stream_queries = config.common_config.max_stream_queries;
-        let Some(stores) = self.stores.get_mut(namespace) else {
+        let Some(stores) = self.databases.get_mut(namespace) else {
             return Err(MemoryStoreError::NamespaceNotFound);
         };
         let store = stores.entry(root_key.to_vec()).or_insert_with(|| {
@@ -72,70 +71,55 @@ impl MemoryStores {
             Arc::new(RwLock::new(map))
         });
         let map = store.clone();
-        let namespace = namespace.to_string();
-        let root_key = root_key.to_vec();
         Ok(MemoryStore {
             map,
+            root_key: root_key.to_vec(),
             max_stream_queries,
-            namespace,
-            root_key,
-            kill_on_drop,
         })
     }
 
     fn sync_list_all(&self) -> Vec<String> {
-        self.stores.keys().cloned().collect::<Vec<_>>()
+        self.databases.keys().cloned().collect::<Vec<_>>()
     }
 
     fn sync_list_root_keys(&self, namespace: &str) -> Vec<Vec<u8>> {
-        match self.stores.get(namespace) {
+        match self.databases.get(namespace) {
             None => Vec::new(),
             Some(map) => map.keys().cloned().collect::<Vec<_>>(),
         }
     }
 
     fn sync_exists(&self, namespace: &str) -> bool {
-        self.stores.contains_key(namespace)
+        self.databases.contains_key(namespace)
     }
 
     fn sync_create(&mut self, namespace: &str) {
-        self.stores.insert(namespace.to_string(), BTreeMap::new());
+        self.databases
+            .insert(namespace.to_string(), BTreeMap::new());
     }
 
     fn sync_delete(&mut self, namespace: &str) {
-        self.stores.remove(namespace);
+        self.databases.remove(namespace);
     }
 }
 
-/// The global variables of the Namespace memory stores
-static MEMORY_STORES: LazyLock<Mutex<MemoryStores>> =
-    LazyLock::new(|| Mutex::new(MemoryStores::default()));
+/// The global table of namespaces.
+static MEMORY_DATABASES: LazyLock<Mutex<MemoryDatabases>> =
+    LazyLock::new(|| Mutex::new(MemoryDatabases::default()));
 
 /// A virtual DB client where data are persisted in memory.
 #[derive(Clone)]
 pub struct MemoryStore {
     /// The map used for storing the data.
     map: Arc<RwLock<MemoryStoreMap>>,
-    /// The maximum number of queries used for the stream.
-    max_stream_queries: usize,
-    /// The namespace of the store
-    namespace: String,
-    /// The root key of the store
+    /// The root key.
     root_key: Vec<u8>,
-    /// Whether to kill on drop or not the
-    kill_on_drop: bool,
+    /// The maximum number of queries used for a stream.
+    max_stream_queries: usize,
 }
 
-impl Drop for MemoryStore {
-    fn drop(&mut self) {
-        if self.kill_on_drop {
-            let mut memory_stores = MEMORY_STORES
-                .lock()
-                .expect("MEMORY_STORES lock should not be poisoned");
-            let stores = memory_stores.stores.get_mut(&self.namespace).unwrap();
-            stores.remove(&self.root_key);
-        }
-    }
+impl WithError for MemoryDatabase {
+    type Error = MemoryStoreError;
 }
 
 impl WithError for MemoryStore {
@@ -144,11 +128,13 @@ impl WithError for MemoryStore {
 
 impl ReadableKeyValueStore for MemoryStore {
     const MAX_KEY_SIZE: usize = usize::MAX;
-    type Keys = Vec<Vec<u8>>;
-    type KeyValues = Vec<(Vec<u8>, Vec<u8>)>;
 
     fn max_stream_queries(&self) -> usize {
         self.max_stream_queries
+    }
+
+    fn root_key(&self) -> Result<Vec<u8>, MemoryStoreError> {
+        Ok(self.root_key.clone())
     }
 
     async fn read_value_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MemoryStoreError> {
@@ -167,20 +153,20 @@ impl ReadableKeyValueStore for MemoryStore {
         Ok(map.contains_key(key))
     }
 
-    async fn contains_keys(&self, keys: Vec<Vec<u8>>) -> Result<Vec<bool>, MemoryStoreError> {
+    async fn contains_keys(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>, MemoryStoreError> {
         let map = self
             .map
             .read()
             .expect("MemoryStore lock should not be poisoned");
         Ok(keys
-            .into_iter()
-            .map(|key| map.contains_key(&key))
+            .iter()
+            .map(|key| map.contains_key(key))
             .collect::<Vec<_>>())
     }
 
     async fn read_multi_values_bytes(
         &self,
-        keys: Vec<Vec<u8>>,
+        keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, MemoryStoreError> {
         let map = self
             .map
@@ -188,7 +174,7 @@ impl ReadableKeyValueStore for MemoryStore {
             .expect("MemoryStore lock should not be poisoned");
         let mut result = Vec::new();
         for key in keys {
-            result.push(map.get(&key).cloned());
+            result.push(map.get(key).cloned());
         }
         Ok(result)
     }
@@ -203,7 +189,7 @@ impl ReadableKeyValueStore for MemoryStore {
             .expect("MemoryStore lock should not be poisoned");
         let mut values = Vec::new();
         let len = key_prefix.len();
-        for (key, _value) in map.range(get_interval(key_prefix.to_vec())) {
+        for (key, _value) in map.range(get_key_range_for_prefix(key_prefix.to_vec())) {
             values.push(key[len..].to_vec())
         }
         Ok(values)
@@ -219,7 +205,7 @@ impl ReadableKeyValueStore for MemoryStore {
             .expect("MemoryStore lock should not be poisoned");
         let mut key_values = Vec::new();
         let len = key_prefix.len();
-        for (key, value) in map.range(get_interval(key_prefix.to_vec())) {
+        for (key, value) in map.range(get_key_range_for_prefix(key_prefix.to_vec())) {
             let key_value = (key[len..].to_vec(), value.to_vec());
             key_values.push(key_value);
         }
@@ -245,7 +231,7 @@ impl WritableKeyValueStore for MemoryStore {
                 }
                 WriteOperation::DeletePrefix { key_prefix } => {
                     let key_list = map
-                        .range(get_interval(key_prefix))
+                        .range(get_key_range_for_prefix(key_prefix))
                         .map(|x| x.0.to_vec())
                         .collect::<Vec<_>>();
                     for key in key_list {
@@ -263,137 +249,111 @@ impl WritableKeyValueStore for MemoryStore {
 }
 
 impl MemoryStore {
-    /// Connects to a memory store. Creates it if it does not exist yet
-    fn sync_maybe_create_and_connect(
-        config: &MemoryStoreConfig,
-        namespace: &str,
-        kill_on_drop: bool,
-    ) -> Result<Self, MemoryStoreError> {
-        let mut memory_stores = MEMORY_STORES.lock().expect("lock should not be poisoned");
-        if !memory_stores.sync_exists(namespace) {
-            memory_stores.sync_create(namespace);
-        }
-        memory_stores.sync_connect(config, namespace, &[], kill_on_drop)
-    }
-
-    /// Creates a `MemoryStore` from a number of queries and a namespace.
-    pub fn new(max_stream_queries: usize, namespace: &str) -> Result<Self, MemoryStoreError> {
-        let common_config = CommonStoreInternalConfig {
-            max_concurrent_queries: None,
-            max_stream_queries,
-        };
-        let config = MemoryStoreConfig { common_config };
-        let kill_on_drop = false;
-        MemoryStore::sync_maybe_create_and_connect(&config, namespace, kill_on_drop)
-    }
-
-    /// Creates a `MemoryStore` from a number of queries and a namespace for testing.
+    /// Creates a `MemoryStore` that doesn't belong to any registered namespace.
     #[cfg(with_testing)]
-    pub fn new_for_testing(
-        max_stream_queries: usize,
-        namespace: &str,
-    ) -> Result<Self, MemoryStoreError> {
-        let common_config = CommonStoreInternalConfig {
-            max_concurrent_queries: None,
-            max_stream_queries,
-        };
-        let config = MemoryStoreConfig { common_config };
-        let kill_on_drop = true;
-        MemoryStore::sync_maybe_create_and_connect(&config, namespace, kill_on_drop)
+    pub fn new_for_testing() -> Self {
+        Self {
+            map: Arc::default(),
+            root_key: Vec::new(),
+            max_stream_queries: TEST_MEMORY_MAX_STREAM_QUERIES,
+        }
     }
 }
 
-impl AdminKeyValueStore for MemoryStore {
+impl Drop for MemoryDatabase {
+    fn drop(&mut self) {
+        if self.kill_on_drop {
+            let mut databases = MEMORY_DATABASES
+                .lock()
+                .expect("MEMORY_DATABASES lock should not be poisoned");
+            databases.databases.remove(&self.namespace);
+        }
+    }
+}
+
+impl KeyValueDatabase for MemoryDatabase {
     type Config = MemoryStoreConfig;
+
+    type Store = MemoryStore;
 
     fn get_name() -> String {
         "memory".to_string()
     }
 
     async fn connect(config: &Self::Config, namespace: &str) -> Result<Self, MemoryStoreError> {
-        let mut memory_stores = MEMORY_STORES
+        let databases = MEMORY_DATABASES
             .lock()
-            .expect("MEMORY_STORES lock should not be poisoned");
-        let kill_on_drop = false;
-        memory_stores.sync_connect(config, namespace, &[], kill_on_drop)
+            .expect("MEMORY_DATABASES lock should not be poisoned");
+        if !databases.sync_exists(namespace) {
+            return Err(MemoryStoreError::NamespaceNotFound);
+        };
+        Ok(MemoryDatabase {
+            namespace: namespace.to_string(),
+            max_stream_queries: config.max_stream_queries,
+            kill_on_drop: config.kill_on_drop,
+        })
     }
 
-    fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, MemoryStoreError> {
-        let max_stream_queries = self.max_stream_queries;
-        let common_config = CommonStoreInternalConfig {
-            max_concurrent_queries: None,
-            max_stream_queries,
-        };
-        let config = MemoryStoreConfig { common_config };
-        let mut memory_stores = MEMORY_STORES
+    fn open_shared(&self, root_key: &[u8]) -> Result<Self::Store, MemoryStoreError> {
+        let mut databases = MEMORY_DATABASES
             .lock()
-            .expect("MEMORY_STORES lock should not be poisoned");
-        let kill_on_drop = self.kill_on_drop;
-        let namespace = &self.namespace;
-        memory_stores.sync_connect(&config, namespace, root_key, kill_on_drop)
+            .expect("MEMORY_DATABASES lock should not be poisoned");
+        databases.sync_open(&self.namespace, self.max_stream_queries, root_key)
+    }
+
+    fn open_exclusive(&self, root_key: &[u8]) -> Result<Self::Store, MemoryStoreError> {
+        self.open_shared(root_key)
     }
 
     async fn list_all(_config: &Self::Config) -> Result<Vec<String>, MemoryStoreError> {
-        let memory_stores = MEMORY_STORES
+        let databases = MEMORY_DATABASES
             .lock()
-            .expect("MEMORY_STORES lock should not be poisoned");
-        Ok(memory_stores.sync_list_all())
+            .expect("MEMORY_DATABASES lock should not be poisoned");
+        Ok(databases.sync_list_all())
     }
 
-    async fn list_root_keys(
-        _config: &Self::Config,
-        namespace: &str,
-    ) -> Result<Vec<Vec<u8>>, MemoryStoreError> {
-        let memory_stores = MEMORY_STORES
+    async fn list_root_keys(&self) -> Result<Vec<Vec<u8>>, MemoryStoreError> {
+        let databases = MEMORY_DATABASES
             .lock()
-            .expect("MEMORY_STORES lock should not be poisoned");
-        Ok(memory_stores.sync_list_root_keys(namespace))
+            .expect("MEMORY_DATABASES lock should not be poisoned");
+        Ok(databases.sync_list_root_keys(&self.namespace))
     }
 
     async fn exists(_config: &Self::Config, namespace: &str) -> Result<bool, MemoryStoreError> {
-        let memory_stores = MEMORY_STORES
+        let databases = MEMORY_DATABASES
             .lock()
-            .expect("MEMORY_STORES lock should not be poisoned");
-        Ok(memory_stores.sync_exists(namespace))
+            .expect("MEMORY_DATABASES lock should not be poisoned");
+        Ok(databases.sync_exists(namespace))
     }
 
     async fn create(_config: &Self::Config, namespace: &str) -> Result<(), MemoryStoreError> {
-        let mut memory_stores = MEMORY_STORES
+        let mut databases = MEMORY_DATABASES
             .lock()
-            .expect("MEMORY_STORES lock should not be poisoned");
-        if memory_stores.sync_exists(namespace) {
+            .expect("MEMORY_DATABASES lock should not be poisoned");
+        if databases.sync_exists(namespace) {
             return Err(MemoryStoreError::StoreAlreadyExists);
         }
-        memory_stores.sync_create(namespace);
+        databases.sync_create(namespace);
         Ok(())
     }
 
     async fn delete(_config: &Self::Config, namespace: &str) -> Result<(), MemoryStoreError> {
-        let mut memory_stores = MEMORY_STORES
+        let mut databases = MEMORY_DATABASES
             .lock()
-            .expect("MEMORY_STORES lock should not be poisoned");
-        memory_stores.sync_delete(namespace);
+            .expect("MEMORY_DATABASES lock should not be poisoned");
+        databases.sync_delete(namespace);
         Ok(())
     }
 }
 
 #[cfg(with_testing)]
-impl TestKeyValueStore for MemoryStore {
+impl TestKeyValueDatabase for MemoryDatabase {
     async fn new_test_config() -> Result<MemoryStoreConfig, MemoryStoreError> {
-        let max_stream_queries = TEST_MEMORY_MAX_STREAM_QUERIES;
-        let common_config = CommonStoreInternalConfig {
-            max_concurrent_queries: None,
-            max_stream_queries,
-        };
-        Ok(MemoryStoreConfig { common_config })
+        Ok(MemoryStoreConfig {
+            max_stream_queries: TEST_MEMORY_MAX_STREAM_QUERIES,
+            kill_on_drop: false,
+        })
     }
-}
-
-/// Creates a test memory store for working.
-#[cfg(with_testing)]
-pub fn create_test_memory_store() -> MemoryStore {
-    let namespace = generate_test_namespace();
-    MemoryStore::new_for_testing(TEST_MEMORY_MAX_STREAM_QUERIES, &namespace).unwrap()
 }
 
 /// The error type for [`MemoryStore`].
@@ -406,10 +366,6 @@ pub enum MemoryStoreError {
     /// Serialization error with BCS.
     #[error(transparent)]
     BcsError(#[from] bcs::Error),
-
-    /// The value is too large for the `MemoryStore`
-    #[error("The value is too large for the MemoryStore")]
-    TooLargeValue,
 
     /// The namespace does not exist
     #[error("The namespace does not exist")]

@@ -12,10 +12,12 @@ use linera_base::crypto::CryptoHash;
 use reqwest::header::InvalidHeaderValue;
 use thiserror::Error;
 
+use crate::db::sqlite::SqliteError;
+
 #[derive(Error, Debug)]
 pub enum IndexerError {
     #[error(transparent)]
-    ViewError(#[from] linera_views::views::ViewError),
+    ViewError(#[from] linera_views::ViewError),
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
     #[error(transparent)]
@@ -28,26 +30,20 @@ pub enum IndexerError {
     IoError(#[from] std::io::Error),
     #[error(transparent)]
     ParserError(#[from] AddrParseError),
-    #[error(transparent)]
-    ServerError(#[from] hyper::Error),
     #[error("Null GraphQL data: {0:?}")]
     NullData(Option<Vec<graphql_client::Error>>),
     #[error("Block not found: {0:?}")]
     NotFound(Option<CryptoHash>),
     #[error("Unknown plugin: {0}")]
     UnknownPlugin(String),
-    #[error("Plugin not loaded: {0}")]
-    UnloadedPlugin(String),
     #[error(transparent)]
     ConversionError(linera_service_graphql_client::ConversionError),
-    #[error("Different plugins in command line and memory")]
-    WrongPlugins,
     #[error("Plugin is already registered")]
     PluginAlreadyRegistered,
-    #[error("Invalid certificate content: {0:?}")]
-    InvalidCertificateValue(CryptoHash),
-    #[error("Clone with root key error")]
-    CloneWithRootKeyError,
+    #[error("Open exclusive error")]
+    OpenExclusiveError,
+    #[error("Other error: {0}")]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 
     #[cfg(feature = "rocksdb")]
     #[error(transparent)]
@@ -55,6 +51,18 @@ pub enum IndexerError {
     #[cfg(feature = "scylladb")]
     #[error(transparent)]
     ScyllaDbError(#[from] Box<linera_views::scylla_db::ScyllaDbStoreError>),
+}
+
+impl From<SqliteError> for IndexerError {
+    fn from(error: SqliteError) -> Self {
+        Self::Other(Box::new(error).into())
+    }
+}
+
+impl From<crate::db::postgres::PostgresError> for IndexerError {
+    fn from(error: crate::db::postgres::PostgresError) -> Self {
+        Self::Other(Box::new(error).into())
+    }
 }
 
 impl From<async_tungstenite::tungstenite::Error> for IndexerError {

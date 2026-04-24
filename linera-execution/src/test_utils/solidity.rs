@@ -11,10 +11,11 @@ use std::{
 };
 
 use anyhow::Context;
+use revm_primitives::{Address, U256};
 use serde_json::Value;
 use tempfile::{tempdir, TempDir};
 
-use crate::LINERA_SOL;
+use crate::{LINERA_SOL, LINERA_TYPES_SOL};
 
 fn write_compilation_json(path: &Path, file_name: &str) -> anyhow::Result<()> {
     let mut source = File::create(path).unwrap();
@@ -62,58 +63,97 @@ fn get_bytecode_path(path: &Path, file_name: &str, contract_name: &str) -> anyho
     let json_data: serde_json::Value = serde_json::from_str(&contents)?;
     let contracts = json_data
         .get("contracts")
-        .with_context(|| format!("failed to get contracts in json_data={}", json_data))?;
+        .with_context(|| format!("failed to get contracts in json_data={json_data}"))?;
     let file_name_contract = contracts
         .get(file_name)
         .context("failed to get {file_name}")?;
     let test_data = file_name_contract
         .get(contract_name)
-        .context("failed to get contract_name={contract_name}")?;
-    let evm_data = test_data.get("evm").context("failed to get evm")?;
-    let bytecode = evm_data.get("bytecode").context("failed to get bytecode")?;
-    let object = bytecode.get("object").context("failed to get object")?;
+        .with_context(|| format!("failed to get contract_name={contract_name}"))?;
+    let evm_data = test_data
+        .get("evm")
+        .with_context(|| format!("failed to get evm in test_data={test_data}"))?;
+    let bytecode = evm_data
+        .get("bytecode")
+        .with_context(|| format!("failed to get bytecode in evm_data={evm_data}"))?;
+    let object = bytecode
+        .get("object")
+        .with_context(|| format!("failed to get object in bytecode={bytecode}"))?;
     let object = object.to_string();
     let object = object.trim_matches(|c| c == '"').to_string();
     Ok(hex::decode(&object)?)
 }
 
-pub fn get_bytecode(source_code: &str, contract_name: &str) -> anyhow::Result<Vec<u8>> {
+pub fn compile_solidity_contract(
+    source_code: &str,
+    file_name: &str,
+    contract_name: &str,
+    extra_sources: &[(&str, &str)],
+) -> anyhow::Result<Vec<u8>> {
     let dir = tempdir().unwrap();
     let path = dir.path();
-    if source_code.contains("linera.sol") {
-        // The source code seems to import linera.sol, so let us write it in the code
-        let file_name = "linera.sol";
-        let test_code_path = path.join(file_name);
-        let mut test_code_file = File::create(&test_code_path)?;
-        writeln!(test_code_file, "{}", LINERA_SOL)?;
+    for (extra_file_name, extra_source_code) in extra_sources {
+        let extra_code_path = path.join(extra_file_name);
+        let mut extra_code_file = File::create(&extra_code_path)?;
+        writeln!(extra_code_file, "{}", extra_source_code)?;
     }
-    let file_name = "test_code.sol";
+    if source_code.contains("Linera.sol") {
+        // The source code seems to import Linera.sol, so we import the relevant files.
+        for (file_name, literal_path) in [
+            ("Linera.sol", LINERA_SOL),
+            ("LineraTypes.sol", LINERA_TYPES_SOL),
+        ] {
+            let test_code_path = path.join(file_name);
+            let mut test_code_file = File::create(&test_code_path)?;
+            writeln!(test_code_file, "{}", literal_path)?;
+        }
+    }
+    if source_code.contains("@openzeppelin") {
+        let _output = Command::new("npm")
+            .args(["install", "@openzeppelin/contracts"])
+            .current_dir(path)
+            .output()?;
+        let _output = Command::new("mv")
+            .args(["node_modules/@openzeppelin", "@openzeppelin"])
+            .current_dir(path)
+            .output()?;
+    }
     let test_code_path = path.join(file_name);
     let mut test_code_file = File::create(&test_code_path)?;
     writeln!(test_code_file, "{}", source_code)?;
     get_bytecode_path(path, file_name, contract_name)
 }
 
+pub fn get_bytecode(source_code: &str, contract_name: &str) -> anyhow::Result<Vec<u8>> {
+    compile_solidity_contract(source_code, "test_code.sol", contract_name, &[])
+}
+
 pub fn load_solidity_example(path: &str) -> anyhow::Result<Vec<u8>> {
     let source_code = std::fs::read_to_string(path)?;
     let contract_name: &str = source_code
         .lines()
-        .filter_map(|line| line.trim_start().strip_prefix("contract "))
-        .next()
-        .ok_or(anyhow::anyhow!("Not matching"))?;
+        .find_map(|line| line.trim_start().strip_prefix("contract "))
+        .ok_or_else(|| anyhow::anyhow!("Not matching"))?;
     let contract_name: &str = contract_name
-        .strip_suffix(" {")
-        .ok_or(anyhow::anyhow!("Not matching"))?;
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No space found after the contract name"))?;
+    tracing::info!("load_solidity_example, contract_name={contract_name}");
     get_bytecode(&source_code, contract_name)
 }
 
-pub fn temporary_write_evm_module(module: Vec<u8>) -> anyhow::Result<(PathBuf, TempDir)> {
+pub fn load_solidity_example_by_name(path: &str, contract_name: &str) -> anyhow::Result<Vec<u8>> {
+    let source_code = std::fs::read_to_string(path)?;
+    get_bytecode(&source_code, contract_name)
+}
+
+pub fn temporary_write_evm_module(module: &[u8]) -> anyhow::Result<(PathBuf, TempDir)> {
     let dir = tempfile::tempdir()?;
     let path = dir.path();
     let app_file = "app.json";
     let app_path = path.join(app_file);
     {
-        std::fs::write(app_path.clone(), &module)?;
+        std::fs::write(app_path.clone(), module)?;
     }
     let evm_contract = app_path.to_path_buf();
     Ok((evm_contract, dir))
@@ -121,10 +161,10 @@ pub fn temporary_write_evm_module(module: Vec<u8>) -> anyhow::Result<(PathBuf, T
 
 pub fn get_evm_contract_path(path: &str) -> anyhow::Result<(PathBuf, TempDir)> {
     let module = load_solidity_example(path)?;
-    temporary_write_evm_module(module)
+    temporary_write_evm_module(&module)
 }
 
-pub fn value_to_vec_u8(value: Value) -> Vec<u8> {
+pub fn value_to_vec_u8(value: &Value) -> Vec<u8> {
     let mut vec: Vec<u8> = Vec::new();
     for val in value.as_array().unwrap() {
         let val = val.as_u64().unwrap();
@@ -134,9 +174,21 @@ pub fn value_to_vec_u8(value: Value) -> Vec<u8> {
     vec
 }
 
-pub fn read_evm_u64_entry(value: Value) -> u64 {
+pub fn read_evm_u64_entry(value: &Value) -> u64 {
     let vec = value_to_vec_u8(value);
     let mut arr = [0_u8; 8];
     arr.copy_from_slice(&vec[24..]);
     u64::from_be_bytes(arr)
+}
+
+pub fn read_evm_u256_entry(value: &Value) -> U256 {
+    let result = value_to_vec_u8(value);
+    U256::from_be_slice(&result)
+}
+
+pub fn read_evm_address_entry(value: &Value) -> Address {
+    let vec = value_to_vec_u8(value);
+    let mut arr = [0_u8; 20];
+    arr.copy_from_slice(&vec[12..]);
+    Address::from_slice(&arr)
 }

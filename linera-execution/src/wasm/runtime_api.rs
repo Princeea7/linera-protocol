@@ -4,18 +4,21 @@
 use std::{any::Any, collections::HashMap, marker::PhantomData};
 
 use linera_base::{
-    crypto::CryptoHash,
-    data_types::{Amount, ApplicationPermissions, BlockHeight, SendMessageRequest, Timestamp},
+    data_types::{
+        Amount, ApplicationDescription, ApplicationPermissions, BlockHeight, Bytecode,
+        SendMessageRequest, Timestamp,
+    },
     http,
-    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, StreamName},
-    ownership::{ChainOwnership, ChangeApplicationPermissionsError, CloseChainError},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId, StreamName},
+    ownership::{ChainOwnership, ManageChainError},
+    vm::VmRuntime,
 };
 use linera_views::batch::{Batch, WriteOperation};
 use linera_witty::{wit_export, Instance, RuntimeError};
 use tracing::log;
 
 use super::WasmExecutionError;
-use crate::{BaseRuntime, ContractRuntime, ExecutionError, ModuleId, ServiceRuntime};
+use crate::{BaseRuntime, ContractRuntime, DataBlobHash, ExecutionError, ModuleId, ServiceRuntime};
 
 /// Common host data used as the `UserData` of the system API implementations.
 pub struct RuntimeApiData<Runtime> {
@@ -41,7 +44,7 @@ impl<Runtime> RuntimeApiData<Runtime> {
 
     /// Registers a `promise` internally, returning an ID that is unique for the lifetime of this
     /// [`RuntimeApiData`].
-    fn register_promise<Promise>(&mut self, promise: Promise) -> Result<u32, RuntimeError>
+    fn register_promise<Promise>(&mut self, promise: Promise) -> u32
     where
         Promise: Send + Sync + 'static,
     {
@@ -50,7 +53,7 @@ impl<Runtime> RuntimeApiData<Runtime> {
         self.active_promises.insert(id, Box::new(promise));
         self.promise_counter += 1;
 
-        Ok(id)
+        id
     }
 
     /// Returns a `Promise` registered to the provided `promise_id`.
@@ -117,6 +120,18 @@ where
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
+    /// Returns the description of the given application.
+    fn read_application_description(
+        caller: &mut Caller,
+        application_id: ApplicationId,
+    ) -> Result<ApplicationDescription, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .read_application_description(application_id)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
     /// Returns the application parameters provided when the application was created.
     fn application_parameters(caller: &mut Caller) -> Result<Vec<u8>, RuntimeError> {
         caller
@@ -132,6 +147,17 @@ where
             .user_data_mut()
             .runtime
             .chain_ownership()
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Retrieves the application permissions for the current chain.
+    fn get_application_permissions(
+        caller: &mut Caller,
+    ) -> Result<ApplicationPermissions, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .application_permissions()
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
@@ -185,6 +211,30 @@ where
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
+    /// Returns the allowance for a given owner-spender pair.
+    fn read_allowance(
+        caller: &mut Caller,
+        owner: AccountOwner,
+        spender: AccountOwner,
+    ) -> Result<Amount, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .read_allowance(owner, spender)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Returns all allowances on this chain.
+    fn read_allowances(
+        caller: &mut Caller,
+    ) -> Result<Vec<(AccountOwner, AccountOwner, Amount)>, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .read_allowances()
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
     /// Makes an HTTP request to the given URL and returns the response body.
     fn perform_http_request(
         caller: &mut Caller,
@@ -209,25 +259,49 @@ where
     }
 
     /// Reads a data blob from storage.
-    fn read_data_blob(caller: &mut Caller, hash: CryptoHash) -> Result<Vec<u8>, RuntimeError> {
+    fn read_data_blob(caller: &mut Caller, hash: DataBlobHash) -> Result<Vec<u8>, RuntimeError> {
         caller
             .user_data_mut()
             .runtime
-            .read_data_blob(&hash)
+            .read_data_blob(hash)
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
     /// Asserts the existence of a data blob with the given hash.
-    fn assert_data_blob_exists(caller: &mut Caller, hash: CryptoHash) -> Result<(), RuntimeError> {
+    fn assert_data_blob_exists(
+        caller: &mut Caller,
+        hash: DataBlobHash,
+    ) -> Result<(), RuntimeError> {
         caller
             .user_data_mut()
             .runtime
-            .assert_data_blob_exists(&hash)
+            .assert_data_blob_exists(hash)
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
     /// Logs a `message` with the provided information `level`.
-    fn log(_caller: &mut Caller, message: String, level: log::Level) -> Result<(), RuntimeError> {
+    #[allow(clippy::needless_pass_by_value)]
+    fn log(caller: &mut Caller, message: String, level: log::Level) -> Result<(), RuntimeError> {
+        let allowed = caller
+            .user_data_mut()
+            .runtime
+            .allow_application_logs()
+            .map_err(|error| RuntimeError::Custom(error.into()))?;
+
+        if !allowed {
+            return Ok(());
+        }
+
+        #[cfg(web)]
+        {
+            // Send log through the execution channel to the main thread
+            caller
+                .user_data_mut()
+                .runtime
+                .send_log(message.clone(), level);
+        }
+
+        // Also use tracing for native builds (and as a fallback on web)
         match level {
             log::Level::Trace => tracing::trace!("{message}"),
             log::Level::Debug => tracing::debug!("{message}"),
@@ -246,7 +320,7 @@ where
             .contains_key_new(key)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to check if the `key` is in storage.
@@ -267,7 +341,7 @@ where
             .contains_keys_new(keys)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to check if the `keys` are in storage.
@@ -291,7 +365,7 @@ where
             .read_multi_values_bytes_new(keys)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to read multiple entries from storage.
@@ -315,7 +389,7 @@ where
             .read_value_bytes_new(key)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to read a single entry from storage.
@@ -339,7 +413,7 @@ where
             .find_keys_by_prefix_new(key_prefix)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to search for keys that start with the `key_prefix`.
@@ -360,7 +434,7 @@ where
             .find_key_values_by_prefix_new(key_prefix)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to search for entries whose keys that start with the `key_prefix`.
@@ -388,22 +462,12 @@ where
     Caller: Instance<UserData = RuntimeApiData<Runtime>>,
     Runtime: ContractRuntime + 'static,
 {
-    /// Returns the authenticated signer for this execution, if there is one.
-    fn authenticated_signer(caller: &mut Caller) -> Result<Option<AccountOwner>, RuntimeError> {
+    /// Returns the authenticated owner for this execution, if there is one.
+    fn authenticated_owner(caller: &mut Caller) -> Result<Option<AccountOwner>, RuntimeError> {
         caller
             .user_data_mut()
             .runtime
-            .authenticated_signer()
-            .map_err(|error| RuntimeError::Custom(error.into()))
-    }
-
-    /// Returns the ID of the incoming message that is being handled, or [`None`] if not executing
-    /// an incoming message.
-    fn get_message_id(caller: &mut Caller) -> Result<Option<MessageId>, RuntimeError> {
-        caller
-            .user_data_mut()
-            .runtime
-            .message_id()
+            .authenticated_owner()
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
@@ -415,6 +479,16 @@ where
             .user_data_mut()
             .runtime
             .message_is_bouncing()
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Returns the chain ID where the current message originated from, or [`None`] if not executing
+    /// an incoming message.
+    fn message_origin_chain_id(caller: &mut Caller) -> Result<Option<ChainId>, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .message_origin_chain_id()
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
@@ -468,6 +542,35 @@ where
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
+    /// Approves a `spender` to withdraw an `amount` of native tokens from the `owner`'s account.
+    fn approve(
+        caller: &mut Caller,
+        owner: AccountOwner,
+        spender: AccountOwner,
+        amount: Amount,
+    ) -> Result<(), RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .approve(owner, spender, amount)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Transfers an `amount` of native tokens from `owner` to `destination` using `spender`'s allowance.
+    fn transfer_from(
+        caller: &mut Caller,
+        owner: AccountOwner,
+        spender: AccountOwner,
+        destination: Account,
+        amount: Amount,
+    ) -> Result<(), RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .transfer_from(owner, spender, destination, amount)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
     /// Opens a new chain, configuring it with the provided `chain_ownership`,
     /// `application_permissions` and initial `balance` (debited from the current chain).
     fn open_chain(
@@ -485,11 +588,26 @@ where
 
     /// Closes the current chain. Returns an error if the application doesn't have
     /// permission to do so.
-    fn close_chain(caller: &mut Caller) -> Result<Result<(), CloseChainError>, RuntimeError> {
+    fn close_chain(caller: &mut Caller) -> Result<Result<(), ManageChainError>, RuntimeError> {
         match caller.user_data_mut().runtime.close_chain() {
             Ok(()) => Ok(Ok(())),
             Err(ExecutionError::UnauthorizedApplication(_)) => {
-                Ok(Err(CloseChainError::NotPermitted))
+                Ok(Err(ManageChainError::NotPermitted))
+            }
+            Err(error) => Err(RuntimeError::Custom(error.into())),
+        }
+    }
+
+    /// Changes the ownership of the current chain. Returns an error if the application doesn't
+    /// have permission to do so.
+    fn change_ownership(
+        caller: &mut Caller,
+        ownership: ChainOwnership,
+    ) -> Result<Result<(), ManageChainError>, RuntimeError> {
+        match caller.user_data_mut().runtime.change_ownership(ownership) {
+            Ok(()) => Ok(Ok(())),
+            Err(ExecutionError::UnauthorizedApplication(_)) => {
+                Ok(Err(ManageChainError::NotPermitted))
             }
             Err(error) => Err(RuntimeError::Custom(error.into())),
         }
@@ -500,7 +618,7 @@ where
     fn change_application_permissions(
         caller: &mut Caller,
         application_permissions: ApplicationPermissions,
-    ) -> Result<Result<(), ChangeApplicationPermissionsError>, RuntimeError> {
+    ) -> Result<Result<(), ManageChainError>, RuntimeError> {
         match caller
             .user_data_mut()
             .runtime
@@ -508,7 +626,7 @@ where
         {
             Ok(()) => Ok(Ok(())),
             Err(ExecutionError::UnauthorizedApplication(_)) => {
-                Ok(Err(ChangeApplicationPermissionsError::NotPermitted))
+                Ok(Err(ManageChainError::NotPermitted))
             }
             Err(error) => Err(RuntimeError::Custom(error.into())),
         }
@@ -527,6 +645,29 @@ where
             .user_data_mut()
             .runtime
             .create_application(module_id, parameters, argument, required_application_ids)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Creates a new data blob and returns its hash.
+    fn create_data_blob(caller: &mut Caller, bytes: Vec<u8>) -> Result<DataBlobHash, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .create_data_blob(bytes)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Publishes a module with contract and service bytecode and returns the module ID.
+    fn publish_module(
+        caller: &mut Caller,
+        contract: Bytecode,
+        service: Bytecode,
+        vm_runtime: VmRuntime,
+    ) -> Result<ModuleId, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .publish_module(contract, service, vm_runtime)
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
@@ -618,11 +759,20 @@ where
         caller
             .user_data_mut()
             .runtime_mut()
-            .consume_fuel(fuel)
+            .consume_fuel(fuel, VmRuntime::Wasm)
             .map_err(|e| RuntimeError::Custom(e.into()))
     }
 
-    /// Returns the round in which this block was validated.
+    /// Returns the amount of execution fuel remaining before execution is aborted.
+    fn remaining_fuel(caller: &mut Caller) -> Result<u64, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime_mut()
+            .remaining_fuel(VmRuntime::Wasm)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Returns the multi-leader round in which this block was validated.
     fn validation_round(caller: &mut Caller) -> Result<Option<u32>, RuntimeError> {
         caller
             .user_data_mut()
@@ -640,6 +790,18 @@ where
             .user_data_mut()
             .runtime_mut()
             .write_batch(Batch { operations })
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Returns true if the corresponding contract uses a zero amount of storage.
+    fn has_empty_storage(
+        caller: &mut Caller,
+        application: ApplicationId,
+    ) -> Result<bool, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime_mut()
+            .has_empty_storage(application)
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 }
@@ -680,7 +842,8 @@ where
     ///
     /// This is called by the metering instrumentation, but the fuel consumed argument is
     /// ignored.
-    fn check_execution_time(caller: &mut Caller, _fuel_consumed: u64) -> Result<(), RuntimeError> {
+    #[allow(unused_variables)]
+    fn check_execution_time(caller: &mut Caller, fuel_consumed: u64) -> Result<(), RuntimeError> {
         caller
             .user_data_mut()
             .runtime_mut()

@@ -1,17 +1,18 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
+use std::collections::BTreeSet;
 
+use allocative::Allocative;
 use linera_base::data_types::{ArithmeticError, BlockHeight};
 #[cfg(with_testing)]
 use linera_views::context::MemoryContext;
 use linera_views::{
-    bucket_queue_view::BucketQueueView,
     context::Context,
+    queue_view::QueueView,
     register_view::RegisterView,
-    views::{ClonableView, View, ViewError},
+    views::{ClonableView, View},
+    ViewError,
 };
 
 #[cfg(test)]
@@ -19,26 +20,21 @@ use linera_views::{
 mod outbox_tests;
 
 #[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{exponential_bucket_interval, register_histogram_vec},
-    prometheus::HistogramVec,
-};
+pub(crate) mod metrics {
+    use std::sync::LazyLock;
 
-#[cfg(with_metrics)]
-static OUTBOX_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "outbox_size",
-        "Outbox size",
-        &[],
-        exponential_bucket_interval(1.0, 10_000.0),
-    )
-});
+    use linera_base::prometheus_util::{exponential_bucket_interval, register_histogram_vec};
+    use prometheus::HistogramVec;
 
-// The number of block heights in a bucket
-// The `BlockHeight` has just 8 bytes so the size is constant.
-// This means that by choosing a size of 1000, we have a
-// reasonable size that will not create any memory issues.
-const BLOCK_HEIGHT_BUCKET_SIZE: usize = 1000;
+    pub static OUTBOX_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "outbox_size",
+            "Outbox size",
+            &[],
+            exponential_bucket_interval(1.0, 10_000.0),
+        )
+    });
+}
 
 /// The state of an outbox
 /// * An outbox is used to send messages to another chain.
@@ -47,21 +43,23 @@ const BLOCK_HEIGHT_BUCKET_SIZE: usize = 1000;
 ///   we just send the certified blocks over and let the receivers figure out what were the
 ///   messages for them.
 /// * When marking block heights as received, messages at lower heights are also marked (i.e. dequeued).
-#[derive(Debug, ClonableView, View, async_graphql::SimpleObject)]
+#[cfg_attr(with_graphql, derive(async_graphql::SimpleObject))]
+#[derive(Debug, ClonableView, View, Allocative)]
+#[allocative(bound = "C")]
 pub struct OutboxStateView<C>
 where
-    C: Context + Send + Sync + 'static,
+    C: Context + 'static,
 {
     /// The minimum block height accepted in the future.
     pub next_height_to_schedule: RegisterView<C, BlockHeight>,
     /// Keep sending these certified blocks of ours until they are acknowledged by
     /// receivers.
-    pub queue: BucketQueueView<C, BlockHeight, BLOCK_HEIGHT_BUCKET_SIZE>,
+    pub queue: QueueView<C, BlockHeight>,
 }
 
 impl<C> OutboxStateView<C>
 where
-    C: Context + Clone + Send + Sync + 'static,
+    C: Context + Clone + 'static,
 {
     /// Schedules a message at the given height if we haven't already.
     /// Returns true if a change was made.
@@ -74,29 +72,50 @@ where
         }
         self.next_height_to_schedule.set(height.try_add_one()?);
         self.queue.push_back(height);
-        #[cfg(with_metrics)]
-        OUTBOX_SIZE
-            .with_label_values(&[])
-            .observe(self.queue.count() as f64);
         Ok(true)
     }
 
+    /// Re-adds heights to the outbox queue by merging them with existing entries.
+    /// Used by the `RevertConfirm` mechanism to undo a previous confirmation.
+    /// Returns the heights that were newly added.
+    pub async fn revert(
+        &mut self,
+        heights_to_add: &[BlockHeight],
+    ) -> Result<Vec<BlockHeight>, ViewError> {
+        let existing = self.queue.elements().await?;
+        let mut all_heights = existing.iter().copied().collect::<BTreeSet<_>>();
+        let new_heights = heights_to_add
+            .iter()
+            .filter(|h| !all_heights.contains(h))
+            .copied()
+            .collect::<Vec<_>>();
+        if new_heights.is_empty() {
+            return Ok(Vec::new());
+        }
+        all_heights.extend(new_heights.iter().copied());
+        self.clear();
+        for h in &all_heights {
+            self.schedule_message(*h).map_err(ViewError::from)?;
+        }
+        Ok(new_heights)
+    }
+
     /// Marks all messages as received up to the given height.
-    /// Returns true if a change was made.
+    /// Returns the heights that were newly marked as received.
     pub(crate) async fn mark_messages_as_received(
         &mut self,
         height: BlockHeight,
     ) -> Result<Vec<BlockHeight>, ViewError> {
         let mut updates = Vec::new();
-        while let Some(h) = self.queue.front().cloned() {
+        while let Some(h) = self.queue.front().await? {
             if h > height {
                 break;
             }
-            self.queue.delete_front().await?;
+            self.queue.delete_front();
             updates.push(h);
         }
         #[cfg(with_metrics)]
-        OUTBOX_SIZE
+        metrics::OUTBOX_SIZE
             .with_label_values(&[])
             .observe(self.queue.count() as f64);
         Ok(updates)

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use async_graphql::SimpleObject;
+use allocative::Allocative;
 use linera_base::{
     data_types::{Blob, Round},
     ensure,
@@ -13,16 +13,19 @@ use linera_views::{
     context::Context,
     map_view::MapView,
     register_view::RegisterView,
-    views::{ClonableView, View, ViewError},
+    views::{ClonableView, View},
+    ViewError,
 };
 
 use crate::ChainError;
 
 /// The pending blobs belonging to a block that can't be processed without them.
-#[derive(Debug, View, ClonableView, SimpleObject)]
+#[cfg_attr(with_graphql, derive(async_graphql::SimpleObject))]
+#[derive(Debug, View, ClonableView, Allocative)]
+#[allocative(bound = "C")]
 pub struct PendingBlobsView<C>
 where
-    C: Clone + Context + Send + Sync + 'static,
+    C: Clone + Context,
 {
     /// The round in which the block is validated.
     pub round: RegisterView<C, Round>,
@@ -38,8 +41,18 @@ where
 
 impl<C> PendingBlobsView<C>
 where
-    C: Clone + Context + Send + Sync + 'static,
+    C: Clone + Context,
 {
+    pub async fn multi_get(&self, blob_ids: &[BlobId]) -> Result<Vec<Option<Blob>>, ViewError> {
+        Ok(self
+            .pending_blobs
+            .multi_get(blob_ids)
+            .await?
+            .into_iter()
+            .map(|x| x.flatten())
+            .collect())
+    }
+
     pub async fn get(&self, blob_id: &BlobId) -> Result<Option<Blob>, ViewError> {
         Ok(self.pending_blobs.get(blob_id).await?.flatten())
     }
@@ -56,7 +69,7 @@ where
         Ok(true)
     }
 
-    pub async fn update(
+    pub fn update(
         &mut self,
         round: Round,
         validated: bool,

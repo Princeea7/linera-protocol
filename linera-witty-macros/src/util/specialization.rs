@@ -249,13 +249,14 @@ impl Specialization {
 
     /// Replaces a type parameter in the [`Generics`] representation with a specialized type.
     pub fn apply_to_generics(&self, generics: &mut Generics) {
-        self.remove_from_where_clause(generics.where_clause.as_mut());
+        let mut maybe_where_clause = generics.where_clause.as_mut();
+        self.remove_from_where_clause(&mut maybe_where_clause);
         self.change_types_in_where_clause(generics.where_clause.as_mut());
     }
 
     /// Removes from a [`WhereClause`] all predicates for the [`Self::type_parameter`] that this
     /// specialization targets.
-    fn remove_from_where_clause(&self, maybe_where_clause: Option<&mut WhereClause>) {
+    fn remove_from_where_clause(&self, maybe_where_clause: &mut Option<&mut WhereClause>) {
         if let Some(WhereClause { predicates, .. }) = maybe_where_clause {
             let original_predicates = mem::take(predicates);
 
@@ -328,7 +329,7 @@ impl Specialization {
                     .iter_mut()
                     .flat_map(|variant| variant.fields.iter_mut()),
             ),
-            _ => Box::new(None.into_iter()),
+            Data::Struct(_) => Box::new(None.into_iter()),
         };
 
         for Field { ty, .. } in fields {
@@ -387,7 +388,7 @@ impl Specialization {
     /// Replaces the [`Self::type_parameter`] with the [`Self::specialized_type`] inside the
     /// [`Path`]'s type arguments.
     fn change_types_in_path(&self, path: &mut Path) {
-        for segment in path.segments.iter_mut() {
+        for segment in &mut path.segments {
             match &mut segment.arguments {
                 PathArguments::None => {}
                 PathArguments::AngleBracketed(angle_bracketed) => {
@@ -407,7 +408,7 @@ impl Specialization {
         &self,
         arguments: &mut AngleBracketedGenericArguments,
     ) {
-        for argument in arguments.args.iter_mut() {
+        for argument in &mut arguments.args {
             match argument {
                 GenericArgument::Type(the_type) => self.change_types_in_type(the_type),
                 GenericArgument::AssocType(AssocType { generics, ty, .. }) => {

@@ -10,12 +10,14 @@ use rfq::{RequestId, TokenPair, Tokens};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, SimpleObject, InputObject)]
+#[graphql(input_name = "QuoteRequestedInput")]
 pub struct QuoteRequested {
     token_pair: TokenPair,
     amount: Amount,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, SimpleObject, InputObject)]
+#[graphql(input_name = "QuoteProvidedInput")]
 pub struct QuoteProvided {
     token_pair: TokenPair,
     amount: Amount,
@@ -34,11 +36,13 @@ impl QuoteProvided {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, SimpleObject, InputObject)]
+#[graphql(input_name = "ExchangeInProgressInput")]
 pub struct ExchangeInProgress {
     temp_chain_id: ChainId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, SimpleObject, InputObject)]
+#[graphql(input_name = "AwaitingTokensInput")]
 pub struct AwaitingTokens {
     pub token_pair: TokenPair,
     pub amount_offered: Amount,
@@ -67,12 +71,6 @@ impl RequestState {
 #[derive(Clone, Debug, Serialize, Deserialize, SimpleObject)]
 pub struct RequestData {
     state: RequestState,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, SimpleObject)]
-pub struct TempChainTokenHolder {
-    pub account_owner: AccountOwner,
-    pub chain_id: ChainId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, SimpleObject)]

@@ -6,30 +6,29 @@
 //! The [`TestValidator`] is a minimal validator with a single shard. Micro-chains can be added to
 //! it, and blocks can be added to each microchain individually.
 
-use std::{num::NonZeroUsize, sync::Arc};
+use std::sync::Arc;
 
-use dashmap::DashMap;
 use futures::{
     lock::{MappedMutexGuard, Mutex, MutexGuard},
     FutureExt as _,
 };
 use linera_base::{
-    crypto::{AccountSecretKey, ValidatorKeypair, ValidatorSecretKey},
+    crypto::{AccountSecretKey, CryptoHash, ValidatorKeypair, ValidatorSecretKey},
     data_types::{
         Amount, ApplicationPermissions, Blob, BlobContent, ChainDescription, ChainOrigin, Epoch,
-        InitialChainConfig, Timestamp,
+        InitialChainConfig, NetworkDescription, Timestamp,
     },
     identifiers::{AccountOwner, ApplicationId, ChainId, ModuleId},
     ownership::ChainOwnership,
 };
-use linera_core::worker::WorkerState;
+use linera_core::{worker::WorkerState, ChainWorkerConfig};
 use linera_execution::{
     committee::Committee,
     system::{AdminOperation, OpenChainConfig, SystemOperation},
     ResourceControlPolicy, WasmRuntime,
 };
 use linera_storage::{DbStorage, Storage, TestClock};
-use linera_views::memory::MemoryStore;
+use linera_views::memory::MemoryDatabase;
 use serde::Serialize;
 
 use super::ActiveChain;
@@ -39,12 +38,12 @@ use crate::ContractAbi;
 ///
 /// ```rust
 /// # use linera_sdk::test::*;
-/// # use linera_base::{data_types::BlockHeight, identifiers::ChainId};
+/// # use linera_base::{data_types::Amount, identifiers::ChainId};
 /// # tokio_test::block_on(async {
 /// let validator = TestValidator::new().await;
 /// assert_eq!(
-///     validator.new_chain().await.get_tip_height().await,
-///     BlockHeight(0)
+///     validator.new_chain().await.chain_balance().await,
+///     Amount::from_tokens(10)
 /// );
 /// # });
 /// ```
@@ -52,11 +51,11 @@ pub struct TestValidator {
     validator_secret: ValidatorSecretKey,
     account_secret: AccountSecretKey,
     committee: Arc<Mutex<(Epoch, Committee)>>,
-    storage: DbStorage<MemoryStore, TestClock>,
-    worker: WorkerState<DbStorage<MemoryStore, TestClock>>,
+    storage: DbStorage<MemoryDatabase, TestClock>,
+    worker: WorkerState<DbStorage<MemoryDatabase, TestClock>>,
     clock: TestClock,
     admin_chain_id: ChainId,
-    chains: Arc<DashMap<ChainId, ActiveChain>>,
+    chains: Arc<papaya::HashMap<ChainId, ActiveChain>>,
 }
 
 impl Clone for TestValidator {
@@ -85,29 +84,24 @@ impl TestValidator {
             account_secret.public(),
         )]);
         let wasm_runtime = Some(WasmRuntime::default());
-        let storage = DbStorage::<MemoryStore, _>::make_test_storage(wasm_runtime)
+        let storage = DbStorage::<MemoryDatabase, _>::make_test_storage(wasm_runtime)
             .now_or_never()
             .expect("execution of DbStorage::new should not await anything");
         let clock = storage.clock().clone();
-        let worker = WorkerState::new(
-            "Single validator node".to_string(),
-            Some(validator_keypair.secret_key.copy()),
-            storage.clone(),
-            NonZeroUsize::new(40).expect("Chain worker limit should not be zero"),
-        );
+        let config = ChainWorkerConfig {
+            nickname: "Single validator node".to_string(),
+            key_pair: Some(Arc::new(validator_keypair.secret_key.copy())),
+            ..ChainWorkerConfig::default()
+        };
+        let worker = WorkerState::new(storage.clone(), config, None);
 
         // Create an admin chain.
         let key_pair = AccountSecretKey::generate();
 
         let new_chain_config = InitialChainConfig {
             ownership: ChainOwnership::single(key_pair.public().into()),
-            committees: [(
-                epoch,
-                bcs::to_bytes(&committee).expect("Serializing a committee should not fail!"),
-            )]
-            .into_iter()
-            .collect(),
-            admin_id: None,
+            min_active_epoch: epoch,
+            max_active_epoch: epoch,
             epoch,
             balance: Amount::from_tokens(1_000_000),
             application_permissions: ApplicationPermissions::default(),
@@ -117,6 +111,25 @@ impl TestValidator {
         let description = ChainDescription::new(origin, new_chain_config, Timestamp::from(0));
         let admin_chain_id = description.id();
 
+        let committee_blob = Blob::new_committee(
+            bcs::to_bytes(&committee).expect("serializing a committee should succeed"),
+        );
+
+        let network_description = NetworkDescription {
+            name: "Test network".to_string(),
+            genesis_config_hash: CryptoHash::test_hash("genesis config"),
+            genesis_timestamp: description.timestamp(),
+            genesis_committee_blob_hash: committee_blob.id().hash,
+            admin_chain_id,
+        };
+        storage
+            .write_network_description(&network_description)
+            .await
+            .unwrap();
+        storage
+            .write_blob(&committee_blob)
+            .await
+            .expect("writing a blob should succeed");
         worker
             .storage_client()
             .create_chain(description.clone())
@@ -136,7 +149,7 @@ impl TestValidator {
 
         let chain = ActiveChain::new(key_pair, description.clone(), validator.clone());
 
-        validator.chains.insert(description.id(), chain);
+        validator.chains.pin().insert(description.id(), chain);
 
         validator
     }
@@ -150,9 +163,9 @@ impl TestValidator {
         ModuleId<Abi, Parameters, InstantiationArgument>,
     ) {
         let validator = TestValidator::new().await;
-        let publisher = validator.new_chain().await;
+        let publisher = Box::pin(validator.new_chain()).await;
 
-        let module_id = publisher.publish_current_module().await;
+        let module_id = Box::pin(publisher.publish_current_module()).await;
 
         (validator, module_id)
     }
@@ -174,10 +187,14 @@ impl TestValidator {
         Parameters: Serialize,
         InstantiationArgument: Serialize,
     {
-        let (validator, module_id) =
-            TestValidator::with_current_module::<Abi, Parameters, InstantiationArgument>().await;
+        let (validator, module_id) = Box::pin(TestValidator::with_current_module::<
+            Abi,
+            Parameters,
+            InstantiationArgument,
+        >())
+        .await;
 
-        let mut creator = validator.new_chain().await;
+        let mut creator = Box::pin(validator.new_chain()).await;
 
         let application_id = creator
             .create_application(module_id, parameters, instantiation_argument, vec![])
@@ -187,12 +204,12 @@ impl TestValidator {
     }
 
     /// Returns this validator's storage.
-    pub(crate) fn storage(&self) -> &DbStorage<MemoryStore, TestClock> {
+    pub(crate) fn storage(&self) -> &DbStorage<MemoryDatabase, TestClock> {
         &self.storage
     }
 
     /// Returns the locked [`WorkerState`] of this validator.
-    pub(crate) fn worker(&self) -> WorkerState<DbStorage<MemoryStore, TestClock>> {
+    pub(crate) fn worker(&self) -> WorkerState<DbStorage<MemoryDatabase, TestClock>> {
         self.worker.clone()
     }
 
@@ -247,23 +264,21 @@ impl TestValidator {
             .await
             .expect("Should write committee blob");
 
-        admin_chain
-            .add_block(|block| {
-                block.with_system_operation(SystemOperation::Admin(
-                    AdminOperation::CreateCommittee { epoch, blob_hash },
-                ));
-            })
-            .await;
+        Box::pin(admin_chain.add_block(|block| {
+            block.with_system_operation(SystemOperation::Admin(AdminOperation::CreateCommittee {
+                epoch,
+                blob_hash,
+            }));
+        }))
+        .await;
 
-        for entry in self.chains.iter() {
-            let chain = entry.value();
-
+        let pinned = self.chains.pin();
+        for chain in pinned.values() {
             if chain.id() != self.admin_chain_id {
-                chain
-                    .add_block(|block| {
-                        block.with_system_operation(SystemOperation::ProcessNewEpoch(epoch));
-                    })
-                    .await;
+                Box::pin(chain.add_block(|block| {
+                    block.with_system_operation(SystemOperation::ProcessNewEpoch(epoch));
+                }))
+                .await;
             }
         }
     }
@@ -271,14 +286,13 @@ impl TestValidator {
     /// Creates a new microchain and returns the [`ActiveChain`] that can be used to add blocks to
     /// it with the given key pair.
     pub async fn new_chain_with_keypair(&self, key_pair: AccountSecretKey) -> ActiveChain {
-        let description = self
-            .request_new_chain_from_admin_chain(key_pair.public().into())
-            .await;
+        let description =
+            Box::pin(self.request_new_chain_from_admin_chain(key_pair.public().into())).await;
         let chain = ActiveChain::new(key_pair, description.clone(), self.clone());
 
-        chain.handle_received_messages().await;
+        Box::pin(chain.handle_received_messages()).await;
 
-        self.chains.insert(description.id(), chain.clone());
+        self.chains.pin().insert(description.id(), chain.clone());
 
         chain
     }
@@ -287,47 +301,48 @@ impl TestValidator {
     /// it.
     pub async fn new_chain(&self) -> ActiveChain {
         let key_pair = AccountSecretKey::generate();
-        self.new_chain_with_keypair(key_pair).await
+        Box::pin(self.new_chain_with_keypair(key_pair)).await
     }
 
     /// Adds an existing [`ActiveChain`].
     pub fn add_chain(&self, chain: ActiveChain) {
-        self.chains.insert(chain.id(), chain);
+        self.chains.pin().insert(chain.id(), chain);
     }
 
     /// Adds a block to the admin chain to create a new chain.
     ///
     /// Returns the [`ChainDescription`] of the new chain.
     async fn request_new_chain_from_admin_chain(&self, owner: AccountOwner) -> ChainDescription {
-        let admin_id = self.admin_chain_id;
-        let admin_chain = self
-            .chains
-            .get(&admin_id)
+        let admin_chain_id = self.admin_chain_id;
+        let pinned = self.chains.pin();
+        let admin_chain = pinned
+            .get(&admin_chain_id)
             .expect("Admin chain should be created when the `TestValidator` is constructed");
-
-        let (epoch, committee) = self.committee.lock().await.clone();
 
         let open_chain_config = OpenChainConfig {
             ownership: ChainOwnership::single(owner),
-            balance: Amount::ZERO,
+            balance: Amount::from_tokens(10),
             application_permissions: ApplicationPermissions::default(),
         };
-        let new_chain_config = open_chain_config.init_chain_config(
-            epoch,
-            Some(admin_id),
-            [(
-                epoch,
-                bcs::to_bytes(&committee).expect("Serializing a committee should not fail!"),
-            )]
-            .into_iter()
-            .collect(),
-        );
 
-        let certificate = admin_chain
-            .add_block(|block| {
-                block.with_system_operation(SystemOperation::OpenChain(open_chain_config));
-            })
-            .await;
+        // Query the admin chain's committees to get the correct min/max active epochs,
+        // matching what the execution does in `SystemExecutionStateView::open_chain`.
+        let chain_state = Box::pin(self.worker.chain_state_view(admin_chain_id))
+            .await
+            .expect("Failed to read admin chain state");
+        let committees = chain_state.execution_state.system.committees.get();
+        let epoch = *chain_state.execution_state.system.epoch.get();
+        let min_active_epoch = committees.keys().min().copied().unwrap_or(Epoch::ZERO);
+        let max_active_epoch = committees.keys().max().copied().unwrap_or(Epoch::ZERO);
+        drop(chain_state);
+
+        let new_chain_config =
+            open_chain_config.init_chain_config(epoch, min_active_epoch, max_active_epoch);
+
+        let (certificate, _) = Box::pin(admin_chain.add_block(|block| {
+            block.with_system_operation(SystemOperation::OpenChain(open_chain_config));
+        }))
+        .await;
         let block = certificate.inner().block();
 
         let origin = ChainOrigin::Child {
@@ -341,6 +356,10 @@ impl TestValidator {
 
     /// Returns the [`ActiveChain`] reference to the microchain identified by `chain_id`.
     pub fn get_chain(&self, chain_id: &ChainId) -> ActiveChain {
-        self.chains.get(chain_id).expect("Chain not found").clone()
+        self.chains
+            .pin()
+            .get(chain_id)
+            .expect("Chain not found")
+            .clone()
     }
 }

@@ -1,15 +1,17 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::{Duration, Instant};
+use linera_base::time::{Duration, Instant};
 
 use crate::{
     batch::Batch,
-    store::{LocalKeyValueStore, TestKeyValueStore},
-    test_utils::{add_prefix, get_random_key_values2},
+    store::{
+        KeyValueStore, ReadableKeyValueStore as _, TestKeyValueDatabase, WritableKeyValueStore as _,
+    },
+    test_utils::{add_prefix, get_random_key_values_with_small_keys},
 };
 
-// We generate about 2000 keys of length 11 with a key of length 10000
+// We generate about 200 keys of length 10 with a value of length 10000
 // The keys are of the form 0,x_1, ..., x_n with 0 <= x_i < 4 and n=10.
 
 /// A value to use for the keys
@@ -30,23 +32,26 @@ const LEN_KEY: usize = 10;
 /// The length of the values
 const LEN_VALUE: usize = 10000;
 
-async fn clear_store<S: LocalKeyValueStore>(store: &S) {
+async fn clear_store<S: KeyValueStore>(store: &S) {
     let mut batch = Batch::new();
     batch.delete_key_prefix(PREFIX.to_vec());
     store.write_batch(batch).await.unwrap();
 }
 
 /// Benchmarks the `contains_key` operation.
-pub async fn contains_key<S: TestKeyValueStore, F>(iterations: u64, f: F) -> Duration
+pub async fn contains_key<D, F>(iterations: u64, f: F) -> Duration
 where
+    D: TestKeyValueDatabase,
+    D::Store: KeyValueStore,
     F: Fn(bool) -> bool,
 {
-    let store = S::new_test_store().await.unwrap();
+    let namespace = D::connect_test_namespace().await.unwrap();
+    let store = namespace.open_shared(&[]).unwrap();
     let mut total_time = Duration::ZERO;
     for _ in 0..iterations {
         let key_values = add_prefix(
             PREFIX,
-            get_random_key_values2(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
+            get_random_key_values_with_small_keys(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
         );
         let mut batch = Batch::new();
         for key_value in &key_values[..NUM_INSERT] {
@@ -67,16 +72,19 @@ where
 }
 
 /// Benchmarks the `contains_keys` operation.
-pub async fn contains_keys<S: TestKeyValueStore, F>(iterations: u64, f: F) -> Duration
+pub async fn contains_keys<D, F>(iterations: u64, f: F) -> Duration
 where
+    D: TestKeyValueDatabase,
+    D::Store: KeyValueStore,
     F: Fn(Vec<bool>) -> Vec<bool>,
 {
-    let store = S::new_test_store().await.unwrap();
+    let namespace = D::connect_test_namespace().await.unwrap();
+    let store = namespace.open_shared(&[]).unwrap();
     let mut total_time = Duration::ZERO;
     for _ in 0..iterations {
         let key_values = add_prefix(
             PREFIX,
-            get_random_key_values2(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
+            get_random_key_values_with_small_keys(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
         );
         let mut batch = Batch::new();
         for key_value in &key_values[..NUM_INSERT] {
@@ -89,7 +97,7 @@ where
             .collect::<Vec<_>>();
 
         let measurement = Instant::now();
-        f(store.contains_keys(keys).await.unwrap());
+        f(store.contains_keys(&keys).await.unwrap());
         total_time += measurement.elapsed();
 
         clear_store(&store).await;
@@ -99,16 +107,19 @@ where
 }
 
 /// Benchmarks the `find_keys_by_prefix` operation.
-pub async fn find_keys_by_prefix<S: TestKeyValueStore, F>(iterations: u64, f: F) -> Duration
+pub async fn find_keys_by_prefix<D, F>(iterations: u64, f: F) -> Duration
 where
-    F: Fn(S::Keys) -> S::Keys,
+    D: TestKeyValueDatabase,
+    D::Store: KeyValueStore,
+    F: Fn(Vec<Vec<u8>>) -> Vec<Vec<u8>>,
 {
-    let store = S::new_test_store().await.unwrap();
+    let namespace = D::connect_test_namespace().await.unwrap();
+    let store = namespace.open_shared(&[]).unwrap();
     let mut total_time = Duration::ZERO;
     for _ in 0..iterations {
         let key_values = add_prefix(
             PREFIX,
-            get_random_key_values2(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
+            get_random_key_values_with_small_keys(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
         );
         let mut batch = Batch::new();
         for key_value in &key_values {
@@ -127,16 +138,19 @@ where
 }
 
 /// Benchmarks the `find_keys_by_prefix` operation.
-pub async fn find_key_values_by_prefix<S: TestKeyValueStore, F>(iterations: u64, f: F) -> Duration
+pub async fn find_key_values_by_prefix<D, F>(iterations: u64, f: F) -> Duration
 where
-    F: Fn(S::KeyValues) -> S::KeyValues,
+    D: TestKeyValueDatabase,
+    D::Store: KeyValueStore,
+    F: Fn(Vec<(Vec<u8>, Vec<u8>)>) -> Vec<(Vec<u8>, Vec<u8>)>,
 {
-    let store = S::new_test_store().await.unwrap();
+    let namespace = D::connect_test_namespace().await.unwrap();
+    let store = namespace.open_shared(&[]).unwrap();
     let mut total_time = Duration::ZERO;
     for _ in 0..iterations {
         let key_values = add_prefix(
             PREFIX,
-            get_random_key_values2(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
+            get_random_key_values_with_small_keys(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
         );
         let mut batch = Batch::new();
         for key_value in &key_values {
@@ -158,16 +172,19 @@ where
 }
 
 /// Benchmarks the `read_value_bytes` operation.
-pub async fn read_value_bytes<S: TestKeyValueStore, F>(iterations: u64, f: F) -> Duration
+pub async fn read_value_bytes<D, F>(iterations: u64, f: F) -> Duration
 where
+    D: TestKeyValueDatabase,
+    D::Store: KeyValueStore,
     F: Fn(Option<Vec<u8>>) -> Option<Vec<u8>>,
 {
-    let store = S::new_test_store().await.unwrap();
+    let namespace = D::connect_test_namespace().await.unwrap();
+    let store = namespace.open_shared(&[]).unwrap();
     let mut total_time = Duration::ZERO;
     for _ in 0..iterations {
         let key_values = add_prefix(
             PREFIX,
-            get_random_key_values2(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
+            get_random_key_values_with_small_keys(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
         );
         let mut batch = Batch::new();
         for key_value in &key_values {
@@ -188,16 +205,19 @@ where
 }
 
 /// Benchmarks the `read_multi_values_bytes` operation.
-pub async fn read_multi_values_bytes<S: TestKeyValueStore, F>(iterations: u64, f: F) -> Duration
+pub async fn read_multi_values_bytes<D, F>(iterations: u64, f: F) -> Duration
 where
+    D: TestKeyValueDatabase,
+    D::Store: KeyValueStore,
     F: Fn(Vec<Option<Vec<u8>>>) -> Vec<Option<Vec<u8>>>,
 {
-    let store = S::new_test_store().await.unwrap();
+    let namespace = D::connect_test_namespace().await.unwrap();
+    let store = namespace.open_shared(&[]).unwrap();
     let mut total_time = Duration::ZERO;
     for _ in 0..iterations {
         let key_values = add_prefix(
             PREFIX,
-            get_random_key_values2(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
+            get_random_key_values_with_small_keys(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
         );
         let mut batch = Batch::new();
         for key_value in &key_values {
@@ -210,7 +230,7 @@ where
             .collect::<Vec<_>>();
 
         let measurement = Instant::now();
-        f(store.read_multi_values_bytes(keys).await.unwrap());
+        f(store.read_multi_values_bytes(&keys).await.unwrap());
         total_time += measurement.elapsed();
 
         clear_store(&store).await;
@@ -220,13 +240,17 @@ where
 }
 
 /// Benchmarks the `write_batch` operation.
-pub async fn write_batch<S: TestKeyValueStore>(iterations: u64) -> Duration {
-    let store = S::new_test_store().await.unwrap();
+pub async fn write_batch<D>(iterations: u64) -> Duration
+where
+    D: TestKeyValueDatabase,
+    D::Store: KeyValueStore,
+{
+    let store = D::new_test_store().await.unwrap();
     let mut total_time = Duration::ZERO;
     for _ in 0..iterations {
         let key_values = add_prefix(
             PREFIX,
-            get_random_key_values2(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
+            get_random_key_values_with_small_keys(NUM_ENTRIES, LEN_KEY, LEN_VALUE),
         );
         let mut batch = Batch::new();
         for key_value in &key_values {

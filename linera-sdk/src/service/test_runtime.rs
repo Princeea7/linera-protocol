@@ -10,14 +10,13 @@ use std::{
 };
 
 use linera_base::{
-    abi::ServiceAbi,
-    data_types::{Amount, BlockHeight, Timestamp},
+    abi::{ContractAbi, ServiceAbi},
+    data_types::{Amount, ApplicationDescription, BlockHeight, Timestamp},
     hex, http,
-    identifiers::{AccountOwner, ApplicationId, ChainId},
+    identifiers::{AccountOwner, ApplicationId, ChainId, DataBlobHash},
 };
-use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{DataBlobHash, KeyValueStore, Service, ViewStorageContext};
+use crate::{KeyValueStore, Service, ViewStorageContext};
 
 /// The runtime available during execution of a query.
 pub struct MockServiceRuntime<Application>
@@ -26,6 +25,8 @@ where
 {
     application_parameters: Mutex<Option<Application::Parameters>>,
     application_id: Mutex<Option<ApplicationId<Application::Abi>>>,
+    application_creator_chain_id: Mutex<Option<ChainId>>,
+    application_descriptions: Mutex<HashMap<ApplicationId, ApplicationDescription>>,
     chain_id: Mutex<Option<ChainId>>,
     next_block_height: Mutex<Option<BlockHeight>>,
     timestamp: Mutex<Option<Timestamp>>,
@@ -56,6 +57,8 @@ where
         MockServiceRuntime {
             application_parameters: Mutex::new(None),
             application_id: Mutex::new(None),
+            application_creator_chain_id: Mutex::new(None),
+            application_descriptions: Mutex::new(HashMap::new()),
             chain_id: Mutex::new(None),
             next_block_height: Mutex::new(None),
             timestamp: Mutex::new(None),
@@ -76,7 +79,7 @@ where
 
     /// Returns a storage context suitable for a root view.
     pub fn root_view_storage_context(&self) -> ViewStorageContext {
-        ViewStorageContext::new_unsafe(self.key_value_store(), Vec::new(), ())
+        ViewStorageContext::new_unchecked(self.key_value_store(), Vec::new(), ())
     }
 
     /// Configures the application parameters to return during the test.
@@ -125,6 +128,71 @@ where
             "Application ID has not been mocked, \
             please call `MockServiceRuntime::set_application_id` first",
         )
+    }
+
+    /// Configures the application creator chain ID to return during the test.
+    pub fn with_application_creator_chain_id(self, application_creator_chain_id: ChainId) -> Self {
+        *self.application_creator_chain_id.lock().unwrap() = Some(application_creator_chain_id);
+        self
+    }
+
+    /// Configures the application creator chain ID to return during the test.
+    pub fn set_application_creator_chain_id(&self, application_creator_chain_id: ChainId) -> &Self {
+        *self.application_creator_chain_id.lock().unwrap() = Some(application_creator_chain_id);
+        self
+    }
+
+    /// Returns the chain ID of the current application creator.
+    pub fn application_creator_chain_id(&self) -> ChainId {
+        Self::fetch_mocked_value(
+            &self.application_creator_chain_id,
+            "Application creator chain ID has not been mocked, \
+            please call `MockServiceRuntime::set_application_creator_chain_id` first",
+        )
+    }
+
+    /// Configures the application description to return for a specific application during the test.
+    pub fn with_application_description(
+        self,
+        application_id: ApplicationId,
+        description: ApplicationDescription,
+    ) -> Self {
+        self.application_descriptions
+            .lock()
+            .unwrap()
+            .insert(application_id, description);
+        self
+    }
+
+    /// Configures the application description to return for a specific application during the test.
+    pub fn set_application_description(
+        &self,
+        application_id: ApplicationId,
+        description: ApplicationDescription,
+    ) -> &Self {
+        self.application_descriptions
+            .lock()
+            .unwrap()
+            .insert(application_id, description);
+        self
+    }
+
+    /// Returns the description of the given application.
+    pub fn read_application_description(
+        &self,
+        application_id: ApplicationId,
+    ) -> ApplicationDescription {
+        self.application_descriptions
+            .lock()
+            .unwrap()
+            .get(&application_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Application description for {application_id:?} has not been mocked, \
+                    please call `MockServiceRuntime::set_application_description` first"
+                )
+            })
     }
 
     /// Configures the chain ID to return during the test.
@@ -287,24 +355,38 @@ where
                 please call `MockServiceRuntime::set_owner_balances` first",
             )
             .keys()
-            .cloned()
+            .copied()
             .collect()
+    }
+
+    /// Returns the allowance for a given owner-spender pair.
+    pub fn allowance(&self, _owner: AccountOwner, _spender: AccountOwner) -> Amount {
+        Amount::ZERO
+    }
+
+    /// Returns all allowances on this chain.
+    pub fn allowances(&self) -> Vec<(AccountOwner, AccountOwner, Amount)> {
+        Vec::new()
     }
 
     /// Schedules an operation to be included in the block being built.
     ///
     /// The operation is specified as an opaque blob of bytes.
-    pub fn schedule_raw_operation(&self, operation: Vec<u8>) {
-        self.scheduled_operations.lock().unwrap().push(operation);
+    pub fn schedule_raw_operation(&self, operation: &[u8]) {
+        self.scheduled_operations
+            .lock()
+            .unwrap()
+            .push(operation.to_vec());
     }
 
     /// Schedules an operation to be included in the block being built.
     ///
-    /// The operation is serialized using BCS.
-    pub fn schedule_operation(&self, operation: &impl Serialize) {
-        let bytes = bcs::to_bytes(operation).expect("Failed to serialize application operation");
+    /// The operation is serialized using the application ABI.
+    pub fn schedule_operation(&self, operation: &<Application::Abi as ContractAbi>::Operation) {
+        let bytes = <Application::Abi as ContractAbi>::serialize_operation(operation)
+            .expect("Failed to serialize application operation");
 
-        self.schedule_raw_operation(bytes);
+        self.schedule_raw_operation(&bytes);
     }
 
     /// Returns the list of operations scheduled since the most recent of:
@@ -322,21 +404,21 @@ where
     /// - the last call to [`Self::raw_scheduled_operations`];
     /// - or since the mock runtime was created.
     ///
-    /// All operations are deserialized using BCS into the `Operation` generic type.
-    pub fn scheduled_operations<Operation>(&self) -> Vec<Operation>
-    where
-        Operation: DeserializeOwned,
-    {
+    /// All operations are deserialized using the application ABI.
+    pub fn scheduled_operations(&self) -> Vec<<Application::Abi as ContractAbi>::Operation> {
         self.raw_scheduled_operations()
             .into_iter()
             .enumerate()
             .map(|(index, bytes)| {
-                bcs::from_bytes(&bytes).unwrap_or_else(|error| {
-                    panic!(
-                        "Failed to deserialize scheduled operation #{index} (0x{}): {error}",
-                        hex::encode(bytes)
-                    )
-                })
+                let hex_bytes = hex::encode(&bytes);
+                <Application::Abi as ContractAbi>::deserialize_operation(bytes).unwrap_or_else(
+                    |error| {
+                        panic!(
+                            "Failed to deserialize scheduled operation #{index} (0x{}): {error}",
+                            hex_bytes
+                        )
+                    },
+                )
             })
             .collect()
     }
@@ -395,10 +477,11 @@ where
     ///
     /// Cannot be used in fast blocks: A block using this call should be proposed by a regular
     /// owner, not a super owner.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn http_request(&self, request: http::Request) -> http::Response {
         let maybe_request = self.expected_http_requests.lock().unwrap().pop_front();
         let (expected_request, response) = maybe_request.expect("Unexpected HTTP request");
-        assert_eq!(request, expected_request);
+        assert_eq!(&request, &expected_request);
         response
     }
 
@@ -447,17 +530,15 @@ where
 
     /// Asserts that a blob with the given hash exists in storage.
     pub fn assert_blob_exists(&self, hash: DataBlobHash) {
-        self.blobs
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|blobs| blobs.contains_key(&hash))
-            .unwrap_or_else(|| {
-                panic!(
-                    "Blob for hash {hash:?} has not been mocked, \
-                    please call `MockServiceRuntime::set_blob` first"
-                )
-            });
+        assert!(
+            self.blobs
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|blobs| blobs.contains_key(&hash)),
+            "Blob for hash {hash:?} has not been mocked, \
+            please call `MockServiceRuntime::set_blob` first"
+        );
     }
 
     /// Loads a mocked value from the `slot` cache or panics with a provided `message`.

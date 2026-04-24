@@ -1,62 +1,89 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use allocative::Allocative;
 #[cfg(with_metrics)]
-use std::sync::LazyLock;
-
-use async_trait::async_trait;
+use linera_base::prometheus_util::MeasureLatency as _;
 use serde::{de::DeserializeOwned, Serialize};
-#[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{
-        exponential_bucket_latencies, register_histogram_vec, MeasureLatency,
-    },
-    prometheus::HistogramVec,
-};
 
 use crate::{
     batch::Batch,
     common::{from_bytes_option_or_default, HasherOutput},
     context::Context,
     hashable_wrapper::WrappedHashableContainerView,
-    views::{ClonableView, HashableView, Hasher, View, ViewError},
+    views::{ClonableView, HashableView, Hasher, ReplaceContext, View},
+    ViewError,
 };
 
 #[cfg(with_metrics)]
-/// The runtime of hash computation
-static REGISTER_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "register_view_hash_runtime",
-        "RegisterView hash runtime",
-        &[],
-        exponential_bucket_latencies(5.0),
-    )
-});
+mod metrics {
+    use std::sync::LazyLock;
+
+    use linera_base::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+    use prometheus::HistogramVec;
+
+    /// The runtime of hash computation
+    pub static REGISTER_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "register_view_hash_runtime",
+            "RegisterView hash runtime",
+            &[],
+            exponential_bucket_latencies(5.0),
+        )
+    });
+}
 
 /// A view that supports modifying a single value of type `T`.
-#[derive(Debug)]
+#[derive(Debug, Allocative)]
+#[allocative(bound = "C, T: Allocative")]
 pub struct RegisterView<C, T> {
+    /// Whether to clear storage before applying updates.
     delete_storage_first: bool,
+    /// The view context.
+    #[allocative(skip)]
     context: C,
+    /// The value persisted in storage.
     stored_value: Box<T>,
+    /// Pending update not yet persisted to storage.
     update: Option<Box<T>>,
 }
 
-#[async_trait]
-impl<C, T> View<C> for RegisterView<C, T>
+impl<C, T, C2> ReplaceContext<C2> for RegisterView<C, T>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
+    C2: Context,
+    T: Default + Send + Sync + Serialize + DeserializeOwned + Clone,
+{
+    type Target = RegisterView<C2, T>;
+
+    async fn with_context(
+        &mut self,
+        ctx: impl FnOnce(&Self::Context) -> C2 + Clone,
+    ) -> Self::Target {
+        RegisterView {
+            delete_storage_first: self.delete_storage_first,
+            context: ctx(&self.context),
+            stored_value: self.stored_value.clone(),
+            update: self.update.clone(),
+        }
+    }
+}
+
+impl<C, T> View for RegisterView<C, T>
+where
+    C: Context,
     T: Default + Send + Sync + Serialize + DeserializeOwned,
 {
     const NUM_INIT_KEYS: usize = 1;
 
-    fn context(&self) -> &C {
-        &self.context
+    type Context = C;
+
+    fn context(&self) -> C {
+        self.context.clone()
     }
 
     fn pre_load(context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
-        Ok(vec![context.base_key()])
+        Ok(vec![context.base_key().bytes.clone()])
     }
 
     fn post_load(context: C, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
@@ -71,12 +98,6 @@ where
         })
     }
 
-    async fn load(context: C) -> Result<Self, ViewError> {
-        let keys = Self::pre_load(&context)?;
-        let values = context.read_multi_values_bytes(keys).await?;
-        Self::post_load(context, &values)
-    }
-
     fn rollback(&mut self) {
         self.delete_storage_first = false;
         self.update = None;
@@ -89,20 +110,26 @@ where
         self.update.is_some()
     }
 
-    fn flush(&mut self, batch: &mut Batch) -> Result<bool, ViewError> {
+    fn pre_save(&self, batch: &mut Batch) -> Result<bool, ViewError> {
         let mut delete_view = false;
         if self.delete_storage_first {
-            batch.delete_key(self.context.base_key());
-            self.stored_value = Box::default();
+            batch.delete_key(self.context.base_key().bytes.clone());
             delete_view = true;
+        } else if let Some(value) = &self.update {
+            let key = self.context.base_key().bytes.clone();
+            batch.put_key_value(key, value)?;
+        }
+        Ok(delete_view)
+    }
+
+    fn post_save(&mut self) {
+        if self.delete_storage_first {
+            *self.stored_value = Default::default();
         } else if let Some(value) = self.update.take() {
-            let key = self.context.base_key();
-            batch.put_key_value(key, &value)?;
             self.stored_value = value;
         }
         self.delete_storage_first = false;
         self.update = None;
-        Ok(delete_view)
     }
 
     fn clear(&mut self) {
@@ -111,10 +138,9 @@ where
     }
 }
 
-impl<C, T> ClonableView<C> for RegisterView<C, T>
+impl<C, T> ClonableView for RegisterView<C, T>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     T: Clone + Default + Send + Sync + Serialize + DeserializeOwned,
 {
     fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
@@ -204,18 +230,16 @@ where
 
     fn compute_hash(&self) -> Result<<sha3::Sha3_256 as Hasher>::Output, ViewError> {
         #[cfg(with_metrics)]
-        let _hash_latency = REGISTER_VIEW_HASH_RUNTIME.measure_latency();
+        let _hash_latency = metrics::REGISTER_VIEW_HASH_RUNTIME.measure_latency();
         let mut hasher = sha3::Sha3_256::default();
         hasher.update_with_bcs_bytes(self.get())?;
         Ok(hasher.finalize())
     }
 }
 
-#[async_trait]
-impl<C, T> HashableView<C> for RegisterView<C, T>
+impl<C, T> HashableView for RegisterView<C, T>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     T: Clone + Default + Send + Sync + Serialize + DeserializeOwned,
 {
     type Hasher = sha3::Sha3_256;
@@ -233,6 +257,7 @@ where
 pub type HashedRegisterView<C, T> =
     WrappedHashableContainerView<C, RegisterView<C, T>, HasherOutput>;
 
+#[cfg(with_graphql)]
 mod graphql {
     use std::borrow::Cow;
 
@@ -241,7 +266,7 @@ mod graphql {
 
     impl<C, T> async_graphql::OutputType for RegisterView<C, T>
     where
-        C: Context + Send + Sync,
+        C: Context,
         T: async_graphql::OutputType + Send + Sync,
     {
         fn type_name() -> Cow<'static, str> {

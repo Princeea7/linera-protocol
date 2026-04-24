@@ -6,33 +6,32 @@ use std::{env, sync::Arc};
 use anyhow::Result;
 use async_trait::async_trait;
 use linera_base::data_types::Amount;
-use linera_client::persistent::{self, Persist};
+use linera_persistent::{self as persistent, Persist};
 use tempfile::{tempdir, TempDir};
 
 use super::{
-    local_net::PathProvider, ClientWrapper, Faucet, FaucetOption, LineraNet, LineraNetConfig,
-    Network, OnClientDrop,
+    local_net::PathProvider, ClientWrapper, Faucet, LineraNet, LineraNetConfig, Network,
+    OnClientDrop,
 };
 
 pub struct RemoteNetTestingConfig {
     faucet: Faucet,
+    close_chains: OnClientDrop,
 }
 
 impl RemoteNetTestingConfig {
     /// Creates a new [`RemoteNetTestingConfig`] for running tests with an external Linera
     /// network.
     ///
-    /// The `faucet_url` is used to connect to the network and obtain its configuration,
-    /// as well as to create microchains used for testing. If the parameter is [`None`],
-    /// then it falls back to the URL specified in the `LINERA_FAUCET_URL` environment
-    /// variable, or the default devnet faucet URL.
-    pub fn new(faucet_url: Option<String>) -> Self {
+    /// The faucet URL is obtained from the `LINERA_FAUCET_URL` environment variable.
+    /// If `close_chains` is true, chains will be closed on drop, otherwise they will be left active.
+    pub fn new(close_chains: OnClientDrop) -> Self {
         Self {
             faucet: Faucet::new(
-                faucet_url
-                    .or_else(|| env::var("LINERA_FAUCET_URL").ok())
+                env::var("LINERA_FAUCET_URL")
                     .expect("Missing `LINERA_FAUCET_URL` environment variable"),
             ),
+            close_chains,
         }
     }
 }
@@ -42,23 +41,20 @@ impl LineraNetConfig for RemoteNetTestingConfig {
     type Net = RemoteNet;
 
     async fn instantiate(self) -> Result<(Self::Net, ClientWrapper)> {
-        let seed = 37;
-        let mut net = RemoteNet::new(Some(seed), &self.faucet)
+        let mut net = RemoteNet::new(None, &self.faucet, self.close_chains)
             .await
             .expect("Creating RemoteNet should not fail");
 
         let client = net.make_client().await;
         // The tests assume we've created a genesis config with 2
         // chains with 10 tokens each. We create the first chain here
-        client
-            .wallet_init(&[], FaucetOption::NewChain(&self.faucet))
-            .await
-            .unwrap();
+        client.wallet_init(Some(&self.faucet)).await?;
+        client.request_chain(&self.faucet, true).await?;
 
         // And the remaining 2 here
         for _ in 0..2 {
             client
-                .open_and_assign(&client, Amount::from_tokens(10))
+                .open_and_assign(&client, Amount::from_tokens(100))
                 .await
                 .unwrap();
         }
@@ -74,6 +70,7 @@ pub struct RemoteNet {
     testing_prng_seed: Option<u64>,
     next_client_id: usize,
     tmp_dir: Arc<TempDir>,
+    close_chains: OnClientDrop,
 }
 
 #[async_trait]
@@ -94,7 +91,7 @@ impl LineraNet for RemoteNet {
             self.network,
             self.testing_prng_seed,
             self.next_client_id,
-            OnClientDrop::CloseChains,
+            self.close_chains,
         );
         if let Some(seed) = self.testing_prng_seed {
             self.testing_prng_seed = Some(seed + 1);
@@ -110,7 +107,11 @@ impl LineraNet for RemoteNet {
 }
 
 impl RemoteNet {
-    async fn new(testing_prng_seed: Option<u64>, faucet: &Faucet) -> Result<Self> {
+    async fn new(
+        testing_prng_seed: Option<u64>,
+        faucet: &Faucet,
+        close_chains: OnClientDrop,
+    ) -> Result<Self> {
         let tmp_dir = Arc::new(tempdir()?);
         // Write json config to disk
         persistent::File::new(
@@ -124,6 +125,7 @@ impl RemoteNet {
             testing_prng_seed,
             next_client_id: 0,
             tmp_dir,
+            close_chains,
         })
     }
 }

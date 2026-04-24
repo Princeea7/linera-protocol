@@ -5,11 +5,18 @@
 
 use async_graphql::{Request, Response};
 use linera_sdk::linera_base_types::{ContractAbi, ServiceAbi};
+use serde::{Deserialize, Serialize};
 
 pub struct CounterAbi;
 
+#[derive(Debug, Deserialize, Serialize)]
+pub enum CounterOperation {
+    /// Increment the counter by the given value
+    Increment { value: u64 },
+}
+
 impl ContractAbi for CounterAbi {
-    type Operation = u64;
+    type Operation = CounterOperation;
     type Response = u64;
 }
 

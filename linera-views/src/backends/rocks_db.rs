@@ -14,25 +14,25 @@ use std::{
 };
 
 use linera_base::ensure;
-use rocksdb::{BlockBasedOptions, Cache, DBCompactionStyle};
+use rocksdb::{BlockBasedOptions, Cache, DBCompactionStyle, SliceTransform, WriteBufferManager};
 use serde::{Deserialize, Serialize};
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tempfile::TempDir;
 use thiserror::Error;
 
 #[cfg(with_metrics)]
-use crate::metering::MeteredStore;
+use crate::metering::MeteredDatabase;
 #[cfg(with_testing)]
-use crate::store::TestKeyValueStore;
+use crate::store::TestKeyValueDatabase;
 use crate::{
     batch::{Batch, WriteOperation},
     common::get_upper_bound_option,
-    lru_caching::{LruCachingConfig, LruCachingStore},
+    lru_caching::{LruCachingConfig, LruCachingDatabase},
     store::{
-        AdminKeyValueStore, CommonStoreInternalConfig, KeyValueStoreError, ReadableKeyValueStore,
-        WithError, WritableKeyValueStore,
+        KeyValueDatabase, KeyValueStoreError, ReadableKeyValueStore, WithError,
+        WritableKeyValueStore,
     },
-    value_splitting::{ValueSplittingError, ValueSplittingStore},
+    value_splitting::{ValueSplittingDatabase, ValueSplittingError},
 };
 
 /// The prefixes being used in the system
@@ -43,17 +43,29 @@ static STORED_ROOT_KEYS_PREFIX: u8 = 1;
 #[cfg(with_testing)]
 const TEST_ROCKS_DB_MAX_STREAM_QUERIES: usize = 10;
 
-// The maximum size of values in RocksDB is 3 GB
-// That is 3221225472 and so for offset reason we decrease by 400
-const MAX_VALUE_SIZE: usize = 3221225072;
+// The maximum size of values in RocksDB is 3 GiB
+// For offset reasons we decrease by 400
+const MAX_VALUE_SIZE: usize = 3 * 1024 * 1024 * 1024 - 400;
 
-// The maximum size of keys in RocksDB is 8 MB
-// 8388608 and so for offset reason we decrease by 400
-const MAX_KEY_SIZE: usize = 8388208;
+// The maximum size of keys in RocksDB is 8 MiB
+// For offset reasons we decrease by 400
+const MAX_KEY_SIZE: usize = 8 * 1024 * 1024 - 400;
 
-const WRITE_BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64 MB
-const MAX_WRITE_BUFFER_NUMBER: i32 = 32;
-const HYPER_CLOCK_CACHE_BLOCK_SIZE: usize = 8 * 1024; // 8 KB
+const WRITE_BUFFER_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
+const MAX_WRITE_BUFFER_NUMBER: i32 = 6;
+
+fn get_available_memory(sys: &System) -> usize {
+    sys.cgroup_limits()
+        .map_or_else(|| sys.total_memory() as usize, |c| c.total_memory as usize)
+}
+
+fn get_available_cpus() -> i32 {
+    std::thread::available_parallelism()
+        .map(|p| p.get() as i32)
+        .unwrap_or(1)
+}
+
+const HYPER_CLOCK_CACHE_BLOCK_SIZE: usize = 8 * 1024; // 8 KiB
 
 /// The RocksDB client that we use.
 type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
@@ -123,7 +135,7 @@ struct RocksDbStoreExecutor {
 }
 
 impl RocksDbStoreExecutor {
-    pub fn contains_keys_internal(
+    fn contains_keys_internal(
         &self,
         keys: Vec<Vec<u8>>,
     ) -> Result<Vec<bool>, RocksDbStoreInternalError> {
@@ -166,25 +178,41 @@ impl RocksDbStoreExecutor {
         Ok(entries.into_iter().collect::<Result<_, _>>()?)
     }
 
+    fn get_find_prefix_iterator(
+        &self,
+        prefix: &[u8],
+    ) -> rocksdb::DBRawIteratorWithThreadMode<'_, DB> {
+        // Configure ReadOptions optimized for SSDs and iterator performance
+        let mut read_opts = rocksdb::ReadOptions::default();
+        // Enable async I/O for better concurrency
+        read_opts.set_async_io(true);
+
+        // Set precise upper bound to minimize key traversal
+        let upper_bound = get_upper_bound_option(prefix);
+        if let Some(upper_bound) = upper_bound {
+            read_opts.set_iterate_upper_bound(upper_bound);
+        }
+
+        let mut iter = self.db.raw_iterator_opt(read_opts);
+        iter.seek(prefix);
+        iter
+    }
+
     fn find_keys_by_prefix_internal(
         &self,
         key_prefix: Vec<u8>,
     ) -> Result<Vec<Vec<u8>>, RocksDbStoreInternalError> {
         check_key_size(&key_prefix)?;
+
         let mut prefix = self.start_key.clone();
         prefix.extend(key_prefix);
         let len = prefix.len();
-        let mut iter = self.db.raw_iterator();
+
+        let mut iter = self.get_find_prefix_iterator(&prefix);
         let mut keys = Vec::new();
-        iter.seek(&prefix);
-        let mut next_key = iter.key();
-        while let Some(key) = next_key {
-            if !key.starts_with(&prefix) {
-                break;
-            }
+        while let Some(key) = iter.key() {
             keys.push(key[len..].to_vec());
             iter.next();
-            next_key = iter.key();
         }
         Ok(keys)
     }
@@ -198,20 +226,13 @@ impl RocksDbStoreExecutor {
         let mut prefix = self.start_key.clone();
         prefix.extend(key_prefix);
         let len = prefix.len();
-        let mut iter = self.db.raw_iterator();
+
+        let mut iter = self.get_find_prefix_iterator(&prefix);
         let mut key_values = Vec::new();
-        iter.seek(&prefix);
-        let mut next_key = iter.key();
-        while let Some(key) = next_key {
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if let Some(value) = iter.value() {
-                let key_value = (key[len..].to_vec(), value.to_vec());
-                key_values.push(key_value);
-            }
+        while let Some((key, value)) = iter.item() {
+            let key_value = (key[len..].to_vec(), value.to_vec());
+            key_values.push(key_value);
             iter.next();
-            next_key = iter.key();
         }
         Ok(key_values)
     }
@@ -260,10 +281,23 @@ impl RocksDbStoreExecutor {
 #[derive(Clone)]
 pub struct RocksDbStoreInternal {
     executor: RocksDbStoreExecutor,
-    _path_with_guard: PathWithGuard,
+    path_with_guard: PathWithGuard,
     max_stream_queries: usize,
     spawn_mode: RocksDbSpawnMode,
     root_key_written: Arc<AtomicBool>,
+}
+
+/// Database-level connection to RocksDB for managing namespaces and partitions.
+#[derive(Clone)]
+pub struct RocksDbDatabaseInternal {
+    executor: RocksDbStoreExecutor,
+    path_with_guard: PathWithGuard,
+    max_stream_queries: usize,
+    spawn_mode: RocksDbSpawnMode,
+}
+
+impl WithError for RocksDbDatabaseInternal {
+    type Error = RocksDbStoreInternalError;
 }
 
 /// The initial configuration of the system
@@ -272,12 +306,12 @@ pub struct RocksDbStoreInternalConfig {
     /// The path to the storage containing the namespaces
     pub path_with_guard: PathWithGuard,
     /// The chosen spawn mode
-    spawn_mode: RocksDbSpawnMode,
-    /// The common configuration of the key value store
-    common_config: CommonStoreInternalConfig,
+    pub spawn_mode: RocksDbSpawnMode,
+    /// Preferred buffer size for async streams.
+    pub max_stream_queries: usize,
 }
 
-impl RocksDbStoreInternal {
+impl RocksDbDatabaseInternal {
     fn check_namespace(namespace: &str) -> Result<(), RocksDbStoreInternalError> {
         if !namespace
             .chars()
@@ -291,45 +325,62 @@ impl RocksDbStoreInternal {
     fn build(
         config: &RocksDbStoreInternalConfig,
         namespace: &str,
+    ) -> Result<RocksDbDatabaseInternal, RocksDbStoreInternalError> {
+        let start_key = ROOT_KEY_DOMAIN.to_vec();
+        // Create a store to extract its executor and configuration
+        let temp_store = RocksDbStoreInternal::build(config, namespace, start_key)?;
+        Ok(RocksDbDatabaseInternal {
+            executor: temp_store.executor,
+            path_with_guard: temp_store.path_with_guard,
+            max_stream_queries: temp_store.max_stream_queries,
+            spawn_mode: temp_store.spawn_mode,
+        })
+    }
+}
+
+impl RocksDbStoreInternal {
+    fn build(
+        config: &RocksDbStoreInternalConfig,
+        namespace: &str,
         start_key: Vec<u8>,
     ) -> Result<RocksDbStoreInternal, RocksDbStoreInternalError> {
-        Self::check_namespace(namespace)?;
+        RocksDbDatabaseInternal::check_namespace(namespace)?;
         let mut path_buf = config.path_with_guard.path_buf.clone();
         let mut path_with_guard = config.path_with_guard.clone();
         path_buf.push(namespace);
         path_with_guard.path_buf = path_buf.clone();
-        let max_stream_queries = config.common_config.max_stream_queries;
+        let max_stream_queries = config.max_stream_queries;
         let spawn_mode = config.spawn_mode;
         if !std::path::Path::exists(&path_buf) {
-            std::fs::create_dir(path_buf.clone())?;
+            std::fs::create_dir_all(path_buf.clone())?;
         }
         let sys = System::new_with_specifics(
-            RefreshKind::nothing()
-                .with_cpu(CpuRefreshKind::everything())
-                .with_memory(MemoryRefreshKind::nothing().with_ram()),
+            RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
         );
-        let num_cpus = sys.cpus().len() as i32;
-        let total_ram = sys.total_memory() as usize;
+        let num_cpus = get_available_cpus();
+        let total_ram = get_available_memory(&sys);
+
         let mut options = rocksdb::Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
+
         // Flush in-memory buffer to disk more often
         options.set_write_buffer_size(WRITE_BUFFER_SIZE);
         options.set_max_write_buffer_number(MAX_WRITE_BUFFER_NUMBER);
         options.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        options.set_level_zero_slowdown_writes_trigger(12);
-        options.set_level_zero_stop_writes_trigger(20);
-        // We use half the available CPUs for RocksDB parallelism to allow concurrent operations
-        // while leaving resources for other application tasks. Using a third of CPUs for background
-        // jobs (compactions, flushes) balances background maintenance with foreground operations,
-        // preventing RocksDB from consuming too many system resources, while still keeping good
-        // performance.
-        options.increase_parallelism((num_cpus / 2).max(1));
-        options.set_max_background_jobs((num_cpus / 3).max(1));
+        options.set_level_zero_slowdown_writes_trigger(8);
+        options.set_level_zero_stop_writes_trigger(12);
+        options.set_level_zero_file_num_compaction_trigger(2);
+        // We deliberately give RocksDB one background thread *per* CPU so that
+        // flush + (N-1) compactions can hammer the NVMe at full bandwidth while
+        // still leaving enough CPU time for the foreground application threads.
+        options.increase_parallelism(num_cpus);
+        options.set_max_background_jobs(num_cpus);
+        options.set_max_subcompactions(num_cpus as u32);
         options.set_level_compaction_dynamic_level_bytes(true);
 
         options.set_compaction_style(DBCompactionStyle::Level);
-        options.set_target_file_size_base(WRITE_BUFFER_SIZE as u64);
+        options.set_target_file_size_base(2 * WRITE_BUFFER_SIZE as u64);
 
         let mut block_options = BlockBasedOptions::default();
         block_options.set_pin_l0_filter_and_index_blocks_in_cache(true);
@@ -343,7 +394,37 @@ impl RocksDbStoreInternal {
             total_ram / 4,
             HYPER_CLOCK_CACHE_BLOCK_SIZE,
         ));
+
+        // Cap total memtable memory to prevent unbounded growth when multiple column
+        // families are used or many memtables accumulate before flushing.
+        let write_buffer_manager =
+            WriteBufferManager::new_write_buffer_manager(total_ram / 4, true);
+        options.set_write_buffer_manager(&write_buffer_manager);
+
+        // Configure bloom filters for prefix iteration optimization
+        block_options.set_bloom_filter(10.0, false);
+        block_options.set_whole_key_filtering(false);
+
+        // 32KB blocks instead of default 4KB - reduces iterator seeks
+        block_options.set_block_size(32 * 1024);
+        // Use latest format for better compression and performance
+        block_options.set_format_version(5);
+
         options.set_block_based_table_factory(&block_options);
+
+        // Configure prefix extraction for bloom filter optimization
+        // Use 8 bytes: ROOT_KEY_DOMAIN (1 byte) + BCS variant (1-2 bytes) + identifier start (4-5 bytes)
+        let prefix_extractor = SliceTransform::create_fixed_prefix(8);
+        options.set_prefix_extractor(prefix_extractor);
+
+        // 12.5% of memtable size for bloom filter
+        options.set_memtable_prefix_bloom_ratio(0.125);
+        // Skip bloom filter for memtable when key exists
+        options.set_optimize_filters_for_hits(true);
+        // Use memory-mapped files for faster reads
+        options.set_allow_mmap_reads(true);
+        // Don't use random access pattern since we do prefix scans
+        options.set_advise_random_on_open(false);
 
         let db = DB::open(&options, path_buf)?;
         let executor = RocksDbStoreExecutor {
@@ -352,7 +433,7 @@ impl RocksDbStoreInternal {
         };
         Ok(RocksDbStoreInternal {
             executor,
-            _path_with_guard: path_with_guard,
+            path_with_guard,
             max_stream_queries,
             spawn_mode,
             root_key_written: Arc::new(AtomicBool::new(false)),
@@ -366,11 +447,15 @@ impl WithError for RocksDbStoreInternal {
 
 impl ReadableKeyValueStore for RocksDbStoreInternal {
     const MAX_KEY_SIZE: usize = MAX_KEY_SIZE;
-    type Keys = Vec<Vec<u8>>;
-    type KeyValues = Vec<(Vec<u8>, Vec<u8>)>;
 
     fn max_stream_queries(&self) -> usize {
         self.max_stream_queries
+    }
+
+    fn root_key(&self) -> Result<Vec<u8>, RocksDbStoreInternalError> {
+        assert!(self.executor.start_key.starts_with(&ROOT_KEY_DOMAIN));
+        let root_key = bcs::from_bytes(&self.executor.start_key[ROOT_KEY_DOMAIN.len()..])?;
+        Ok(root_key)
     }
 
     async fn read_value_bytes(
@@ -406,28 +491,31 @@ impl ReadableKeyValueStore for RocksDbStoreInternal {
 
     async fn contains_keys(
         &self,
-        keys: Vec<Vec<u8>>,
+        keys: &[Vec<u8>],
     ) -> Result<Vec<bool>, RocksDbStoreInternalError> {
         let executor = self.executor.clone();
         self.spawn_mode
-            .spawn(move |x| executor.contains_keys_internal(x), keys)
+            .spawn(move |x| executor.contains_keys_internal(x), keys.to_vec())
             .await
     }
 
     async fn read_multi_values_bytes(
         &self,
-        keys: Vec<Vec<u8>>,
+        keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, RocksDbStoreInternalError> {
         let executor = self.executor.clone();
         self.spawn_mode
-            .spawn(move |x| executor.read_multi_values_bytes_internal(x), keys)
+            .spawn(
+                move |x| executor.read_multi_values_bytes_internal(x),
+                keys.to_vec(),
+            )
             .await
     }
 
     async fn find_keys_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::Keys, RocksDbStoreInternalError> {
+    ) -> Result<Vec<Vec<u8>>, RocksDbStoreInternalError> {
         let executor = self.executor.clone();
         let key_prefix = key_prefix.to_vec();
         self.spawn_mode
@@ -441,7 +529,7 @@ impl ReadableKeyValueStore for RocksDbStoreInternal {
     async fn find_key_values_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::KeyValues, RocksDbStoreInternalError> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksDbStoreInternalError> {
         let executor = self.executor.clone();
         let key_prefix = key_prefix.to_vec();
         self.spawn_mode
@@ -472,8 +560,9 @@ impl WritableKeyValueStore for RocksDbStoreInternal {
     }
 }
 
-impl AdminKeyValueStore for RocksDbStoreInternal {
+impl KeyValueDatabase for RocksDbDatabaseInternal {
     type Config = RocksDbStoreInternalConfig;
+    type Store = RocksDbStoreInternal;
 
     fn get_name() -> String {
         "rocksdb internal".to_string()
@@ -483,17 +572,25 @@ impl AdminKeyValueStore for RocksDbStoreInternal {
         config: &Self::Config,
         namespace: &str,
     ) -> Result<Self, RocksDbStoreInternalError> {
-        let start_key = ROOT_KEY_DOMAIN.to_vec();
-        RocksDbStoreInternal::build(config, namespace, start_key)
+        Self::build(config, namespace)
     }
 
-    fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, RocksDbStoreInternalError> {
-        let mut store = self.clone();
+    fn open_shared(&self, root_key: &[u8]) -> Result<Self::Store, RocksDbStoreInternalError> {
         let mut start_key = ROOT_KEY_DOMAIN.to_vec();
-        start_key.extend(root_key);
-        store.executor.start_key = start_key;
-        store.root_key_written = Arc::new(AtomicBool::new(false));
-        Ok(store)
+        start_key.extend(bcs::to_bytes(root_key)?);
+        let mut executor = self.executor.clone();
+        executor.start_key = start_key;
+        Ok(RocksDbStoreInternal {
+            executor,
+            path_with_guard: self.path_with_guard.clone(),
+            max_stream_queries: self.max_stream_queries,
+            spawn_mode: self.spawn_mode,
+            root_key_written: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn open_exclusive(&self, root_key: &[u8]) -> Result<Self::Store, RocksDbStoreInternalError> {
+        self.open_shared(root_key)
     }
 
     async fn list_all(config: &Self::Config) -> Result<Vec<String>, RocksDbStoreInternalError> {
@@ -515,17 +612,20 @@ impl AdminKeyValueStore for RocksDbStoreInternal {
         Ok(namespaces)
     }
 
-    async fn list_root_keys(
-        config: &Self::Config,
-        namespace: &str,
-    ) -> Result<Vec<Vec<u8>>, RocksDbStoreInternalError> {
-        let start_key = vec![STORED_ROOT_KEYS_PREFIX];
-        let store = RocksDbStoreInternal::build(config, namespace, start_key)?;
-        store.find_keys_by_prefix(&[]).await
+    async fn list_root_keys(&self) -> Result<Vec<Vec<u8>>, RocksDbStoreInternalError> {
+        let mut store = self.open_shared(&[])?;
+        store.executor.start_key = vec![STORED_ROOT_KEYS_PREFIX];
+        let bcs_root_keys = store.find_keys_by_prefix(&[]).await?;
+        let mut root_keys = Vec::new();
+        for bcs_root_key in bcs_root_keys {
+            let root_key = bcs::from_bytes::<Vec<u8>>(&bcs_root_key)?;
+            root_keys.push(root_key);
+        }
+        Ok(root_keys)
     }
 
     async fn delete_all(config: &Self::Config) -> Result<(), RocksDbStoreInternalError> {
-        let namespaces = RocksDbStoreInternal::list_all(config).await?;
+        let namespaces = Self::list_all(config).await?;
         for namespace in namespaces {
             let mut path_buf = config.path_with_guard.path_buf.clone();
             path_buf.push(&namespace);
@@ -573,18 +673,15 @@ impl AdminKeyValueStore for RocksDbStoreInternal {
 }
 
 #[cfg(with_testing)]
-impl TestKeyValueStore for RocksDbStoreInternal {
+impl TestKeyValueDatabase for RocksDbDatabaseInternal {
     async fn new_test_config() -> Result<RocksDbStoreInternalConfig, RocksDbStoreInternalError> {
         let path_with_guard = PathWithGuard::new_testing();
-        let common_config = CommonStoreInternalConfig {
-            max_concurrent_queries: None,
-            max_stream_queries: TEST_ROCKS_DB_MAX_STREAM_QUERIES,
-        };
         let spawn_mode = RocksDbSpawnMode::get_spawn_mode_from_runtime();
+        let max_stream_queries = TEST_ROCKS_DB_MAX_STREAM_QUERIES;
         Ok(RocksDbStoreInternalConfig {
             path_with_guard,
             spawn_mode,
-            common_config,
+            max_stream_queries,
         })
     }
 }
@@ -612,8 +709,8 @@ pub enum RocksDbStoreInternalError {
     #[error("error in the conversion from OsString: {0:?}")]
     IntoStringError(OsString),
 
-    /// The key must have at most 8 MB
-    #[error("The key must have at most 8 MB")]
+    /// The key must have at most 8 MiB
+    #[error("The key must have at most 8 MiB")]
     KeyTooLong,
 
     /// Namespace contains forbidden characters
@@ -636,7 +733,7 @@ pub struct PathWithGuard {
     pub path_buf: PathBuf,
     /// The guard for the directory if one is needed
     #[serde(skip)]
-    _dir: Option<Arc<TempDir>>,
+    _dir_guard: Option<Arc<TempDir>>,
 }
 
 impl PathWithGuard {
@@ -644,7 +741,7 @@ impl PathWithGuard {
     pub fn new(path_buf: PathBuf) -> Self {
         Self {
             path_buf,
-            _dir: None,
+            _dir_guard: None,
         }
     }
 
@@ -653,8 +750,11 @@ impl PathWithGuard {
     fn new_testing() -> PathWithGuard {
         let dir = TempDir::new().unwrap();
         let path_buf = dir.path().to_path_buf();
-        let _dir = Some(Arc::new(dir));
-        PathWithGuard { path_buf, _dir }
+        let dir_guard = Some(Arc::new(dir));
+        PathWithGuard {
+            path_buf,
+            _dir_guard: dir_guard,
+        }
     }
 }
 
@@ -669,37 +769,19 @@ impl KeyValueStoreError for RocksDbStoreInternalError {
     const BACKEND: &'static str = "rocks_db";
 }
 
-/// The `RocksDbStore` composed type with metrics
-#[cfg(with_metrics)]
-pub type RocksDbStore = MeteredStore<
-    LruCachingStore<MeteredStore<ValueSplittingStore<MeteredStore<RocksDbStoreInternal>>>>,
->;
-
-/// The `RocksDbStore` composed type
-#[cfg(not(with_metrics))]
-pub type RocksDbStore = LruCachingStore<ValueSplittingStore<RocksDbStoreInternal>>;
-
 /// The composed error type for the `RocksDbStore`
 pub type RocksDbStoreError = ValueSplittingError<RocksDbStoreInternalError>;
 
 /// The composed config type for the `RocksDbStore`
 pub type RocksDbStoreConfig = LruCachingConfig<RocksDbStoreInternalConfig>;
 
-impl RocksDbStoreConfig {
-    /// Creates a new `RocksDbStoreConfig` from the input.
-    pub fn new(
-        spawn_mode: RocksDbSpawnMode,
-        path_with_guard: PathWithGuard,
-        common_config: crate::store::CommonStoreConfig,
-    ) -> RocksDbStoreConfig {
-        let inner_config = RocksDbStoreInternalConfig {
-            path_with_guard,
-            spawn_mode,
-            common_config: common_config.reduced(),
-        };
-        RocksDbStoreConfig {
-            inner_config,
-            storage_cache_config: common_config.storage_cache_config,
-        }
-    }
-}
+/// The `RocksDbDatabase` composed type with metrics
+#[cfg(with_metrics)]
+pub type RocksDbDatabase = MeteredDatabase<
+    LruCachingDatabase<
+        MeteredDatabase<ValueSplittingDatabase<MeteredDatabase<RocksDbDatabaseInternal>>>,
+    >,
+>;
+/// The `RocksDbDatabase` composed type
+#[cfg(not(with_metrics))]
+pub type RocksDbDatabase = LruCachingDatabase<ValueSplittingDatabase<RocksDbDatabaseInternal>>;

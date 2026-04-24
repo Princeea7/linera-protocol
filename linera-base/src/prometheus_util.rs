@@ -4,15 +4,17 @@
 //! This module defines utility functions for interacting with Prometheus (logging metrics, etc)
 
 use prometheus::{
-    exponential_buckets, histogram_opts, linear_buckets, register_histogram_vec,
-    register_int_counter_vec, HistogramVec, IntCounterVec, Opts,
+    exponential_buckets, histogram_opts, linear_buckets, register_histogram,
+    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
+    register_int_gauge_vec, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts,
 };
 
 use crate::time::Instant;
 
 const LINERA_NAMESPACE: &str = "linera";
 
-/// Wrapper around Prometheus register_int_counter_vec! macro which also sets the `linera` namespace
+/// Wrapper around Prometheus `register_int_counter_vec!` macro which also sets the `linera` namespace
 pub fn register_int_counter_vec(
     name: &str,
     description: &str,
@@ -20,6 +22,26 @@ pub fn register_int_counter_vec(
 ) -> IntCounterVec {
     let counter_opts = Opts::new(name, description).namespace(LINERA_NAMESPACE);
     register_int_counter_vec!(counter_opts, label_names).expect("IntCounter can be created")
+}
+
+/// Wrapper around Prometheus `register_int_counter_vec!` macro with `linera` namespace and a subsystem.
+/// Results in metrics named `linera_<subsystem>_<name>`.
+pub fn register_int_counter_vec_with_subsystem(
+    subsystem: &str,
+    name: &str,
+    description: &str,
+    label_names: &[&str],
+) -> IntCounterVec {
+    let counter_opts = Opts::new(name, description)
+        .namespace(LINERA_NAMESPACE)
+        .subsystem(subsystem);
+    register_int_counter_vec!(counter_opts, label_names).expect("IntCounter can be created")
+}
+
+/// Wrapper around Prometheus `register_int_counter!` macro which also sets the `linera` namespace
+pub fn register_int_counter(name: &str, description: &str) -> IntCounter {
+    let counter_opts = Opts::new(name, description).namespace(LINERA_NAMESPACE);
+    register_int_counter!(counter_opts).expect("IntCounter can be created")
 }
 
 /// Wrapper around Prometheus `register_histogram_vec!` macro which also sets the `linera` namespace
@@ -36,6 +58,99 @@ pub fn register_histogram_vec(
     };
 
     register_histogram_vec!(histogram_opts, label_names).expect("Histogram can be created")
+}
+
+/// Wrapper around Prometheus `register_histogram_vec!` macro with `linera` namespace and a subsystem.
+/// Results in metrics named `linera_<subsystem>_<name>`.
+pub fn register_histogram_vec_with_subsystem(
+    subsystem: &str,
+    name: &str,
+    description: &str,
+    label_names: &[&str],
+    buckets: Option<Vec<f64>>,
+) -> HistogramVec {
+    let histogram_opts = if let Some(buckets) = buckets {
+        histogram_opts!(name, description, buckets)
+            .namespace(LINERA_NAMESPACE)
+            .subsystem(subsystem)
+    } else {
+        histogram_opts!(name, description)
+            .namespace(LINERA_NAMESPACE)
+            .subsystem(subsystem)
+    };
+
+    register_histogram_vec!(histogram_opts, label_names).expect("Histogram can be created")
+}
+
+/// Wrapper around Prometheus `register_histogram!` macro which also sets the `linera` namespace
+pub fn register_histogram(name: &str, description: &str, buckets: Option<Vec<f64>>) -> Histogram {
+    let histogram_opts = if let Some(buckets) = buckets {
+        histogram_opts!(name, description, buckets).namespace(LINERA_NAMESPACE)
+    } else {
+        histogram_opts!(name, description).namespace(LINERA_NAMESPACE)
+    };
+
+    register_histogram!(histogram_opts).expect("Histogram can be created")
+}
+
+/// Wrapper around Prometheus `register_histogram!` macro with `linera` namespace and a subsystem.
+/// Results in metrics named `linera_<subsystem>_<name>`.
+pub fn register_histogram_with_subsystem(
+    subsystem: &str,
+    name: &str,
+    description: &str,
+    buckets: Option<Vec<f64>>,
+) -> Histogram {
+    let histogram_opts = if let Some(buckets) = buckets {
+        histogram_opts!(name, description, buckets)
+            .namespace(LINERA_NAMESPACE)
+            .subsystem(subsystem)
+    } else {
+        histogram_opts!(name, description)
+            .namespace(LINERA_NAMESPACE)
+            .subsystem(subsystem)
+    };
+
+    register_histogram!(histogram_opts).expect("Histogram can be created")
+}
+
+/// Wrapper around Prometheus `register_int_gauge!` macro which also sets the `linera` namespace
+pub fn register_int_gauge(name: &str, description: &str) -> IntGauge {
+    let gauge_opts = Opts::new(name, description).namespace(LINERA_NAMESPACE);
+    register_int_gauge!(gauge_opts).expect("IntGauge can be created")
+}
+
+/// Wrapper around Prometheus `register_int_gauge!` macro with `linera` namespace and a subsystem.
+/// Results in metrics named `linera_<subsystem>_<name>`.
+pub fn register_int_gauge_with_subsystem(
+    subsystem: &str,
+    name: &str,
+    description: &str,
+) -> IntGauge {
+    let gauge_opts = Opts::new(name, description)
+        .namespace(LINERA_NAMESPACE)
+        .subsystem(subsystem);
+    register_int_gauge!(gauge_opts).expect("IntGauge can be created")
+}
+
+/// Wrapper around Prometheus `register_int_gauge_vec!` macro which also sets the `linera` namespace
+pub fn register_int_gauge_vec(name: &str, description: &str, label_names: &[&str]) -> IntGaugeVec {
+    let gauge_opts = Opts::new(name, description).namespace(LINERA_NAMESPACE);
+    register_int_gauge_vec!(gauge_opts, label_names).expect("IntGauge can be created")
+}
+
+/// Wrapper around Prometheus `register_int_gauge_vec!` macro with `linera` namespace and a subsystem.
+/// Results in metrics named `linera_<subsystem>_<name>`.
+pub fn register_int_gauge_vec_with_subsystem(
+    subsystem: &str,
+    name: &str,
+    description: &str,
+    label_names: &[&str],
+) -> IntGaugeVec {
+    let gauge_opts = Opts::new(name, description)
+        .namespace(LINERA_NAMESPACE)
+        .subsystem(subsystem);
+    register_int_gauge_vec!(gauge_opts, label_names).expect("IntGauge can be created")
 }
 
 /// Construct the bucket interval exponentially starting from a value and an ending value.
@@ -69,9 +184,12 @@ pub fn linear_bucket_interval(start_value: f64, width: f64, end_value: f64) -> O
     Some(buckets)
 }
 
-/// Construct the latencies linearly starting from 1 and ending at the maximum latency
-pub fn linear_bucket_latencies(max_latency: f64) -> Option<Vec<f64>> {
-    linear_bucket_interval(1.0, 50.0, max_latency)
+/// The unit of measurement for latency metrics.
+enum MeasurementUnit {
+    /// Measure latency in milliseconds.
+    Milliseconds,
+    /// Measure latency in microseconds.
+    Microseconds,
 }
 
 /// A guard for an active latency measurement.
@@ -83,6 +201,7 @@ where
 {
     start: Instant,
     metric: Option<&'metric Metric>,
+    unit: MeasurementUnit,
 }
 
 impl<Metric> ActiveMeasurementGuard<'_, Metric>
@@ -90,17 +209,23 @@ where
     Metric: MeasureLatency,
 {
     /// Finishes the measurement, updates the `Metric` and returns the measured latency in
-    /// milliseconds.
+    /// the unit specified when the measurement was started.
     pub fn finish(mut self) -> f64 {
         self.finish_by_ref()
     }
 
     /// Finishes the measurement without taking ownership of this [`ActiveMeasurementGuard`],
-    /// updates the `Metric` and returns the measured latency in milliseconds.
+    /// updates the `Metric` and returns the measured latency in the unit specified when
+    /// the measurement was started.
     fn finish_by_ref(&mut self) -> f64 {
         match self.metric.take() {
             Some(metric) => {
-                let latency = self.start.elapsed().as_secs_f64() * 1000.0;
+                let latency = match self.unit {
+                    MeasurementUnit::Milliseconds => self.start.elapsed().as_secs_f64() * 1000.0,
+                    MeasurementUnit::Microseconds => {
+                        self.start.elapsed().as_secs_f64() * 1_000_000.0
+                    }
+                };
                 metric.finish_measurement(latency);
                 latency
             }
@@ -124,9 +249,13 @@ where
 
 /// An extension trait for metrics that can be used to measure latencies.
 pub trait MeasureLatency: Sized {
-    /// Starts measuring the latency, finishing when the returned
+    /// Starts measuring the latency in milliseconds, finishing when the returned
     /// [`ActiveMeasurementGuard`] is dropped.
     fn measure_latency(&self) -> ActiveMeasurementGuard<'_, Self>;
+
+    /// Starts measuring the latency in microseconds, finishing when the returned
+    /// [`ActiveMeasurementGuard`] is dropped.
+    fn measure_latency_us(&self) -> ActiveMeasurementGuard<'_, Self>;
 
     /// Updates the metric with measured latency in `milliseconds`.
     fn finish_measurement(&self, milliseconds: f64);
@@ -137,11 +266,42 @@ impl MeasureLatency for HistogramVec {
         ActiveMeasurementGuard {
             start: Instant::now(),
             metric: Some(self),
+            unit: MeasurementUnit::Milliseconds,
+        }
+    }
+
+    fn measure_latency_us(&self) -> ActiveMeasurementGuard<'_, Self> {
+        ActiveMeasurementGuard {
+            start: Instant::now(),
+            metric: Some(self),
+            unit: MeasurementUnit::Microseconds,
         }
     }
 
     fn finish_measurement(&self, milliseconds: f64) {
         self.with_label_values(&[]).observe(milliseconds);
+    }
+}
+
+impl MeasureLatency for Histogram {
+    fn measure_latency(&self) -> ActiveMeasurementGuard<'_, Self> {
+        ActiveMeasurementGuard {
+            start: Instant::now(),
+            metric: Some(self),
+            unit: MeasurementUnit::Milliseconds,
+        }
+    }
+
+    fn measure_latency_us(&self) -> ActiveMeasurementGuard<'_, Self> {
+        ActiveMeasurementGuard {
+            start: Instant::now(),
+            metric: Some(self),
+            unit: MeasurementUnit::Microseconds,
+        }
+    }
+
+    fn finish_measurement(&self, milliseconds: f64) {
+        self.observe(milliseconds);
     }
 }
 

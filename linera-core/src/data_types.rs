@@ -2,7 +2,7 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, ops::Not};
+use std::{collections::BTreeMap, fmt, ops::Not};
 
 use custom_debug_derive::Debug;
 use linera_base::{
@@ -11,52 +11,20 @@ use linera_base::{
         ValidatorSignature,
     },
     data_types::{Amount, BlockHeight, ChainDescription, Epoch, Round, Timestamp},
-    identifiers::{AccountOwner, ChainId},
+    identifiers::{AccountOwner, ChainId, StreamId},
 };
 use linera_chain::{
     data_types::{ChainAndHeight, IncomingBundle, MessageBundle},
     manager::ChainManagerInfo,
+    types::ConfirmedBlockCertificate,
     ChainStateView,
 };
-use linera_execution::{committee::Committee, ExecutionRuntimeContext};
+use linera_execution::ExecutionRuntimeContext;
 use linera_storage::ChainRuntimeContext;
-use linera_views::context::Context;
+use linera_views::{context::Context, ViewError};
 use serde::{Deserialize, Serialize};
 
-use crate::client::ChainClientError;
-
-/// A range of block heights as used in `ChainInfoQuery`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(with_testing, derive(test_strategy::Arbitrary, Eq, PartialEq))]
-pub struct BlockHeightRange {
-    /// Starting point
-    pub start: BlockHeight,
-    /// Optional limit on the number of elements.
-    #[debug(skip_if = Option::is_none)]
-    pub limit: Option<u64>,
-}
-
-impl BlockHeightRange {
-    /// Creates a range containing only the single specified block height.
-    pub fn single(start: BlockHeight) -> BlockHeightRange {
-        let limit = Some(1);
-        BlockHeightRange { start, limit }
-    }
-
-    /// Creates a range starting at the specified block height and containing up to `limit` elements.
-    pub fn multi(start: BlockHeight, limit: u64) -> BlockHeightRange {
-        BlockHeightRange {
-            start,
-            limit: Some(limit),
-        }
-    }
-
-    /// Returns the highest block height in the range.
-    pub fn highest(&self) -> BlockHeight {
-        self.limit
-            .map_or(self.start, |limit| BlockHeight(self.start.0 + limit - 1))
-    }
-}
+use crate::client::chain_client;
 
 /// Request information about a chain.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,21 +43,25 @@ pub struct ChainInfoQuery {
     /// Query the received messages that are waiting to be picked in the next block.
     #[debug(skip_if = Not::not)]
     pub request_pending_message_bundles: bool,
-    /// Query a range of certificate hashes sent from the chain.
-    #[debug(skip_if = Option::is_none)]
-    pub request_sent_certificate_hashes_in_range: Option<BlockHeightRange>,
     /// Query new certificate sender chain IDs and block heights received from the chain.
     #[debug(skip_if = Option::is_none)]
     pub request_received_log_excluding_first_n: Option<u64>,
     /// Query values from the chain manager, not just votes.
     #[debug(skip_if = Not::not)]
     pub request_manager_values: bool,
-    /// Include a timeout vote for the current round, if appropriate.
-    #[debug(skip_if = Not::not)]
-    pub request_leader_timeout: bool,
+    /// Include a timeout vote for the specified round, if appropriate.
+    #[debug(skip_if = Option::is_none)]
+    pub request_leader_timeout: Option<(BlockHeight, Round)>,
     /// Include a vote to switch to fallback mode, if appropriate.
     #[debug(skip_if = Not::not)]
     pub request_fallback: bool,
+    /// Query for certificate hashes at block heights.
+    #[debug(skip_if = Vec::is_empty, with = "debug_compressed_heights")]
+    pub request_sent_certificate_hashes_by_heights: Vec<BlockHeight>,
+    /// Query the previous event blocks for specific streams.
+    #[debug(skip_if = Vec::is_empty)]
+    #[cfg_attr(with_testing, strategy(proptest::strategy::Just(Vec::new())))]
+    pub request_previous_event_blocks: Vec<StreamId>,
 }
 
 impl ChainInfoQuery {
@@ -100,26 +72,17 @@ impl ChainInfoQuery {
             request_committees: false,
             request_owner_balance: AccountOwner::CHAIN,
             request_pending_message_bundles: false,
-            request_sent_certificate_hashes_in_range: None,
             request_received_log_excluding_first_n: None,
             request_manager_values: false,
-            request_leader_timeout: false,
+            request_leader_timeout: None,
             request_fallback: false,
+            request_sent_certificate_hashes_by_heights: Vec::new(),
+            request_previous_event_blocks: Vec::new(),
         }
-    }
-
-    pub fn test_next_block_height(mut self, height: BlockHeight) -> Self {
-        self.test_next_block_height = Some(height);
-        self
     }
 
     pub fn with_committees(mut self) -> Self {
         self.request_committees = true;
-        self
-    }
-
-    pub fn with_owner_balance(mut self, owner: AccountOwner) -> Self {
-        self.request_owner_balance = owner;
         self
     }
 
@@ -128,8 +91,13 @@ impl ChainInfoQuery {
         self
     }
 
-    pub fn with_sent_certificate_hashes_in_range(mut self, range: BlockHeightRange) -> Self {
-        self.request_sent_certificate_hashes_in_range = Some(range);
+    pub fn with_sent_certificate_hashes_by_heights(mut self, heights: Vec<BlockHeight>) -> Self {
+        self.request_sent_certificate_hashes_by_heights = heights;
+        self
+    }
+
+    pub fn with_previous_event_blocks(mut self, stream_ids: Vec<StreamId>) -> Self {
+        self.request_previous_event_blocks = stream_ids;
         self
     }
 
@@ -143,11 +111,12 @@ impl ChainInfoQuery {
         self
     }
 
-    pub fn with_timeout(mut self) -> Self {
-        self.request_leader_timeout = true;
+    pub fn with_timeout(mut self, height: BlockHeight, round: Round) -> Self {
+        self.request_leader_timeout = Some((height, round));
         self
     }
 
+    #[cfg(with_testing)]
     pub fn with_fallback(mut self) -> Self {
         self.request_fallback = true;
         self
@@ -160,8 +129,7 @@ pub struct ChainInfo {
     /// The chain ID.
     pub chain_id: ChainId,
     /// The number identifying the current configuration.
-    #[debug(skip_if = Option::is_none)]
-    pub epoch: Option<Epoch>,
+    pub epoch: Epoch,
     /// The chain description.
     #[debug(skip_if = Option::is_none)]
     pub description: Option<ChainDescription>,
@@ -182,13 +150,13 @@ pub struct ChainInfo {
     /// The requested owner balance, if any.
     #[debug(skip_if = Option::is_none)]
     pub requested_owner_balance: Option<Amount>,
-    /// The current committees.
+    /// Committee blob hashes indexed by epoch, if requested.
     #[debug(skip_if = Option::is_none)]
-    pub requested_committees: Option<BTreeMap<Epoch, Committee>>,
+    pub requested_committees: Option<BTreeMap<Epoch, CryptoHash>>,
     /// The received messages that are waiting be picked in the next block (if requested).
     #[debug(skip_if = Vec::is_empty)]
     pub requested_pending_message_bundles: Vec<IncomingBundle>,
-    /// The response to `request_sent_certificate_hashes_in_range`
+    /// The response to `request_sent_certificate_hashes_by_heights`.
     #[debug(skip_if = Vec::is_empty)]
     pub requested_sent_certificate_hashes: Vec<CryptoHash>,
     /// The current number of received certificates (useful for `request_received_log_excluding_first_n`)
@@ -196,6 +164,9 @@ pub struct ChainInfo {
     /// The response to `request_received_certificates_excluding_first_n`
     #[debug(skip_if = Vec::is_empty)]
     pub requested_received_log: Vec<ChainAndHeight>,
+    /// The response to `request_previous_event_blocks`.
+    #[debug(skip_if = BTreeMap::is_empty)]
+    pub requested_previous_event_blocks: BTreeMap<StreamId, (BlockHeight, CryptoHash)>,
 }
 
 impl ChainInfo {
@@ -219,6 +190,16 @@ pub struct ChainInfoResponse {
     pub signature: Option<ValidatorSignature>,
 }
 
+/// Information about shard allocation for a chain.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(with_testing, derive(Eq, PartialEq))]
+pub struct ShardInfo {
+    /// The shard ID that will process this chain.
+    pub shard_id: usize,
+    /// The total number of shards in the validator.
+    pub total_shards: usize,
+}
+
 /// An internal request between chains within a validator.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]
@@ -229,12 +210,25 @@ pub enum CrossChainRequest {
         sender: ChainId,
         recipient: ChainId,
         bundles: Vec<(Epoch, MessageBundle)>,
+        /// The height of the sender's previous block that sent messages to this
+        /// recipient (before the first bundle in this request). `None` if the first
+        /// bundle is the first message ever sent to this recipient.
+        previous_height: Option<BlockHeight>,
     },
     /// Acknowledge the height of the highest confirmed blocks communicated with `UpdateRecipient`.
     ConfirmUpdatedRecipient {
         sender: ChainId,
         recipient: ChainId,
         latest_height: BlockHeight,
+    },
+    /// Request the sender to revert a previous confirmation and resend bundles
+    /// starting from the given height. This is used to recover from state
+    /// inconsistencies where the recipient lost persisted state after a
+    /// confirmation was sent.
+    RevertConfirm {
+        sender: ChainId,
+        recipient: ChainId,
+        retransmit_from: BlockHeight,
     },
 }
 
@@ -245,6 +239,7 @@ impl CrossChainRequest {
         match self {
             UpdateRecipient { recipient, .. } => *recipient,
             ConfirmUpdatedRecipient { sender, .. } => *sender,
+            RevertConfirm { sender, .. } => *sender,
         }
     }
 
@@ -260,18 +255,18 @@ impl CrossChainRequest {
     }
 }
 
-impl<C, S> From<&ChainStateView<C>> for ChainInfo
-where
-    C: Context<Extra = ChainRuntimeContext<S>> + Clone + Send + Sync + 'static,
-    ChainRuntimeContext<S>: ExecutionRuntimeContext,
-{
-    fn from(view: &ChainStateView<C>) -> Self {
+impl ChainInfo {
+    pub async fn from_chain_view<C, S>(view: &ChainStateView<C>) -> Result<Self, ViewError>
+    where
+        C: Context<Extra = ChainRuntimeContext<S>> + Clone + 'static,
+        ChainRuntimeContext<S>: ExecutionRuntimeContext,
+    {
         let system_state = &view.execution_state.system;
         let tip_state = view.tip_state.get();
-        ChainInfo {
+        Ok(ChainInfo {
             chain_id: view.chain_id(),
             epoch: *system_state.epoch.get(),
-            description: system_state.description.get().clone(),
+            description: system_state.description.get().await?.clone(),
             manager: Box::new(ChainManagerInfo::from(&view.manager)),
             chain_balance: *system_state.balance.get(),
             block_hash: tip_state.block_hash,
@@ -284,7 +279,8 @@ where
             requested_sent_certificate_hashes: Vec::new(),
             count_received_log: view.received_log.count(),
             requested_received_log: Vec::new(),
-        }
+            requested_previous_event_blocks: BTreeMap::new(),
+        })
     }
 }
 
@@ -301,21 +297,72 @@ impl ChainInfoResponse {
         self.signature = Some(ValidatorSignature::new(&*self.info, key_pair));
     }
 
-    pub fn check(&self, public_key: &ValidatorPublicKey) -> Result<(), CryptoError> {
+    pub fn check(&self, public_key: ValidatorPublicKey) -> Result<(), CryptoError> {
         match self.signature.as_ref() {
             Some(sig) => sig.check(&*self.info, public_key),
             None => Err(CryptoError::MissingValidatorSignature),
         }
     }
-
-    /// Returns the committee in the latest epoch.
-    pub fn latest_committee(&self) -> Option<&Committee> {
-        let committees = self.info.requested_committees.as_ref()?;
-        committees.get(&self.info.epoch?)
-    }
 }
 
 impl BcsSignable<'_> for ChainInfo {}
+
+/// Request for downloading certificates by heights.
+#[derive(Clone)]
+pub struct CertificatesByHeightRequest {
+    pub chain_id: ChainId,
+    pub heights: Vec<BlockHeight>,
+}
+
+/// Wrapper for displaying a sorted slice of [`BlockHeight`] as compressed ranges.
+///
+/// Contiguous heights are shown as `start..end` (inclusive), with gaps producing
+/// comma-separated entries: `[14810..15309, 15311, 15320..15400]`.
+pub(crate) struct CompressedHeights<'a>(pub(crate) &'a [BlockHeight]);
+
+/// Formats a `Vec<BlockHeight>` as compressed ranges for use with `#[debug(with = "...")]`.
+#[allow(clippy::ptr_arg)]
+pub(crate) fn debug_compressed_heights(
+    heights: &Vec<BlockHeight>,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    fmt::Debug::fmt(&CompressedHeights(heights), f)
+}
+
+impl fmt::Debug for CompressedHeights<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let heights = self.0;
+        write!(f, "[")?;
+        let mut index = 0;
+        while index < heights.len() {
+            if index > 0 {
+                write!(f, ", ")?;
+            }
+            let range_start = u64::from(heights[index]);
+            let mut range_end = range_start;
+            while index + 1 < heights.len() && u64::from(heights[index + 1]) == range_end + 1 {
+                index += 1;
+                range_end = u64::from(heights[index]);
+            }
+            if range_start == range_end {
+                write!(f, "{range_start}")?;
+            } else {
+                write!(f, "{range_start}..{range_end}")?;
+            }
+            index += 1;
+        }
+        write!(f, "]")
+    }
+}
+
+impl fmt::Debug for CertificatesByHeightRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CertificatesByHeightRequest")
+            .field("chain_id", &self.chain_id)
+            .field("heights", &CompressedHeights(&self.heights))
+            .finish()
+    }
+}
 
 /// The outcome of trying to commit a list of operations to the chain.
 #[derive(Debug)]
@@ -325,6 +372,8 @@ pub enum ClientOutcome<T> {
     /// We are not the round leader and cannot do anything. Try again at the specified time
     /// or whenever the round or block height changes.
     WaitForTimeout(RoundTimeout),
+    /// A different block was committed at the current block height.
+    Conflict(Box<ConfirmedBlockCertificate>),
 }
 
 #[derive(Debug)]
@@ -334,19 +383,32 @@ pub struct RoundTimeout {
     pub next_block_height: BlockHeight,
 }
 
+impl fmt::Display for RoundTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} at height {} times out at {}",
+            self.current_round, self.next_block_height, self.timestamp
+        )
+    }
+}
+
 impl<T> ClientOutcome<T> {
     #[cfg(with_testing)]
     pub fn unwrap(self) -> T {
         match self {
             ClientOutcome::Committed(t) => t,
-            ClientOutcome::WaitForTimeout(_) => panic!(),
+            ClientOutcome::WaitForTimeout(timeout) => panic!("unexpected timeout: {timeout}"),
+            ClientOutcome::Conflict(certificate) => {
+                panic!("unexpected conflict: {}", certificate.hash())
+            }
         }
     }
 
     pub fn expect(self, msg: &'static str) -> T {
         match self {
             ClientOutcome::Committed(t) => t,
-            ClientOutcome::WaitForTimeout(_) => panic!("{}", msg),
+            ClientOutcome::WaitForTimeout(_) | ClientOutcome::Conflict(_) => panic!("{}", msg),
         }
     }
 
@@ -357,16 +419,71 @@ impl<T> ClientOutcome<T> {
         match self {
             ClientOutcome::Committed(t) => ClientOutcome::Committed(f(t)),
             ClientOutcome::WaitForTimeout(timeout) => ClientOutcome::WaitForTimeout(timeout),
+            ClientOutcome::Conflict(certificate) => ClientOutcome::Conflict(certificate),
         }
     }
 
-    pub fn try_map<F, S>(self, f: F) -> Result<ClientOutcome<S>, ChainClientError>
+    pub fn try_map<F, S>(self, f: F) -> Result<ClientOutcome<S>, chain_client::Error>
     where
-        F: FnOnce(T) -> Result<S, ChainClientError>,
+        F: FnOnce(T) -> Result<S, chain_client::Error>,
     {
         match self {
             ClientOutcome::Committed(t) => Ok(ClientOutcome::Committed(f(t)?)),
             ClientOutcome::WaitForTimeout(timeout) => Ok(ClientOutcome::WaitForTimeout(timeout)),
+            ClientOutcome::Conflict(certificate) => Ok(ClientOutcome::Conflict(certificate)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use linera_base::data_types::BlockHeight;
+
+    use super::CompressedHeights;
+
+    #[test]
+    fn test_compressed_heights_empty() {
+        let heights: Vec<BlockHeight> = vec![];
+        assert_eq!(format!("{:?}", CompressedHeights(&heights)), "[]");
+    }
+
+    #[test]
+    fn test_compressed_heights_single() {
+        let heights = vec![BlockHeight::from(5)];
+        assert_eq!(format!("{:?}", CompressedHeights(&heights)), "[5]");
+    }
+
+    #[test]
+    fn test_compressed_heights_contiguous() {
+        let heights: Vec<BlockHeight> = (100..=105).map(BlockHeight::from).collect();
+        assert_eq!(format!("{:?}", CompressedHeights(&heights)), "[100..105]");
+    }
+
+    #[test]
+    fn test_compressed_heights_with_gaps() {
+        let heights = vec![
+            BlockHeight::from(1),
+            BlockHeight::from(2),
+            BlockHeight::from(3),
+            BlockHeight::from(5),
+            BlockHeight::from(7),
+            BlockHeight::from(8),
+            BlockHeight::from(9),
+            BlockHeight::from(10),
+        ];
+        assert_eq!(
+            format!("{:?}", CompressedHeights(&heights)),
+            "[1..3, 5, 7..10]"
+        );
+    }
+
+    #[test]
+    fn test_compressed_heights_all_isolated() {
+        let heights = vec![
+            BlockHeight::from(1),
+            BlockHeight::from(5),
+            BlockHeight::from(10),
+        ];
+        assert_eq!(format!("{:?}", CompressedHeights(&heights)), "[1, 5, 10]");
     }
 }

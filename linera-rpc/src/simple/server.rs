@@ -1,24 +1,27 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::{pin::Pin, sync::Arc};
+
 use async_trait::async_trait;
-use futures::{channel::mpsc, stream::StreamExt};
-use linera_base::{data_types::Blob, time::Duration};
+use futures::{channel::mpsc, lock::Mutex, Stream, StreamExt as _};
+use linera_base::{data_types::Blob, identifiers::ChainId, time::Duration};
 use linera_core::{
+    data_types::CrossChainRequest,
     node::NodeError,
-    worker::{NetworkActions, WorkerError, WorkerState},
+    worker::{NetworkActions, Notification, WorkerError, WorkerState},
     JoinSetExt as _,
 };
 use linera_storage::Storage;
-use rand::Rng;
-use tokio::{sync::oneshot, task::JoinSet};
+use tokio::{sync, sync::oneshot, task::JoinSet};
+use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, instrument};
 
 use super::transport::{MessageHandler, ServerHandle, TransportProtocol};
 use crate::{
     config::{CrossChainConfig, ShardId, ValidatorInternalNetworkPreConfig},
-    RpcMessage,
+    cross_chain_message_queue, RpcMessage,
 };
 
 #[derive(Clone)]
@@ -80,65 +83,44 @@ where
         network: ValidatorInternalNetworkPreConfig<TransportProtocol>,
         cross_chain_max_retries: u32,
         cross_chain_retry_delay: Duration,
+        cross_chain_max_backoff: Duration,
         cross_chain_sender_delay: Duration,
         cross_chain_sender_failure_rate: f32,
         this_shard: ShardId,
-        mut receiver: mpsc::Receiver<(RpcMessage, ShardId)>,
+        receiver: mpsc::Receiver<(CrossChainRequest, ShardId)>,
     ) {
-        let mut pool = network
-            .protocol
-            .make_outgoing_connection_pool()
-            .await
-            .expect("Initialization should not fail");
-
-        while let Some((message, shard_id)) = receiver.next().await {
-            if cross_chain_sender_failure_rate > 0.0
-                && rand::thread_rng().gen::<f32>() < cross_chain_sender_failure_rate
-            {
-                warn!("Dropped 1 cross-message intentionally.");
-                continue;
-            }
-
+        let pool = Arc::new(Mutex::new(
+            network
+                .protocol
+                .make_outgoing_connection_pool()
+                .await
+                .expect("Initialization should not fail"),
+        ));
+        let handle_request = move |shard_id, request| {
+            let pool = pool.clone();
             let shard = network.shard(shard_id);
             let remote_address = format!("{}:{}", shard.host, shard.port);
-
-            // Send the cross-chain query and retry if needed.
-            for i in 0..cross_chain_max_retries {
-                // Delay increases linearly with the attempt number.
-                linera_base::time::timer::sleep(
-                    cross_chain_sender_delay + cross_chain_retry_delay * i,
-                )
-                .await;
-
-                let status = pool.send_message_to(message.clone(), &remote_address).await;
-                match status {
-                    Err(error) => {
-                        warn!(
-                            nickname,
-                            %error,
-                            i,
-                            from_shard = this_shard,
-                            to_shard = shard_id,
-                            "Failed to send cross-chain query",
-                        );
-                    }
-                    _ => {
-                        debug!(
-                            from_shard = this_shard,
-                            to_shard = shard_id,
-                            "Sent cross-chain query",
-                        );
-                        break;
-                    }
-                }
-                error!(
-                    nickname,
-                    from_shard = this_shard,
-                    to_shard = shard_id,
-                    "Dropping cross-chain query",
-                );
+            let message = RpcMessage::CrossChainRequest(Box::new(request));
+            async move {
+                pool.lock()
+                    .await
+                    .send_message_to(message.clone(), &remote_address)
+                    .await?;
+                anyhow::Result::<_, anyhow::Error>::Ok(())
             }
-        }
+        };
+        cross_chain_message_queue::forward_cross_chain_queries(
+            nickname,
+            cross_chain_max_retries,
+            cross_chain_retry_delay,
+            cross_chain_max_backoff,
+            cross_chain_sender_delay,
+            cross_chain_sender_failure_rate,
+            this_shard,
+            receiver,
+            handle_request,
+        )
+        .await;
     }
 
     pub fn spawn(
@@ -155,11 +137,14 @@ where
         let (cross_chain_sender, cross_chain_receiver) =
             mpsc::channel(self.cross_chain_config.queue_size);
 
+        let (notification_sender, _) = sync::broadcast::channel(1000);
+
         join_set.spawn_task(Self::forward_cross_chain_queries(
             self.state.nickname().to_string(),
             self.network.clone(),
             self.cross_chain_config.max_retries,
             Duration::from_millis(self.cross_chain_config.retry_delay_ms),
+            Duration::from_millis(self.cross_chain_config.max_backoff_ms),
             Duration::from_millis(self.cross_chain_config.sender_delay_ms),
             self.cross_chain_config.sender_failure_rate,
             self.shard_id,
@@ -170,6 +155,7 @@ where
         let state = RunningServerState {
             server: self,
             cross_chain_sender,
+            notification_sender,
         };
         // Launch server for the appropriate protocol.
         protocol.spawn_server(address, state, shutdown_signal, join_set)
@@ -182,7 +168,8 @@ where
     S: Storage,
 {
     server: Server<S>,
-    cross_chain_sender: mpsc::Sender<(RpcMessage, ShardId)>,
+    cross_chain_sender: mpsc::Sender<(CrossChainRequest, ShardId)>,
+    notification_sender: sync::broadcast::Sender<Notification>,
 }
 
 #[async_trait]
@@ -209,8 +196,7 @@ where
                         Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info))))
                     }
                     Err(error) => {
-                        let nickname = self.server.state.nickname();
-                        warn!(nickname, %error, "Failed to handle block proposal");
+                        self.log_error(&error, "Failed to handle block proposal");
                         Err(error.into())
                     }
                 }
@@ -263,8 +249,7 @@ where
                         Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info))))
                     }
                     Err(error) => {
-                        let nickname = self.server.state.nickname();
-                        error!(nickname, %error, "Failed to handle timeout certificate");
+                        self.log_error(&error, "Failed to handle timeout certificate");
                         Err(error.into())
                     }
                 }
@@ -283,10 +268,7 @@ where
                         Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info))))
                     }
                     Err(error) => {
-                        error!(
-                            nickname = self.server.state.nickname(), %error,
-                            "Failed to handle validated certificate"
-                        );
+                        self.log_error(&error, "Failed to handle validated certificate");
                         Err(error.into())
                     }
                 }
@@ -314,23 +296,16 @@ where
                         Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info))))
                     }
                     Err(error) => {
-                        let nickname = self.server.state.nickname();
-                        error!(nickname, %error, "Failed to handle confirmed certificate");
+                        self.log_error(&error, "Failed to handle confirmed certificate");
                         Err(error.into())
                     }
                 }
             }
             RpcMessage::ChainInfoQuery(message) => {
                 match self.server.state.handle_chain_info_query(*message).await {
-                    Ok((info, actions)) => {
-                        // Cross-shard requests
-                        self.handle_network_actions(actions);
-                        // Response
-                        Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info))))
-                    }
+                    Ok(info) => Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info)))),
                     Err(error) => {
-                        let nickname = self.server.state.nickname();
-                        error!(nickname, %error, "Failed to handle chain info query");
+                        self.log_error(&error, "Failed to handle chain info query");
                         Err(error.into())
                     }
                 }
@@ -341,8 +316,7 @@ where
                         self.handle_network_actions(actions);
                     }
                     Err(error) => {
-                        let nickname = self.server.state.nickname();
-                        error!(nickname, %error, "Failed to handle cross-chain request");
+                        self.log_error(&error, "Failed to handle cross-chain request");
                     }
                 }
                 // No user to respond to.
@@ -360,8 +334,7 @@ where
                         blob.into(),
                     )))),
                     Err(error) => {
-                        let nickname = self.server.state.nickname();
-                        error!(nickname, %error, "Failed to handle pending blob request");
+                        self.log_error(&error, "Failed to handle pending blob request");
                         Err(error.into())
                     }
                 }
@@ -376,8 +349,7 @@ where
                 {
                     Ok(info) => Ok(Some(RpcMessage::ChainInfoResponse(Box::new(info)))),
                     Err(error) => {
-                        let nickname = self.server.state.nickname();
-                        error!(nickname, %error, "Failed to handle pending blob");
+                        self.log_error(&error, "Failed to handle pending blob");
                         Err(error.into())
                     }
                 }
@@ -387,12 +359,19 @@ where
                 Ok(Some(RpcMessage::VersionInfoResponse(Box::default())))
             }
 
+            RpcMessage::SubscribeNotifications(_) | RpcMessage::Notification(_) => {
+                // Subscriptions are handled at the transport level, not here.
+                Err(NodeError::UnexpectedMessage)
+            }
+
             RpcMessage::Vote(_)
             | RpcMessage::Error(_)
             | RpcMessage::ChainInfoResponse(_)
             | RpcMessage::VersionInfoResponse(_)
             | RpcMessage::NetworkDescriptionQuery
             | RpcMessage::NetworkDescriptionResponse(_)
+            | RpcMessage::ShardInfoQuery(_)
+            | RpcMessage::ShardInfoResponse(_)
             | RpcMessage::DownloadBlob(_)
             | RpcMessage::DownloadBlobResponse(_)
             | RpcMessage::DownloadPendingBlobResponse(_)
@@ -400,15 +379,26 @@ where
             | RpcMessage::DownloadConfirmedBlockResponse(_)
             | RpcMessage::BlobLastUsedBy(_)
             | RpcMessage::BlobLastUsedByResponse(_)
+            | RpcMessage::BlobLastUsedByCertificate(_)
+            | RpcMessage::BlobLastUsedByCertificateResponse(_)
             | RpcMessage::MissingBlobIds(_)
             | RpcMessage::MissingBlobIdsResponse(_)
+            | RpcMessage::EventBlockHeights(_)
+            | RpcMessage::EventBlockHeightsResponse(_)
             | RpcMessage::DownloadCertificates(_)
             | RpcMessage::DownloadCertificatesResponse(_)
             | RpcMessage::UploadBlob(_)
-            | RpcMessage::UploadBlobResponse(_) => Err(NodeError::UnexpectedMessage),
+            | RpcMessage::UploadBlobResponse(_)
+            | RpcMessage::DownloadCertificatesByHeights(_, _)
+            | RpcMessage::DownloadCertificatesByHeightsResponse(_) => {
+                Err(NodeError::UnexpectedMessage)
+            }
         };
 
         self.server.packets_processed += 1;
+        // We allow this because `is_multiple_of` is still unstable in our MSRV.
+        #[allow(unknown_lints)]
+        #[allow(clippy::manual_is_multiple_of)]
         if self.server.packets_processed % 5000 == 0 {
             debug!(
                 "[{}] {}:{} (shard {}) has processed {} packets",
@@ -434,6 +424,37 @@ where
             }
         }
     }
+
+    async fn handle_subscribe(
+        &mut self,
+        chains: Vec<ChainId>,
+    ) -> Option<Pin<Box<dyn Stream<Item = RpcMessage> + Send>>> {
+        RunningServerState::subscribe_to_notifications(self, chains).await
+    }
+}
+
+impl<S> RunningServerState<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    async fn subscribe_to_notifications(
+        &self,
+        chains: Vec<ChainId>,
+    ) -> Option<Pin<Box<dyn Stream<Item = RpcMessage> + Send>>> {
+        let receiver = self.notification_sender.subscribe();
+        let stream = BroadcastStream::new(receiver).filter_map(move |result| {
+            let chains = chains.clone();
+            async move {
+                match result {
+                    Ok(notification) if chains.contains(&notification.chain_id) => {
+                        Some(RpcMessage::Notification(Box::new(notification)))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        Some(Box::pin(stream))
+    }
 }
 
 impl<S> RunningServerState<S>
@@ -449,11 +470,25 @@ where
                 self.server.shard_id,
                 shard_id
             );
-            let request = RpcMessage::CrossChainRequest(Box::new(request));
             if let Err(error) = self.cross_chain_sender.try_send((request, shard_id)) {
                 error!(%error, "dropping cross-chain request");
                 break;
             }
+        }
+        for notification in actions.notifications {
+            debug!("Scheduling notification query");
+            if let Err(error) = self.notification_sender.send(notification) {
+                debug!(%error, "dropping notification (no receivers)");
+            }
+        }
+    }
+
+    fn log_error(&self, error: &WorkerError, context: &str) {
+        let nickname = self.server.state.nickname();
+        if error.is_local() {
+            error!(nickname, %error, "{}", context);
+        } else {
+            debug!(nickname, %error, "{}", context);
         }
     }
 }

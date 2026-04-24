@@ -8,9 +8,10 @@ mod ed25519;
 mod hash;
 #[allow(dead_code)]
 mod secp256k1;
-mod signer;
+pub mod signer;
 use std::{fmt::Display, io, num::ParseIntError, str::FromStr};
 
+use allocative::Allocative;
 use alloy_primitives::FixedBytes;
 use custom_debug_derive::Debug;
 pub use ed25519::{Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature};
@@ -24,6 +25,8 @@ use serde::{Deserialize, Serialize};
 pub use signer::*;
 use thiserror::Error;
 
+use crate::{hex_debug, identifiers::AccountOwner, visit_allocative_simple};
+
 /// The public key of a validator.
 pub type ValidatorPublicKey = secp256k1::Secp256k1PublicKey;
 /// The private key of a validator.
@@ -32,17 +35,6 @@ pub type ValidatorSecretKey = secp256k1::Secp256k1SecretKey;
 pub type ValidatorSignature = secp256k1::Secp256k1Signature;
 /// The key pair of a validator.
 pub type ValidatorKeypair = secp256k1::Secp256k1KeyPair;
-
-/// Signature scheme used for the public key.
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq)]
-pub enum SignatureScheme {
-    /// Ed25519
-    Ed25519,
-    /// secp256k1
-    Secp256k1,
-    /// EVM secp256k1
-    EvmSecp256k1,
-}
 
 /// The public key of a chain owner.
 /// The corresponding private key is allowed to propose blocks
@@ -61,14 +53,15 @@ pub enum SignatureScheme {
     WitType,
     WitLoad,
     WitStore,
+    Allocative,
 )]
 pub enum AccountPublicKey {
     /// Ed25519 public key.
-    Ed25519(ed25519::Ed25519PublicKey),
+    Ed25519(#[allocative(visit = visit_allocative_simple)] ed25519::Ed25519PublicKey),
     /// secp256k1 public key.
-    Secp256k1(secp256k1::Secp256k1PublicKey),
+    Secp256k1(#[allocative(visit = visit_allocative_simple)] secp256k1::Secp256k1PublicKey),
     /// EVM secp256k1 public key.
-    EvmSecp256k1(secp256k1::evm::EvmPublicKey),
+    EvmSecp256k1(#[allocative(visit = visit_allocative_simple)] secp256k1::evm::EvmPublicKey),
 }
 
 /// The private key of a chain owner.
@@ -83,14 +76,36 @@ pub enum AccountSecretKey {
 }
 
 /// The signature of a chain owner.
-#[derive(Eq, PartialEq, Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Copy, Clone, Debug, Serialize, Deserialize, Allocative)]
 pub enum AccountSignature {
     /// Ed25519 signature.
-    Ed25519(ed25519::Ed25519Signature),
+    Ed25519 {
+        /// Signature of the value.
+        #[allocative(visit = visit_allocative_simple)]
+        signature: ed25519::Ed25519Signature,
+        /// Public key of the signer.
+        #[allocative(visit = visit_allocative_simple)]
+        public_key: ed25519::Ed25519PublicKey,
+    },
     /// secp256k1 signature.
-    Secp256k1(secp256k1::Secp256k1Signature),
+    Secp256k1 {
+        /// Signature of the value.
+        #[allocative(visit = visit_allocative_simple)]
+        signature: secp256k1::Secp256k1Signature,
+        /// Public key of the signer.
+        #[allocative(visit = visit_allocative_simple)]
+        public_key: secp256k1::Secp256k1PublicKey,
+    },
     /// EVM secp256k1 signature.
-    EvmSecp256k1(secp256k1::evm::EvmSignature),
+    EvmSecp256k1 {
+        /// Signature of the value.
+        #[allocative(visit = visit_allocative_simple)]
+        signature: secp256k1::evm::EvmSignature,
+        /// EVM address of the signer.
+        #[debug(with = "hex_debug")]
+        #[allocative(visit = visit_allocative_simple)]
+        address: [u8; 20],
+    },
 }
 
 impl AccountSecretKey {
@@ -122,15 +137,24 @@ impl AccountSecretKey {
         match self {
             AccountSecretKey::Ed25519(secret) => {
                 let signature = Ed25519Signature::new(value, secret);
-                AccountSignature::Ed25519(signature)
+                let public_key = secret.public();
+                AccountSignature::Ed25519 {
+                    signature,
+                    public_key,
+                }
             }
             AccountSecretKey::Secp256k1(secret) => {
                 let signature = secp256k1::Secp256k1Signature::new(value, secret);
-                AccountSignature::Secp256k1(signature)
+                let public_key = secret.public();
+                AccountSignature::Secp256k1 {
+                    signature,
+                    public_key,
+                }
             }
             AccountSecretKey::EvmSecp256k1(secret) => {
-                let signature = secp256k1::evm::EvmSignature::new(value, secret);
-                AccountSignature::EvmSecp256k1(signature)
+                let signature = secp256k1::evm::EvmSignature::new(CryptoHash::new(value), secret);
+                let address: [u8; 20] = secret.address().into();
+                AccountSignature::EvmSecp256k1 { signature, address }
             }
         }
     }
@@ -140,15 +164,24 @@ impl AccountSecretKey {
         match self {
             AccountSecretKey::Ed25519(secret) => {
                 let signature = Ed25519Signature::sign_prehash(secret, value);
-                AccountSignature::Ed25519(signature)
+                let public_key = secret.public();
+                AccountSignature::Ed25519 {
+                    signature,
+                    public_key,
+                }
             }
             AccountSecretKey::Secp256k1(secret) => {
                 let signature = secp256k1::Secp256k1Signature::sign_prehash(secret, value);
-                AccountSignature::Secp256k1(signature)
+                let public_key = secret.public();
+                AccountSignature::Secp256k1 {
+                    signature,
+                    public_key,
+                }
             }
             AccountSecretKey::EvmSecp256k1(secret) => {
                 let signature = secp256k1::evm::EvmSignature::sign_prehash(secret, value);
-                AccountSignature::EvmSecp256k1(signature)
+                let address: [u8; 20] = secret.address().into();
+                AccountSignature::EvmSecp256k1 { signature, address }
             }
         }
     }
@@ -159,23 +192,20 @@ impl AccountSecretKey {
         AccountSecretKey::Ed25519(Ed25519SecretKey::generate())
     }
 
-    #[cfg(with_getrandom)]
-    /// Generates a new key pair from the given RNG. Use with care.
+    #[cfg(all(with_getrandom, not(feature = "revm")))]
+    /// Generates a new Ed25519 key pair from the given RNG. Use with care.
     pub fn generate_from<R: CryptoRng>(rng: &mut R) -> Self {
         AccountSecretKey::Ed25519(Ed25519SecretKey::generate_from(rng))
+    }
+
+    #[cfg(all(with_getrandom, feature = "revm"))]
+    /// Generates a new Evm Secp256k1 key pair from the given RNG. Use with care.
+    pub fn generate_from<R: CryptoRng>(rng: &mut R) -> Self {
+        AccountSecretKey::EvmSecp256k1(EvmSecretKey::generate_from(rng))
     }
 }
 
 impl AccountPublicKey {
-    /// Returns the signature scheme of the public key.
-    pub fn scheme(&self) -> SignatureScheme {
-        match self {
-            AccountPublicKey::Ed25519(_) => SignatureScheme::Ed25519,
-            AccountPublicKey::Secp256k1(_) => SignatureScheme::Secp256k1,
-            AccountPublicKey::EvmSecp256k1(_) => SignatureScheme::EvmSecp256k1,
-        }
-    }
-
     /// Returns the byte representation of the public key.
     pub fn as_bytes(&self) -> Vec<u8> {
         bcs::to_bytes(&self).expect("serialization to bytes should not fail")
@@ -197,41 +227,25 @@ impl AccountPublicKey {
 
 impl AccountSignature {
     /// Verifies the signature for the `value` using the provided `public_key`.
-    pub fn verify<'de, T>(&self, value: &T, author: AccountPublicKey) -> Result<(), CryptoError>
+    pub fn verify<'de, T>(&self, value: &T) -> Result<(), CryptoError>
     where
         T: BcsSignable<'de> + std::fmt::Debug,
     {
-        match (self, author) {
-            (AccountSignature::Ed25519(signature), AccountPublicKey::Ed25519(public_key)) => {
-                signature.check(value, public_key)
-            }
-            (AccountSignature::Secp256k1(signature), AccountPublicKey::Secp256k1(public_key)) => {
-                signature.check(value, &public_key)
-            }
-            (
-                AccountSignature::EvmSecp256k1(signature),
-                AccountPublicKey::EvmSecp256k1(public_key),
-            ) => signature.check(value, &public_key),
-            (AccountSignature::Ed25519(_), _) => {
-                let type_name = std::any::type_name::<T>();
-                Err(CryptoError::InvalidSignature {
-                    error: "invalid signature scheme. Expected Ed25519 signature.".to_string(),
-                    type_name: type_name.to_string(),
-                })
-            }
-            (AccountSignature::Secp256k1(_), _) => {
-                let type_name = std::any::type_name::<T>();
-                Err(CryptoError::InvalidSignature {
-                    error: "invalid signature scheme. Expected secp256k1 signature.".to_string(),
-                    type_name: type_name.to_string(),
-                })
-            }
-            (AccountSignature::EvmSecp256k1(_), _) => {
-                let type_name = std::any::type_name::<T>();
-                Err(CryptoError::InvalidSignature {
-                    error: "invalid signature scheme. Expected EvmSecp256k1 signature.".to_string(),
-                    type_name: type_name.to_string(),
-                })
+        match self {
+            AccountSignature::Ed25519 {
+                signature,
+                public_key,
+            } => signature.check(value, *public_key),
+            AccountSignature::Secp256k1 {
+                signature,
+                public_key,
+            } => signature.check(value, *public_key),
+            AccountSignature::EvmSecp256k1 {
+                signature,
+                address: sender_address,
+            } => {
+                signature.check_with_recover(value, *sender_address)?;
+                Ok(())
             }
         }
     }
@@ -244,6 +258,15 @@ impl AccountSignature {
     /// Parses the byte representation of the signature.
     pub fn from_slice(bytes: &[u8]) -> Result<Self, CryptoError> {
         bcs::from_bytes(bytes).map_err(CryptoError::SignatureParseError)
+    }
+
+    /// Returns the [`AccountOwner`] of the account that signed the value.
+    pub fn owner(&self) -> AccountOwner {
+        match self {
+            AccountSignature::Ed25519 { public_key, .. } => AccountOwner::from(*public_key),
+            AccountSignature::Secp256k1 { public_key, .. } => AccountOwner::from(*public_key),
+            AccountSignature::EvmSecp256k1 { address, .. } => AccountOwner::Address20(*address),
+        }
     }
 }
 
@@ -496,43 +519,44 @@ mod tests {
 
     #[test]
     fn roundtrip_account_pk_bytes_repr() {
-        fn roundtrip_test(secret: AccountSecretKey) {
+        fn roundtrip_test(secret: &AccountSecretKey) {
             let public = secret.public();
             let bytes = public.as_bytes();
             let parsed = AccountPublicKey::from_slice(&bytes).unwrap();
             assert_eq!(public, parsed);
         }
-        roundtrip_test(AccountSecretKey::Ed25519(Ed25519SecretKey::generate()));
-        roundtrip_test(AccountSecretKey::Secp256k1(
+        roundtrip_test(&AccountSecretKey::Ed25519(Ed25519SecretKey::generate()));
+        roundtrip_test(&AccountSecretKey::Secp256k1(
             Secp256k1KeyPair::generate().secret_key,
         ));
     }
 
     #[test]
     fn roundtrip_signature_bytes_repr() {
-        fn roundtrip_test(secret: AccountSecretKey) {
+        fn roundtrip_test(secret: &AccountSecretKey) {
             let test_string = TestString::new("test");
             let signature = secret.sign(&test_string);
             let bytes = signature.to_bytes();
             let parsed = AccountSignature::from_slice(&bytes).unwrap();
             assert_eq!(signature, parsed);
         }
-        roundtrip_test(AccountSecretKey::Ed25519(Ed25519SecretKey::generate()));
-        roundtrip_test(AccountSecretKey::Secp256k1(
+        roundtrip_test(&AccountSecretKey::Ed25519(Ed25519SecretKey::generate()));
+        roundtrip_test(&AccountSecretKey::Secp256k1(
             Secp256k1KeyPair::generate().secret_key,
         ));
+        roundtrip_test(&AccountSecretKey::EvmSecp256k1(EvmSecretKey::generate()));
     }
 
     #[test]
     fn roundtrip_display_from_str_pk() {
-        fn test(secret: AccountSecretKey) {
+        fn test(secret: &AccountSecretKey) {
             let public = secret.public();
             let display = public.to_string();
             let parsed = AccountPublicKey::from_str(&display).unwrap();
             assert_eq!(public, parsed);
         }
-        test(AccountSecretKey::Ed25519(Ed25519SecretKey::generate()));
-        test(AccountSecretKey::Secp256k1(
+        test(&AccountSecretKey::Ed25519(Ed25519SecretKey::generate()));
+        test(&AccountSecretKey::Secp256k1(
             Secp256k1KeyPair::generate().secret_key,
         ));
     }

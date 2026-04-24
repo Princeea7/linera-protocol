@@ -13,15 +13,6 @@ version.workspace = true
 
 [features]
 test = ["linera-views/test", "linera-execution/test"]
-benchmark = [
-    "linera-base/test",
-    "dep:linera-sdk",
-    "dep:crossbeam-channel",
-    "dep:num-format",
-    "dep:reqwest",
-    "dep:anyhow",
-    "dep:prometheus-parse",
-]
 wasmer = [
     "linera-core/wasmer",
     "linera-execution/wasmer",
@@ -41,40 +32,39 @@ web = [
     "dep:web-sys",
     "dep:wasm-bindgen-futures",
     "linera-base/web",
-    "linera-storage/web",
+    "linera-execution/web",
     "linera-chain/web",
     "linera-client/web",
     "linera-core/web",
-    "linera-views/web",
-    "linera-execution/web",
     "linera-rpc/web",
+    "linera-storage/web",
+    "linera-views/web",
 ]
-indexed-db = ["web", "indexed_db_futures", "serde-wasm-bindgen", "gloo-utils"]
+indexed-db = ["web", "serde-wasm-bindgen", "gloo-utils"]
 web-default = ["web", "wasmer", "indexed-db"]
 
 [dependencies]
-anyhow = { workspace = true, optional = true }
-async-trait.workspace = true
+anyhow.workspace = true
 bcs.workspace = true
-cfg-if.workspace = true
 clap.workspace = true
-crossbeam-channel = { workspace = true, optional = true }
-derive_more = { workspace = true, features = ["deref", "deref_mut"] }
 futures.workspace = true
+hdrhistogram = { workspace = true }
 linera-base.workspace = true
 linera-chain.workspace = true
 linera-core.workspace = true
 linera-execution.workspace = true
 linera-rpc.workspace = true
-linera-sdk = { workspace = true, optional = true }
+linera-sdk.workspace = true
 linera-storage.workspace = true
 linera-version = { workspace = true }
 linera-views.workspace = true
-num-format = { workspace = true, optional = true }
-prometheus-parse = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
+num-format.workspace = true
+prometheus-parse.workspace = true
+rand.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 thiserror-context.workspace = true
 tokio.workspace = true
@@ -82,11 +72,12 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 trait-variant.workspace = true
+tsify.workspace = true
+wasm-bindgen.workspace = true
 
 [target.wasm32-unknown-unknown.dependencies]
 flarch = { workspace = true, optional = true }
 gloo-utils = { workspace = true, optional = true }
-indexed_db_futures = { workspace = true, optional = true }
 serde-wasm-bindgen = { workspace = true, optional = true }
 wasm-bindgen-futures = { workspace = true, optional = true }
 web-sys = { workspace = true, optional = true }
@@ -94,6 +85,7 @@ web-sys = { workspace = true, optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fs-err = { workspace = true, optional = true }
 fs4 = { workspace = true, optional = true }
+papaya = { workspace = true, features = ["serde"] }
 tokio = { workspace = true, features = ["full"] }
 linera-rpc = { workspace = true, features = ["server", "simple-network"] }
 
@@ -101,9 +93,6 @@ linera-rpc = { workspace = true, features = ["server", "simple-network"] }
 cfg_aliases.workspace = true
 
 [dev-dependencies]
-alloy = { workspace = true, default-features = false, features = [
-    "rpc-types-eth",
-] }
 amm.workspace = true
 anyhow.workspace = true
 base64.workspace = true
@@ -133,3 +122,9 @@ test-strategy.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+
+[package.metadata.cargo-machete]
+ignored = [
+    # `wasm-bindgen` is implicitly used by `tsify`
+    "wasm-bindgen",
+]

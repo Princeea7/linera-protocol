@@ -6,9 +6,11 @@
 use linera_base::{
     crypto::CryptoHash,
     data_types::{
-        Amount, ApplicationPermissions, BlockHeight, Resources, SendMessageRequest, TimeDelta,
+        Amount, ApplicationPermissions, Bytecode, Resources, SendMessageRequest, TimeDelta,
     },
-    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, ModuleId, StreamName},
+    identifiers::{
+        Account, AccountOwner, ApplicationId, ChainId, DataBlobHash, ModuleId, StreamName,
+    },
     ownership::{ChainOwnership, TimeoutConfig},
     vm::VmRuntime,
 };
@@ -29,6 +31,14 @@ impl From<CryptoHash> for wit_contract_api::CryptoHash {
     }
 }
 
+impl From<DataBlobHash> for wit_contract_api::DataBlobHash {
+    fn from(hash_value: DataBlobHash) -> Self {
+        wit_contract_api::DataBlobHash {
+            inner0: hash_value.0.into(),
+        }
+    }
+}
+
 impl From<ChainId> for wit_contract_api::CryptoHash {
     fn from(chain_id: ChainId) -> Self {
         chain_id.0.into()
@@ -40,7 +50,7 @@ impl From<[u8; 20]> for wit_contract_api::Array20 {
         wit_contract_api::Array20 {
             part1: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
             part2: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
-            part3: u64::from_be_bytes(bytes[16..20].try_into().unwrap()),
+            part3: (u32::from_be_bytes(bytes[16..20].try_into().unwrap()) as u64) << 32,
         }
     }
 }
@@ -84,14 +94,6 @@ impl From<ChainId> for wit_contract_api::ChainId {
     }
 }
 
-impl From<BlockHeight> for wit_contract_api::BlockHeight {
-    fn from(block_height: BlockHeight) -> Self {
-        wit_contract_api::BlockHeight {
-            inner0: block_height.0,
-        }
-    }
-}
-
 impl From<ModuleId> for wit_contract_api::ModuleId {
     fn from(module_id: ModuleId) -> Self {
         wit_contract_api::ModuleId {
@@ -111,16 +113,6 @@ impl From<VmRuntime> for wit_contract_api::VmRuntime {
     }
 }
 
-impl From<MessageId> for wit_contract_api::MessageId {
-    fn from(message_id: MessageId) -> Self {
-        wit_contract_api::MessageId {
-            chain_id: message_id.chain_id.into(),
-            height: message_id.height.into(),
-            index: message_id.index,
-        }
-    }
-}
-
 impl From<ApplicationId> for wit_contract_api::ApplicationId {
     fn from(application_id: ApplicationId) -> Self {
         wit_contract_api::ApplicationId {
@@ -132,9 +124,11 @@ impl From<ApplicationId> for wit_contract_api::ApplicationId {
 impl From<Resources> for wit_contract_api::Resources {
     fn from(resources: Resources) -> Self {
         wit_contract_api::Resources {
-            fuel: resources.fuel,
+            wasm_fuel: resources.wasm_fuel,
+            evm_fuel: resources.evm_fuel,
             read_operations: resources.read_operations,
             write_operations: resources.write_operations,
+            bytes_runtime: resources.bytes_runtime,
             bytes_to_read: resources.bytes_to_read,
             bytes_to_write: resources.bytes_to_write,
             blobs_to_read: resources.blobs_to_read,
@@ -200,8 +194,7 @@ impl From<ApplicationPermissions> for wit_contract_api::ApplicationPermissions {
         let ApplicationPermissions {
             execute_operations,
             mandatory_applications,
-            close_chain,
-            change_application_permissions,
+            manage_chain,
             call_service_as_oracle,
             make_http_requests,
         } = permissions;
@@ -209,11 +202,7 @@ impl From<ApplicationPermissions> for wit_contract_api::ApplicationPermissions {
             execute_operations: execute_operations
                 .map(|app_ids| app_ids.into_iter().map(Into::into).collect()),
             mandatory_applications: mandatory_applications.into_iter().map(Into::into).collect(),
-            close_chain: close_chain.into_iter().map(Into::into).collect(),
-            change_application_permissions: change_application_permissions
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            manage_chain: manage_chain.into_iter().map(Into::into).collect(),
             call_service_as_oracle: call_service_as_oracle
                 .map(|app_ids| app_ids.into_iter().map(Into::into).collect()),
             make_http_requests: make_http_requests
@@ -227,6 +216,7 @@ impl From<ChainOwnership> for wit_contract_api::ChainOwnership {
         let ChainOwnership {
             super_owners,
             owners,
+            first_leader,
             multi_leader_rounds,
             open_multi_leader_rounds,
             timeout_config,
@@ -237,6 +227,7 @@ impl From<ChainOwnership> for wit_contract_api::ChainOwnership {
                 .into_iter()
                 .map(|(owner, weight)| (owner.into(), weight))
                 .collect(),
+            first_leader: first_leader.map(Into::into),
             multi_leader_rounds,
             open_multi_leader_rounds,
             timeout_config: timeout_config.into(),
@@ -254,6 +245,14 @@ impl From<WriteOperation> for wit_contract_api::WriteOperation {
             WriteOperation::Put { key, value } => {
                 wit_contract_api::WriteOperation::Put((key, value))
             }
+        }
+    }
+}
+
+impl From<Bytecode> for wit_contract_api::Bytecode {
+    fn from(bytecode: Bytecode) -> Self {
+        wit_contract_api::Bytecode {
+            bytes: bytecode.bytes,
         }
     }
 }

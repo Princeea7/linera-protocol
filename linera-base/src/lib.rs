@@ -6,7 +6,7 @@
 //! applications (compiled from Rust to Wasm).
 
 #![deny(missing_docs)]
-#![deny(clippy::large_futures)]
+#![allow(async_fn_in_trait)]
 
 use std::fmt;
 
@@ -34,14 +34,14 @@ pub mod port;
 pub mod prometheus_util;
 #[cfg(not(chain))]
 pub mod task;
-pub mod vm;
 #[cfg(not(chain))]
-pub use task::Blocking;
+pub use task::Task;
+pub mod task_processor;
 pub mod time;
-#[cfg_attr(web, path = "tracing_web.rs")]
-pub mod tracing;
 #[cfg(test)]
 mod unit_tests;
+pub mod util;
+pub mod vm;
 
 pub use graphql::BcsHexParseError;
 #[doc(hidden)]
@@ -152,6 +152,11 @@ pub fn hex_vec_debug(list: &Vec<Vec<u8>>, f: &mut fmt::Formatter) -> fmt::Result
         hex_debug(bytes, f)?;
     }
     write!(f, "]")
+}
+
+/// Helper function for allocative.
+pub fn visit_allocative_simple<T>(_: &T, visitor: &mut allocative::Visitor<'_>) {
+    visitor.visit_simple_sized::<T>();
 }
 
 /// Listens for shutdown signals, and notifies the [`CancellationToken`] if one is

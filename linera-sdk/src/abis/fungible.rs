@@ -5,31 +5,18 @@
 
 use std::collections::BTreeMap;
 
-use async_graphql::{InputObject, Request, Response, SimpleObject};
+use async_graphql::{Request, Response};
 use linera_base::{
     abi::{ContractAbi, ServiceAbi},
     data_types::Amount,
-    identifiers::{AccountOwner, ChainId},
+    identifiers::{Account, AccountOwner},
 };
 use linera_sdk_derive::GraphQLMutationRootInCrate;
 use serde::{Deserialize, Serialize};
 
-/// An ABI for applications that implement a fungible token.
-pub struct FungibleTokenAbi;
-
-impl ContractAbi for FungibleTokenAbi {
-    type Operation = Operation;
-    type Response = FungibleResponse;
-}
-
-impl ServiceAbi for FungibleTokenAbi {
-    type Query = Request;
-    type QueryResponse = Response;
-}
-
 /// An operation
 #[derive(Debug, Deserialize, Serialize, GraphQLMutationRootInCrate)]
-pub enum Operation {
+pub enum FungibleOperation {
     /// Requests an account balance.
     Balance {
         /// Owner to query the balance for
@@ -37,10 +24,30 @@ pub enum Operation {
     },
     /// Requests this fungible token's ticker symbol.
     TickerSymbol,
+    /// Approve the transfer of tokens
+    Approve {
+        /// Owner to transfer from
+        owner: AccountOwner,
+        /// The spender account
+        spender: AccountOwner,
+        /// Maximum amount to be transferred
+        allowance: Amount,
+    },
     /// Transfers tokens from a (locally owned) account to a (possibly remote) account.
     Transfer {
         /// Owner to transfer from
         owner: AccountOwner,
+        /// Amount to be transferred
+        amount: Amount,
+        /// Target account to transfer the amount to
+        target_account: Account,
+    },
+    /// Transfers tokens from a (locally owned) account to a (possibly remote) account by using the allowance.
+    TransferFrom {
+        /// Owner to transfer from
+        owner: AccountOwner,
+        /// The spender of the amount.
+        spender: AccountOwner,
         /// Amount to be transferred
         amount: Amount,
         /// Target account to transfer the amount to
@@ -59,7 +66,20 @@ pub enum Operation {
     },
 }
 
-/// A fungible response
+/// An ABI for applications that implement a fungible token.
+pub struct FungibleTokenAbi;
+
+impl ContractAbi for FungibleTokenAbi {
+    type Operation = FungibleOperation;
+    type Response = FungibleResponse;
+}
+
+impl ServiceAbi for FungibleTokenAbi {
+    type Query = Request;
+    type QueryResponse = Response;
+}
+
+/// A native fungible response
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub enum FungibleResponse {
     /// OK response
@@ -91,28 +111,6 @@ impl Parameters {
         let ticker_symbol = ticker_symbol.to_string();
         Self { ticker_symbol }
     }
-}
-
-/// An account.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Deserialize,
-    Eq,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-    SimpleObject,
-    InputObject,
-)]
-#[graphql(input_name = "FungibleAccount")]
-pub struct Account {
-    /// Chain ID of the account
-    pub chain_id: ChainId,
-    /// Owner of the account
-    pub owner: AccountOwner,
 }
 
 /// A builder type for constructing the initial state of the application.

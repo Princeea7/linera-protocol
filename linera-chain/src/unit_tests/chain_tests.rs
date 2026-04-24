@@ -5,51 +5,48 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    iter, thread,
-    time::{Duration, Instant},
+    thread,
 };
 
 use assert_matches::assert_matches;
 use axum::{routing::get, Router};
 use linera_base::{
-    crypto::{AccountPublicKey, ValidatorPublicKey},
+    crypto::{AccountPublicKey, CryptoHash, ValidatorPublicKey},
     data_types::{
         Amount, ApplicationDescription, ApplicationPermissions, Blob, BlockHeight, Bytecode,
         ChainDescription, ChainOrigin, Epoch, InitialChainConfig, Timestamp,
     },
     http,
-    identifiers::{AccountOwner, ApplicationId, ChainId, ModuleId},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId, ModuleId},
     ownership::ChainOwnership,
+    time::{Duration, Instant},
     vm::VmRuntime,
 };
 use linera_execution::{
     committee::{Committee, ValidatorState},
-    system::Recipient,
     test_utils::{ExpectedCall, MockApplication},
     BaseRuntime, ContractRuntime, ExecutionError, ExecutionRuntimeConfig, ExecutionRuntimeContext,
-    Operation, ResourceControlPolicy, ServiceRuntime, SystemOperation, TestExecutionRuntimeContext,
+    Message, MessageKind, Operation, ResourceControlPolicy, ResourceTracker, ServiceRuntime,
+    SystemOperation, TestExecutionRuntimeContext,
 };
 use linera_views::{
     context::{Context as _, MemoryContext, ViewContext},
     memory::MemoryStore,
-    views::{View, ViewError},
+    views::View,
 };
 use test_case::test_case;
 
 use crate::{
     block::{Block, ConfirmedBlock},
-    data_types::{BlockExecutionOutcome, ProposedBlock},
+    data_types::{
+        BlockExecutionOutcome, BundleExecutionPolicy, IncomingBundle, MessageAction, MessageBundle,
+        PostedMessage, ProposedBlock,
+    },
     test::{make_child_block, make_first_block, BlockTestExt, HttpServer},
     ChainError, ChainExecutionContext, ChainStateView,
 };
 
-impl ChainStateView<MemoryContext<TestExecutionRuntimeContext>>
-where
-    MemoryContext<TestExecutionRuntimeContext>:
-        linera_views::context::Context + Clone + Send + Sync + 'static,
-    ViewError:
-        From<<MemoryContext<TestExecutionRuntimeContext> as linera_views::context::Context>::Error>,
-{
+impl ChainStateView<MemoryContext<TestExecutionRuntimeContext>> {
     pub async fn new(chain_id: ChainId) -> Self {
         let exec_runtime_context =
             TestExecutionRuntimeContext::new(chain_id, ExecutionRuntimeConfig::default());
@@ -57,6 +54,26 @@ where
         Self::load(context)
             .await
             .expect("Loading from memory should work")
+    }
+
+    /// Test helper that calls `execute_block` with default test parameters:
+    /// `round = None`, `replayed_oracle_responses = None`, `policy = Abort`.
+    #[cfg(with_testing)]
+    pub async fn execute_test_block_simple(
+        &mut self,
+        block: ProposedBlock,
+        local_time: Timestamp,
+        published_blobs: &[Blob],
+    ) -> Result<(ProposedBlock, BlockExecutionOutcome, ResourceTracker), ChainError> {
+        self.execute_block(
+            block,
+            local_time,
+            None,
+            published_blobs,
+            None,
+            BundleExecutionPolicy::committed(),
+        )
+        .await
     }
 }
 
@@ -67,32 +84,26 @@ struct TestEnvironment {
 
 impl TestEnvironment {
     fn new() -> Self {
-        let committee = Committee::make_simple(vec![(
-            ValidatorPublicKey::test_key(1),
-            AccountPublicKey::test_key(1),
-        )]);
         let config = InitialChainConfig {
             ownership: ChainOwnership::single(AccountPublicKey::test_key(0).into()),
-            admin_id: None,
             epoch: Epoch::ZERO,
-            committees: iter::once((
-                Epoch::ZERO,
-                bcs::to_bytes(&committee).expect("serializing a committee should not fail"),
-            ))
-            .collect(),
+            min_active_epoch: Epoch::ZERO,
+            max_active_epoch: Epoch::ZERO,
             balance: Amount::from_tokens(10),
             application_permissions: Default::default(),
         };
         let origin = ChainOrigin::Root(0);
         let admin_chain_description = ChainDescription::new(origin, config, Default::default());
-        let admin_id = admin_chain_description.id();
+        let admin_chain_id = admin_chain_description.id();
         Self {
             admin_chain_description: admin_chain_description.clone(),
-            created_descriptions: [(admin_id, admin_chain_description)].into_iter().collect(),
+            created_descriptions: [(admin_chain_id, admin_chain_description)]
+                .into_iter()
+                .collect(),
         }
     }
 
-    fn admin_id(&self) -> ChainId {
+    fn admin_chain_id(&self) -> ChainId {
         self.admin_chain_description.id()
     }
 
@@ -109,6 +120,14 @@ impl TestEnvironment {
     fn make_app_description(&self) -> (ApplicationDescription, Blob, Blob) {
         let contract = Bytecode::new(b"contract".into());
         let service = Bytecode::new(b"service".into());
+        self.make_app_from_bytecodes(&contract, &service)
+    }
+
+    fn make_app_from_bytecodes(
+        &self,
+        contract: &Bytecode,
+        service: &Bytecode,
+    ) -> (ApplicationDescription, Blob, Blob) {
         let contract_blob = Blob::new_contract_bytecode(contract.compress());
         let service_blob = Blob::new_service_bytecode(service.compress());
         let vm_runtime = VmRuntime::Wasm;
@@ -117,7 +136,7 @@ impl TestEnvironment {
         (
             ApplicationDescription {
                 module_id,
-                creator_chain_id: self.admin_id(),
+                creator_chain_id: self.admin_chain_id(),
                 block_height: BlockHeight(2),
                 application_index: 0,
                 required_application_ids: vec![],
@@ -134,19 +153,31 @@ impl TestEnvironment {
         config: InitialChainConfig,
     ) -> ChainDescription {
         let origin = ChainOrigin::Child {
-            parent: self.admin_id(),
+            parent: self.admin_chain_id(),
             block_height: BlockHeight(height),
             chain_index: 0,
-        };
-        let config = InitialChainConfig {
-            admin_id: Some(self.admin_id()),
-            ..config
         };
         let description = ChainDescription::new(origin, config, Timestamp::from(0));
         self.created_descriptions
             .insert(description.id(), description.clone());
         description
     }
+}
+
+fn committee_blob(policy: ResourceControlPolicy) -> Blob {
+    let committee = Committee::new(
+        BTreeMap::from([(
+            ValidatorPublicKey::test_key(1),
+            ValidatorState {
+                network_address: ValidatorPublicKey::test_key(1).to_string(),
+                votes: 1,
+                account_public_key: AccountPublicKey::test_key(1),
+            },
+        )]),
+        policy,
+    )
+    .expect("test committee votes should not overflow");
+    Blob::new_committee(bcs::to_bytes(&committee).expect("serializing a committee should succeed"))
 }
 
 #[tokio::test]
@@ -158,25 +189,7 @@ async fn test_block_size_limit() -> anyhow::Result<()> {
     // The size of the executed valid block below.
     let maximum_block_size = 260;
 
-    let mut config = env.make_open_chain_config();
-    config.committees.insert(
-        Epoch(0),
-        bcs::to_bytes(&Committee::new(
-            BTreeMap::from([(
-                ValidatorPublicKey::test_key(1),
-                ValidatorState {
-                    network_address: ValidatorPublicKey::test_key(1).to_string(),
-                    votes: 1,
-                    account_public_key: AccountPublicKey::test_key(1),
-                },
-            )]),
-            ResourceControlPolicy {
-                maximum_block_size,
-                ..ResourceControlPolicy::default()
-            },
-        ))
-        .expect("serializing a committee should not fail"),
-    );
+    let config = env.make_open_chain_config();
 
     let chain_desc = env.make_child_chain_description_with_config(3, config);
     let chain_id = chain_desc.id();
@@ -189,6 +202,15 @@ async fn test_block_size_limit() -> anyhow::Result<()> {
         .unwrap();
 
     let mut chain = ChainStateView::new(chain_id).await;
+    let policy = ResourceControlPolicy {
+        maximum_block_size,
+        ..ResourceControlPolicy::default()
+    };
+    chain
+        .context()
+        .extra()
+        .add_blobs([committee_blob(policy)])
+        .await?;
     chain
         .context()
         .extra()
@@ -197,13 +219,13 @@ async fn test_block_size_limit() -> anyhow::Result<()> {
 
     // Initialize the chain.
 
-    chain.ensure_is_active(time).await.unwrap();
+    chain.initialize_if_needed(time).await.unwrap();
 
     let valid_block = make_first_block(chain_id)
-        .with_authenticated_signer(Some(owner))
+        .with_authenticated_owner(Some(owner))
         .with_operation(SystemOperation::Transfer {
             owner: AccountOwner::CHAIN,
-            recipient: Recipient::chain(env.admin_id()),
+            recipient: Account::chain(env.admin_chain_id()),
             amount: Amount::ONE,
         });
 
@@ -212,12 +234,12 @@ async fn test_block_size_limit() -> anyhow::Result<()> {
         .clone()
         .with_operation(SystemOperation::Transfer {
             owner: AccountOwner::CHAIN,
-            recipient: Recipient::chain(env.admin_id()),
+            recipient: Account::chain(env.admin_chain_id()),
             amount: Amount::ONE,
         });
 
     let result = chain
-        .execute_block(&invalid_block, time, None, &[], None)
+        .execute_test_block_simple(invalid_block, time, &[])
         .await;
     assert_matches!(
         result,
@@ -228,8 +250,8 @@ async fn test_block_size_limit() -> anyhow::Result<()> {
     );
 
     // The valid block is accepted...
-    let outcome = chain
-        .execute_block(&valid_block, time, None, &[], None)
+    let (valid_block, outcome, _) = chain
+        .execute_test_block_simple(valid_block, time, &[])
         .await
         .unwrap();
     let block = Block::new(valid_block, outcome);
@@ -254,8 +276,17 @@ async fn test_application_permissions() -> anyhow::Result<()> {
     let application_id = ApplicationId::from(&app_description);
     let application = MockApplication::default();
 
+    let (another_app, another_contract, another_service) = env.make_app_from_bytecodes(
+        &Bytecode::new(b"contractB".into()),
+        &Bytecode::new(b"serviceB".into()),
+    );
+    let another_app_id = ApplicationId::from(&another_app);
+
     let config = InitialChainConfig {
-        application_permissions: ApplicationPermissions::new_single(application_id),
+        application_permissions: ApplicationPermissions::new_multiple(vec![
+            application_id,
+            another_app_id,
+        ]),
         ..env.make_open_chain_config()
     };
     let chain_desc = env.make_child_chain_description_with_config(3, config);
@@ -263,10 +294,138 @@ async fn test_application_permissions() -> anyhow::Result<()> {
 
     let mut chain = ChainStateView::new(chain_id).await;
 
-    let extra = &chain.context().extra();
+    let context = chain.context();
+    let extra = context.extra();
+    {
+        let pinned = extra.user_contracts().pin();
+        pinned.insert(application_id, application.clone().into());
+        pinned.insert(another_app_id, application.clone().into());
+    }
+
     extra
-        .user_contracts()
-        .insert(application_id, application.clone().into());
+        .add_blobs([committee_blob(Default::default())])
+        .await?;
+    extra.add_blobs(env.description_blobs()).await?;
+    extra
+        .add_blobs([
+            contract_blob,
+            service_blob,
+            Blob::new_application_description(&app_description),
+        ])
+        .await?;
+    extra
+        .add_blobs([
+            another_contract,
+            another_service,
+            Blob::new_application_description(&another_app),
+        ])
+        .await?;
+
+    // Initialize the chain, with a chain application.
+    chain.initialize_if_needed(time).await?;
+
+    // An operation that doesn't belong to the app isn't allowed.
+    let invalid_block = make_first_block(chain_id).with_simple_transfer(chain_id, Amount::ONE);
+    let result = chain
+        .execute_test_block_simple(invalid_block, time, &[])
+        .await;
+    assert_matches!(result, Err(ChainError::AuthorizedApplications(app_ids))
+        if app_ids == vec![application_id, another_app_id]
+    );
+
+    // After registering, an app operation can already be used in the first block.
+    application.expect_call(ExpectedCall::execute_operation(|_, _| Ok(vec![])));
+    application.expect_call(ExpectedCall::default_finalize());
+    application.expect_call(ExpectedCall::execute_operation(|_, _| Ok(vec![])));
+    application.expect_call(ExpectedCall::default_finalize());
+    let app_operation = Operation::User {
+        application_id,
+        bytes: b"foo".to_vec(),
+    };
+    let another_app_operation = Operation::User {
+        application_id: another_app_id,
+        bytes: b"bar".to_vec(),
+    };
+
+    let valid_block = make_first_block(chain_id)
+        .with_operation(app_operation.clone())
+        .with_operation(another_app_operation.clone());
+
+    let (valid_block, outcome, _) = chain
+        .execute_test_block_simple(valid_block, time, &[])
+        .await?;
+
+    let value = ConfirmedBlock::new(outcome.with(valid_block));
+    chain.apply_confirmed_block(&value, time).await?;
+
+    // In the second block, other operations are still not allowed.
+    let invalid_block = make_child_block(&value.clone())
+        .with_simple_transfer(chain_id, Amount::ONE)
+        .with_operation(app_operation.clone());
+    let result = chain
+        .execute_test_block_simple(invalid_block, time, &[])
+        .await;
+    assert_matches!(result, Err(ChainError::AuthorizedApplications(app_ids))
+        if app_ids == vec![application_id, another_app_id]
+    );
+    // Also, blocks without all authorized applications operation, or incoming message, are forbidden.
+    let invalid_block = make_child_block(&value).with_operation(another_app_operation.clone());
+    let result = chain
+        .execute_test_block_simple(invalid_block, time, &[])
+        .await;
+    assert_matches!(result, Err(ChainError::MissingMandatoryApplications(app_ids))
+        if app_ids == vec![application_id]
+    );
+    // But app operations continue to work.
+    application.expect_call(ExpectedCall::execute_operation(|_, _| Ok(vec![])));
+    application.expect_call(ExpectedCall::default_finalize());
+    application.expect_call(ExpectedCall::execute_operation(|_, _| Ok(vec![])));
+    application.expect_call(ExpectedCall::default_finalize());
+    let valid_block = make_child_block(&value)
+        .with_operation(app_operation.clone())
+        .with_operation(another_app_operation.clone());
+    let (valid_block, outcome, _) = chain
+        .execute_test_block_simple(valid_block, time, &[])
+        .await?;
+    let value = ConfirmedBlock::new(outcome.with(valid_block));
+    chain.apply_confirmed_block(&value, time).await?;
+
+    Ok(())
+}
+
+/// Tests that mandatory applications can be satisfied by accepted messages but not rejected ones.
+#[tokio::test]
+async fn test_mandatory_applications_with_messages() -> anyhow::Result<()> {
+    let mut env = TestEnvironment::new();
+
+    let time = Timestamp::from(0);
+
+    // Create a mock application.
+    let (app_description, contract_blob, service_blob) = env.make_app_description();
+    let application_id = ApplicationId::from(&app_description);
+    let application = MockApplication::default();
+
+    // Configure the chain with a mandatory application.
+    let config = InitialChainConfig {
+        application_permissions: ApplicationPermissions::new_single(application_id),
+        ..env.make_open_chain_config()
+    };
+    let chain_desc = env.make_child_chain_description_with_config(3, config);
+    let chain_id = chain_desc.id();
+    let origin_chain_id = ChainId(CryptoHash::test_hash("origin"));
+
+    let mut chain = ChainStateView::new(chain_id).await;
+
+    let context = chain.context();
+    let extra = context.extra();
+    {
+        let pinned = extra.user_contracts().pin();
+        pinned.insert(application_id, application.clone().into());
+    }
+
+    extra
+        .add_blobs([committee_blob(Default::default())])
+        .await?;
     extra.add_blobs(env.description_blobs()).await?;
     extra
         .add_blobs([
@@ -276,60 +435,57 @@ async fn test_application_permissions() -> anyhow::Result<()> {
         ])
         .await?;
 
-    // Initialize the chain, with a chain application.
-    chain.ensure_is_active(time).await?;
+    // Initialize the chain.
+    chain.initialize_if_needed(time).await?;
 
-    // An operation that doesn't belong to the app isn't allowed.
-    let invalid_block = make_first_block(chain_id).with_simple_transfer(chain_id, Amount::ONE);
-    let result = chain
-        .execute_block(&invalid_block, time, None, &[], None)
-        .await;
-    assert_matches!(result, Err(ChainError::AuthorizedApplications(app_ids))
-        if app_ids == vec![application_id]
-    );
-
-    // After registering, an app operation can already be used in the first block.
-    application.expect_call(ExpectedCall::execute_operation(|_, _| Ok(vec![])));
-    application.expect_call(ExpectedCall::default_finalize());
-    let app_operation = Operation::User {
+    // Create an incoming bundle with a user message from the mandatory application.
+    let user_message = Message::User {
         application_id,
-        bytes: b"foo".to_vec(),
+        bytes: b"test_message".to_vec(),
     };
-    let valid_block = make_first_block(chain_id).with_operation(app_operation.clone());
-    let outcome = chain
-        .execute_block(&valid_block, time, None, &[], None)
-        .await?;
-    let value = ConfirmedBlock::new(outcome.with(valid_block));
-    chain.apply_confirmed_block(&value, time).await?;
+    let posted_message = PostedMessage {
+        authenticated_owner: None,
+        grant: Amount::ZERO,
+        refund_grant_to: None,
+        kind: MessageKind::Simple,
+        index: 0,
+        message: user_message,
+    };
+    let message_bundle = MessageBundle {
+        height: BlockHeight::ZERO,
+        timestamp: time,
+        certificate_hash: CryptoHash::test_hash("test"),
+        transaction_index: 0,
+        messages: vec![posted_message],
+    };
 
-    // In the second block, other operations are still not allowed.
-    let invalid_block = make_child_block(&value.clone())
-        .with_simple_transfer(chain_id, Amount::ONE)
-        .with_operation(app_operation.clone());
+    // Test 1: A rejected message should NOT satisfy the mandatory application requirement.
+    let rejected_bundle = IncomingBundle {
+        origin: origin_chain_id,
+        bundle: message_bundle.clone(),
+        action: MessageAction::Reject,
+    };
+    let block_with_rejected = make_first_block(chain_id).with_incoming_bundle(rejected_bundle);
     let result = chain
-        .execute_block(&invalid_block, time, None, &[], None)
-        .await;
-    assert_matches!(result, Err(ChainError::AuthorizedApplications(app_ids))
-        if app_ids == vec![application_id]
-    );
-
-    // Also, blocks without an application operation or incoming message are forbidden.
-    let invalid_block = make_child_block(&value.clone());
-    let result = chain
-        .execute_block(&invalid_block, time, None, &[], None)
+        .execute_test_block_simple(block_with_rejected, time, &[])
         .await;
     assert_matches!(result, Err(ChainError::MissingMandatoryApplications(app_ids))
         if app_ids == vec![application_id]
     );
 
-    // But app operations continue to work.
-    application.expect_call(ExpectedCall::execute_operation(|_, _| Ok(vec![])));
+    // Test 2: An accepted message SHOULD satisfy the mandatory application requirement.
+    application.expect_call(ExpectedCall::execute_message(|_, _| Ok(())));
     application.expect_call(ExpectedCall::default_finalize());
-    let valid_block = make_child_block(&value).with_operation(app_operation);
-    let outcome = chain
-        .execute_block(&valid_block, time, None, &[], None)
+    let accepted_bundle = IncomingBundle {
+        origin: origin_chain_id,
+        bundle: message_bundle,
+        action: MessageAction::Accept,
+    };
+    let block_with_accepted = make_first_block(chain_id).with_incoming_bundle(accepted_bundle);
+    let (block_with_accepted, outcome, _) = chain
+        .execute_test_block_simple(block_with_accepted, time, &[])
         .await?;
-    let value = ConfirmedBlock::new(outcome.with(valid_block));
+    let value = ConfirmedBlock::new(outcome.with(block_with_accepted));
     chain.apply_confirmed_block(&value, time).await?;
 
     Ok(())
@@ -372,7 +528,7 @@ async fn test_service_as_oracles(service_oracle_execution_times_ms: &[u64]) -> a
 
     application.expect_call(ExpectedCall::default_finalize());
 
-    chain.execute_block(&block, time, None, &[], None).await?;
+    chain.execute_test_block_simple(block, time, &[]).await?;
 
     Ok(())
 }
@@ -417,7 +573,7 @@ async fn test_service_as_oracle_exceeding_time_limit(
 
     application.expect_call(ExpectedCall::default_finalize());
 
-    let result = chain.execute_block(&block, time, None, &[], None).await;
+    let result = chain.execute_test_block_simple(block, time, &[]).await;
 
     let Err(ChainError::ExecutionError(execution_error, ChainExecutionContext::Operation(0))) =
         result
@@ -482,7 +638,7 @@ async fn test_service_as_oracle_timeout_early_stop(
     application.expect_call(ExpectedCall::default_finalize());
 
     let execution_start = Instant::now();
-    let result = chain.execute_block(&block, time, None, &[], None).await;
+    let result = chain.execute_test_block_simple(block, time, &[]).await;
     let execution_time = execution_start.elapsed();
 
     let Err(ChainError::ExecutionError(execution_error, ChainExecutionContext::Operation(0))) =
@@ -533,7 +689,10 @@ async fn test_service_as_oracle_response_size_limit(
 
     application.expect_call(ExpectedCall::default_finalize());
 
-    chain.execute_block(&block, time, None, &[], None).await
+    chain
+        .execute_test_block_simple(block, time, &[])
+        .await
+        .map(|(_, outcome, _)| outcome)
 }
 
 /// Tests contract HTTP response size limit.
@@ -589,7 +748,10 @@ async fn test_contract_http_response_size_limit(
 
     application.expect_call(ExpectedCall::default_finalize());
 
-    chain.execute_block(&block, time, None, &[], None).await
+    chain
+        .execute_test_block_simple(block, time, &[])
+        .await
+        .map(|(_, outcome, _)| outcome)
 }
 
 /// Tests service HTTP response size limit.
@@ -645,7 +807,10 @@ async fn test_service_http_response_size_limit(
 
     application.expect_call(ExpectedCall::default_finalize());
 
-    chain.execute_block(&block, time, None, &[], None).await
+    chain
+        .execute_test_block_simple(block, time, &[])
+        .await
+        .map(|(_, outcome, _)| outcome)
 }
 
 /// Sets up a test with a dummy [`MockApplication`].
@@ -665,22 +830,9 @@ async fn prepare_test_with_dummy_mock_application(
     let mut env = TestEnvironment::new();
     let time = Timestamp::from(0);
 
-    let mut config = env.make_open_chain_config();
-    config.committees.insert(
-        Epoch(0),
-        bcs::to_bytes(&Committee::new(
-            BTreeMap::from([(
-                ValidatorPublicKey::test_key(1),
-                ValidatorState {
-                    network_address: ValidatorPublicKey::test_key(1).to_string(),
-                    votes: 1,
-                    account_public_key: AccountPublicKey::test_key(1),
-                },
-            )]),
-            policy,
-        ))
-        .expect("serializing a committee should not fail"),
-    );
+    let config = env.make_open_chain_config();
+
+    let committee_blob = committee_blob(policy);
 
     let chain_desc = env.make_child_chain_description_with_config(3, config);
     let chain_id = chain_desc.id();
@@ -689,24 +841,34 @@ async fn prepare_test_with_dummy_mock_application(
     chain
         .context()
         .extra()
+        .add_blobs([committee_blob.clone()])
+        .await?;
+
+    chain
+        .context()
+        .extra()
         .add_blobs(env.description_blobs())
         .await?;
 
-    chain.ensure_is_active(time).await?;
+    chain.initialize_if_needed(time).await?;
 
     // Create a mock application.
     let (app_description, contract_blob, service_blob) = env.make_app_description();
     let application_id = ApplicationId::from(&app_description);
     let application = MockApplication::default();
-    let extra = &chain.context().extra();
-    extra
-        .user_contracts()
-        .insert(application_id, application.clone().into());
-    extra
-        .user_services()
-        .insert(application_id, application.clone().into());
+    let context = chain.context();
+    let extra = context.extra();
+    {
+        let pinned = extra.user_contracts().pin();
+        pinned.insert(application_id, application.clone().into());
+    }
+    {
+        let pinned = extra.user_services().pin();
+        pinned.insert(application_id, application.clone().into());
+    }
     extra
         .add_blobs([
+            committee_blob,
             contract_blob,
             service_blob,
             Blob::new_application_description(&app_description),

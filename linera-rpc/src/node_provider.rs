@@ -39,12 +39,19 @@ impl ValidatorNodeProvider for NodeProvider {
         }
 
         if address.starts_with("grpc") {
-            return Ok(Client::Grpc(self.grpc.make_node(&address)?));
+            return Ok(Client::Grpc(Box::new(self.grpc.make_node(&address)?)));
         }
 
         Err(NodeError::CannotResolveValidatorAddress { address })
     }
 }
+
+/// Default maximum backoff delay (30 seconds), following Google Cloud's recommendation.
+/// References:
+/// - <https://cloud.google.com/storage/docs/retry-strategy>
+/// - <https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html>
+/// - <https://github.com/grpc/grpc/blob/master/doc/connection-backoff.md>
+pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Copy, Clone)]
 pub struct NodeOptions {
@@ -52,4 +59,17 @@ pub struct NodeOptions {
     pub recv_timeout: Duration,
     pub retry_delay: Duration,
     pub max_retries: u32,
+    pub max_backoff: Duration,
+}
+
+impl Default for NodeOptions {
+    fn default() -> Self {
+        Self {
+            send_timeout: Duration::ZERO,
+            recv_timeout: Duration::ZERO,
+            retry_delay: Duration::ZERO,
+            max_retries: 0,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+        }
+    }
 }

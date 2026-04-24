@@ -3,15 +3,17 @@
 
 //! This module tracks the resources used during the execution of a transaction.
 
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use custom_debug_derive::Debug;
 use linera_base::{
-    data_types::{Amount, ArithmeticError, BlobContent},
+    data_types::{Amount, ApplicationDescription, ArithmeticError, Blob},
     ensure,
     identifiers::AccountOwner,
+    ownership::ChainOwnership,
+    vm::VmRuntime,
 };
-use linera_views::{context::Context, views::ViewError};
+use linera_views::{context::Context, ViewError};
 use serde::Serialize;
 
 use crate::{ExecutionError, Message, Operation, ResourceControlPolicy, SystemExecutionStateView};
@@ -19,26 +21,146 @@ use crate::{ExecutionError, Message, Operation, ResourceControlPolicy, SystemExe
 #[derive(Clone, Debug, Default)]
 pub struct ResourceController<Account = Amount, Tracker = ResourceTracker> {
     /// The (fixed) policy used to charge fees and control resource usage.
-    pub policy: Arc<ResourceControlPolicy>,
+    policy: Arc<ResourceControlPolicy>,
     /// How the resources were used so far.
     pub tracker: Tracker,
     /// The account paying for the resource usage.
     pub account: Account,
+    /// When true, balance deductions are skipped (fees waived for free apps).
+    pub is_free: bool,
+}
+
+impl<Account, Tracker> ResourceController<Account, Tracker> {
+    /// Creates a new resource controller with the given policy and account.
+    pub fn new(policy: Arc<ResourceControlPolicy>, tracker: Tracker, account: Account) -> Self {
+        Self {
+            policy,
+            tracker,
+            account,
+            is_free: false,
+        }
+    }
+
+    /// Returns a reference to the policy.
+    pub fn policy(&self) -> &Arc<ResourceControlPolicy> {
+        &self.policy
+    }
+
+    /// Returns a reference to the tracker.
+    pub fn tracker(&self) -> &Tracker {
+        &self.tracker
+    }
+}
+
+/// The runtime size of an `Amount`.
+pub const RUNTIME_AMOUNT_SIZE: u32 = 16;
+
+/// The runtime size of a `ApplicationId`.
+pub const RUNTIME_APPLICATION_ID_SIZE: u32 = 32;
+
+/// The runtime size of a `BlockHeight`.
+pub const RUNTIME_BLOCK_HEIGHT_SIZE: u32 = 8;
+
+/// The runtime size of a `ChainId`.
+pub const RUNTIME_CHAIN_ID_SIZE: u32 = 32;
+
+/// The runtime size of a `Timestamp`.
+pub const RUNTIME_TIMESTAMP_SIZE: u32 = 8;
+
+/// The runtime size of the weight of an owner.
+pub const RUNTIME_OWNER_WEIGHT_SIZE: u32 = 8;
+
+/// The runtime constant part size of the `ChainOwnership`.
+/// It consists of one `u32` and four `TimeDelta` which are the constant part of
+/// the `ChainOwnership`. The way we do it is not optimal:
+/// TODO(#4164): Implement a procedure for computing naive sizes.
+pub const RUNTIME_CONSTANT_CHAIN_OWNERSHIP_SIZE: u32 = 4 + 4 * 8;
+
+/// The runtime size of a `CryptoHash`.
+pub const RUNTIME_CRYPTO_HASH_SIZE: u32 = 32;
+
+/// The runtime size of a `VmRuntime` enum.
+pub const RUNTIME_VM_RUNTIME_SIZE: u32 = 1;
+
+/// The runtime constant part size of an `ApplicationDescription`.
+/// This includes: `ModuleId` (2 hashes + VmRuntime) + `ChainId` + `BlockHeight` + `u32`.
+/// Variable parts (`parameters` and `required_application_ids`) are calculated separately.
+pub const RUNTIME_CONSTANT_APPLICATION_DESCRIPTION_SIZE: u32 = 2 * RUNTIME_CRYPTO_HASH_SIZE + RUNTIME_VM_RUNTIME_SIZE  // ModuleId
+    + RUNTIME_CHAIN_ID_SIZE                                  // creator_chain_id
+    + RUNTIME_BLOCK_HEIGHT_SIZE                              // block_height
+    + 4; // application_index (u32)
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+
+    use linera_base::{
+        data_types::{Amount, ApplicationDescription, BlockHeight, Timestamp},
+        identifiers::{ApplicationId, ChainId, ModuleId},
+    };
+
+    use crate::resources::{
+        RUNTIME_AMOUNT_SIZE, RUNTIME_APPLICATION_ID_SIZE, RUNTIME_BLOCK_HEIGHT_SIZE,
+        RUNTIME_CHAIN_ID_SIZE, RUNTIME_CONSTANT_APPLICATION_DESCRIPTION_SIZE,
+        RUNTIME_OWNER_WEIGHT_SIZE, RUNTIME_TIMESTAMP_SIZE,
+    };
+
+    #[test]
+    fn test_size_of_runtime_operations() {
+        assert_eq!(RUNTIME_AMOUNT_SIZE as usize, size_of::<Amount>());
+        assert_eq!(
+            RUNTIME_APPLICATION_ID_SIZE as usize,
+            size_of::<ApplicationId>()
+        );
+        assert_eq!(RUNTIME_BLOCK_HEIGHT_SIZE as usize, size_of::<BlockHeight>());
+        assert_eq!(RUNTIME_CHAIN_ID_SIZE as usize, size_of::<ChainId>());
+        assert_eq!(RUNTIME_TIMESTAMP_SIZE as usize, size_of::<Timestamp>());
+        assert_eq!(RUNTIME_OWNER_WEIGHT_SIZE as usize, size_of::<u64>());
+    }
+
+    /// Verifies that `RUNTIME_CONSTANT_APPLICATION_DESCRIPTION_SIZE` matches the actual
+    /// structure of `ApplicationDescription`. This test will fail if a new fixed-size
+    /// field is added to the struct.
+    #[test]
+    fn test_application_description_size() {
+        // Verify using BCS serialization, which is architecture-independent.
+        // BCS encodes Vec length as ULEB128, so empty vectors add 1 byte each.
+        let description = ApplicationDescription {
+            module_id: ModuleId::default(),
+            creator_chain_id: ChainId::default(),
+            block_height: BlockHeight::default(),
+            application_index: 0,
+            parameters: vec![],
+            required_application_ids: vec![],
+        };
+        let serialized = bcs::to_bytes(&description).expect("serialization should succeed");
+        // Serialized size = fixed fields + 2 bytes for empty vectors (1 byte each for ULEB128 length).
+        assert_eq!(
+            serialized.len(),
+            RUNTIME_CONSTANT_APPLICATION_DESCRIPTION_SIZE as usize + 2
+        );
+    }
 }
 
 /// The resources used so far by an execution process.
+/// Acts as an accumulator for all resources consumed during
+/// a specific execution flow. This could be the execution of a block,
+/// the processing of a single message, or a specific phase within these
+/// broader operations.
 #[derive(Copy, Debug, Clone, Default)]
 pub struct ResourceTracker {
-    /// The number of blocks created.
-    pub blocks: u32,
     /// The total size of the block so far.
     pub block_size: u64,
-    /// The fuel used so far.
-    pub fuel: u64,
+    /// The EVM fuel used so far.
+    pub evm_fuel: u64,
+    /// The Wasm fuel used so far.
+    pub wasm_fuel: u64,
     /// The number of read operations.
     pub read_operations: u32,
     /// The number of write operations.
     pub write_operations: u32,
+    /// The size of bytes read from runtime.
+    pub bytes_runtime: u32,
     /// The number of bytes read.
     pub bytes_read: u64,
     /// The number of bytes written.
@@ -51,6 +173,14 @@ pub struct ResourceTracker {
     pub blob_bytes_read: u64,
     /// The number of blob bytes published.
     pub blob_bytes_published: u64,
+    /// The number of events read.
+    pub events_read: u32,
+    /// The number of events published.
+    pub events_published: u32,
+    /// The number of event bytes read.
+    pub event_bytes_read: u64,
+    /// The number of event bytes published.
+    pub event_bytes_published: u64,
     /// The change in the number of bytes being stored by user applications.
     pub bytes_stored: i32,
     /// The number of operations executed.
@@ -69,6 +199,144 @@ pub struct ResourceTracker {
     pub service_oracle_execution: Duration,
     /// The amount allocated to message grants.
     pub grants: Amount,
+}
+
+impl ResourceTracker {
+    fn fuel(&self, vm_runtime: VmRuntime) -> u64 {
+        match vm_runtime {
+            VmRuntime::Wasm => self.wasm_fuel,
+            VmRuntime::Evm => self.evm_fuel,
+        }
+    }
+}
+
+impl fmt::Display for ResourceTracker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut lines = Vec::new();
+
+        let mut block_parts = Vec::new();
+        if self.block_size != 0 {
+            block_parts.push(format!("size={}", self.block_size));
+        }
+        if self.operations != 0 {
+            block_parts.push(format!("operations={}", self.operations));
+        }
+        if self.operation_bytes != 0 {
+            block_parts.push(format!("operation_bytes={}", self.operation_bytes));
+        }
+        if !block_parts.is_empty() {
+            lines.push(format!("block: {}", block_parts.join(", ")));
+        }
+
+        let mut fuel_parts = Vec::new();
+        if self.wasm_fuel != 0 {
+            fuel_parts.push(format!("wasm={}", self.wasm_fuel));
+        }
+        if self.evm_fuel != 0 {
+            fuel_parts.push(format!("evm={}", self.evm_fuel));
+        }
+        if !fuel_parts.is_empty() {
+            lines.push(format!("fuel: {}", fuel_parts.join(", ")));
+        }
+
+        let mut storage_parts = Vec::new();
+        if self.read_operations != 0 {
+            storage_parts.push(format!("reads={}", self.read_operations));
+        }
+        if self.write_operations != 0 {
+            storage_parts.push(format!("writes={}", self.write_operations));
+        }
+        if self.bytes_runtime != 0 {
+            storage_parts.push(format!("runtime_bytes={}", self.bytes_runtime));
+        }
+        if self.bytes_read != 0 {
+            storage_parts.push(format!("bytes_read={}", self.bytes_read));
+        }
+        if self.bytes_written != 0 {
+            storage_parts.push(format!("bytes_written={}", self.bytes_written));
+        }
+        if self.bytes_stored != 0 {
+            storage_parts.push(format!("bytes_stored={}", self.bytes_stored));
+        }
+        if !storage_parts.is_empty() {
+            lines.push(format!("storage: {}", storage_parts.join(", ")));
+        }
+
+        let mut blob_parts = Vec::new();
+        if self.blobs_read != 0 {
+            blob_parts.push(format!("read={}", self.blobs_read));
+        }
+        if self.blobs_published != 0 {
+            blob_parts.push(format!("published={}", self.blobs_published));
+        }
+        if self.blob_bytes_read != 0 {
+            blob_parts.push(format!("bytes_read={}", self.blob_bytes_read));
+        }
+        if self.blob_bytes_published != 0 {
+            blob_parts.push(format!("bytes_published={}", self.blob_bytes_published));
+        }
+        if !blob_parts.is_empty() {
+            lines.push(format!("blobs: {}", blob_parts.join(", ")));
+        }
+
+        let mut event_parts = Vec::new();
+        if self.events_read != 0 {
+            event_parts.push(format!("read={}", self.events_read));
+        }
+        if self.events_published != 0 {
+            event_parts.push(format!("published={}", self.events_published));
+        }
+        if self.event_bytes_read != 0 {
+            event_parts.push(format!("bytes_read={}", self.event_bytes_read));
+        }
+        if self.event_bytes_published != 0 {
+            event_parts.push(format!("bytes_published={}", self.event_bytes_published));
+        }
+        if !event_parts.is_empty() {
+            lines.push(format!("events: {}", event_parts.join(", ")));
+        }
+
+        let mut message_parts = Vec::new();
+        if self.messages != 0 {
+            message_parts.push(format!("count={}", self.messages));
+        }
+        if self.message_bytes != 0 {
+            message_parts.push(format!("bytes={}", self.message_bytes));
+        }
+        if self.grants != Amount::ZERO {
+            message_parts.push(format!("grants={}", self.grants));
+        }
+        if !message_parts.is_empty() {
+            lines.push(format!("messages: {}", message_parts.join(", ")));
+        }
+
+        let mut http_service_parts = Vec::new();
+        if self.http_requests != 0 {
+            http_service_parts.push(format!("http_requests={}", self.http_requests));
+        }
+        if self.service_oracle_queries != 0 {
+            http_service_parts.push(format!("service_queries={}", self.service_oracle_queries));
+        }
+        if self.service_oracle_execution != Duration::ZERO {
+            http_service_parts.push(format!(
+                "service_execution={:?}",
+                self.service_oracle_execution
+            ));
+        }
+        if !http_service_parts.is_empty() {
+            lines.push(format!("http/service: {}", http_service_parts.join(", ")));
+        }
+
+        let mut lines_iter = lines.into_iter();
+        if let Some(first) = lines_iter.next() {
+            write!(f, "{}", first)?;
+            for line in lines_iter {
+                write!(f, "\n  {}", line)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// How to access the balance of an account.
@@ -96,11 +364,13 @@ where
     /// and `other` to `self`.
     pub fn merge_balance(&mut self, initial: Amount, other: Amount) -> Result<(), ExecutionError> {
         if other <= initial {
-            self.account
-                .try_sub_assign(initial.try_sub(other).expect("other <= initial"))
-                .map_err(|_| ExecutionError::InsufficientFundingForFees {
+            let sub_amount = initial.try_sub(other).expect("other <= initial");
+            self.account.try_sub_assign(sub_amount).map_err(|_| {
+                ExecutionError::FeesExceedFunding {
+                    fees: sub_amount,
                     balance: self.balance().unwrap_or(Amount::MAX),
-                })?;
+                }
+            })?;
         } else {
             self.account
                 .try_add_assign(other.try_sub(initial).expect("other > initial"))?;
@@ -109,41 +379,37 @@ where
     }
 
     /// Subtracts an amount from a balance and reports an error if that is impossible.
+    /// When `is_free` is set, balance deductions are skipped (fees waived).
     fn update_balance(&mut self, fees: Amount) -> Result<(), ExecutionError> {
-        self.account.try_sub_assign(fees).map_err(|_| {
-            ExecutionError::InsufficientFundingForFees {
+        if self.is_free {
+            return Ok(());
+        }
+        self.account
+            .try_sub_assign(fees)
+            .map_err(|_| ExecutionError::FeesExceedFunding {
+                fees,
                 balance: self.balance().unwrap_or(Amount::MAX),
-            }
-        })?;
+            })?;
         Ok(())
     }
 
     /// Obtains the amount of fuel that could be spent by consuming the entire balance.
-    pub(crate) fn remaining_fuel(&self) -> u64 {
+    pub(crate) fn remaining_fuel(&self, vm_runtime: VmRuntime) -> u64 {
+        let fuel = self.tracker.as_ref().fuel(vm_runtime);
+        let maximum_fuel_per_block = self.policy.maximum_fuel_per_block(vm_runtime);
+        if self.is_free {
+            return maximum_fuel_per_block.saturating_sub(fuel);
+        }
+        let balance = self.balance().unwrap_or(Amount::MAX);
         self.policy
-            .remaining_fuel(self.balance().unwrap_or(Amount::MAX))
-            .min(
-                self.policy
-                    .maximum_fuel_per_block
-                    .saturating_sub(self.tracker.as_ref().fuel),
-            )
+            .remaining_fuel(balance, vm_runtime)
+            .min(maximum_fuel_per_block.saturating_sub(fuel))
     }
 
     /// Tracks the allocation of a grant.
     pub fn track_grant(&mut self, grant: Amount) -> Result<(), ExecutionError> {
         self.tracker.as_mut().grants.try_add_assign(grant)?;
         self.update_balance(grant)
-    }
-
-    /// Tracks the creation of a block.
-    pub fn track_block(&mut self) -> Result<(), ExecutionError> {
-        self.tracker.as_mut().blocks = self
-            .tracker
-            .as_mut()
-            .blocks
-            .checked_add(1)
-            .ok_or(ArithmeticError::Overflow)?;
-        self.update_balance(self.policy.block)
     }
 
     /// Tracks the execution of an operation in block.
@@ -208,29 +474,147 @@ where
     }
 
     /// Tracks a number of fuel units used.
-    pub(crate) fn track_fuel(&mut self, fuel: u64) -> Result<(), ExecutionError> {
-        self.tracker.as_mut().fuel = self
+    pub(crate) fn track_fuel(
+        &mut self,
+        fuel: u64,
+        vm_runtime: VmRuntime,
+    ) -> Result<(), ExecutionError> {
+        match vm_runtime {
+            VmRuntime::Wasm => {
+                self.tracker.as_mut().wasm_fuel = self
+                    .tracker
+                    .as_ref()
+                    .wasm_fuel
+                    .checked_add(fuel)
+                    .ok_or(ArithmeticError::Overflow)?;
+                ensure!(
+                    self.tracker.as_ref().wasm_fuel <= self.policy.maximum_wasm_fuel_per_block,
+                    ExecutionError::MaximumFuelExceeded(vm_runtime)
+                );
+            }
+            VmRuntime::Evm => {
+                self.tracker.as_mut().evm_fuel = self
+                    .tracker
+                    .as_ref()
+                    .evm_fuel
+                    .checked_add(fuel)
+                    .ok_or(ArithmeticError::Overflow)?;
+                ensure!(
+                    self.tracker.as_ref().evm_fuel <= self.policy.maximum_evm_fuel_per_block,
+                    ExecutionError::MaximumFuelExceeded(vm_runtime)
+                );
+            }
+        }
+        self.update_balance(self.policy.fuel_price(fuel, vm_runtime)?)
+    }
+
+    /// Tracks runtime reading of `ChainId`
+    pub(crate) fn track_runtime_chain_id(&mut self) -> Result<(), ExecutionError> {
+        self.track_size_runtime_operations(RUNTIME_CHAIN_ID_SIZE)
+    }
+
+    /// Tracks runtime reading of `BlockHeight`
+    pub(crate) fn track_runtime_block_height(&mut self) -> Result<(), ExecutionError> {
+        self.track_size_runtime_operations(RUNTIME_BLOCK_HEIGHT_SIZE)
+    }
+
+    /// Tracks runtime reading of `ApplicationId`
+    pub(crate) fn track_runtime_application_id(&mut self) -> Result<(), ExecutionError> {
+        self.track_size_runtime_operations(RUNTIME_APPLICATION_ID_SIZE)
+    }
+
+    /// Tracks runtime reading of application parameters.
+    pub(crate) fn track_runtime_application_parameters(
+        &mut self,
+        parameters: &[u8],
+    ) -> Result<(), ExecutionError> {
+        let parameters_len = parameters.len() as u32;
+        self.track_size_runtime_operations(parameters_len)
+    }
+
+    /// Tracks runtime reading of `Timestamp`
+    pub(crate) fn track_runtime_timestamp(&mut self) -> Result<(), ExecutionError> {
+        self.track_size_runtime_operations(RUNTIME_TIMESTAMP_SIZE)
+    }
+
+    /// Tracks runtime reading of balance
+    pub(crate) fn track_runtime_balance(&mut self) -> Result<(), ExecutionError> {
+        self.track_size_runtime_operations(RUNTIME_AMOUNT_SIZE)
+    }
+
+    /// Tracks runtime reading of owner balances
+    pub(crate) fn track_runtime_owner_balances(
+        &mut self,
+        owner_balances: &[(AccountOwner, Amount)],
+    ) -> Result<(), ExecutionError> {
+        let mut size = 0;
+        for (account_owner, _) in owner_balances {
+            size += account_owner.size() + RUNTIME_AMOUNT_SIZE;
+        }
+        self.track_size_runtime_operations(size)
+    }
+
+    /// Tracks runtime reading of owners
+    pub(crate) fn track_runtime_owners(
+        &mut self,
+        owners: &[AccountOwner],
+    ) -> Result<(), ExecutionError> {
+        let mut size = 0;
+        for owner in owners {
+            size += owner.size();
+        }
+        self.track_size_runtime_operations(size)
+    }
+
+    /// Tracks runtime reading of owners
+    pub(crate) fn track_runtime_chain_ownership(
+        &mut self,
+        chain_ownership: &ChainOwnership,
+    ) -> Result<(), ExecutionError> {
+        let mut size = 0;
+        for account_owner in &chain_ownership.super_owners {
+            size += account_owner.size();
+        }
+        for account_owner in chain_ownership.owners.keys() {
+            size += account_owner.size() + RUNTIME_OWNER_WEIGHT_SIZE;
+        }
+        size += RUNTIME_CONSTANT_CHAIN_OWNERSHIP_SIZE;
+        self.track_size_runtime_operations(size)
+    }
+
+    /// Tracks runtime reading of an application description.
+    pub(crate) fn track_runtime_application_description(
+        &mut self,
+        description: &ApplicationDescription,
+    ) -> Result<(), ExecutionError> {
+        let parameters_size = description.parameters.len() as u32;
+        let required_apps_size =
+            description.required_application_ids.len() as u32 * RUNTIME_APPLICATION_ID_SIZE;
+        let size =
+            RUNTIME_CONSTANT_APPLICATION_DESCRIPTION_SIZE + parameters_size + required_apps_size;
+        self.track_size_runtime_operations(size)
+    }
+
+    /// Tracks runtime operations.
+    fn track_size_runtime_operations(&mut self, size: u32) -> Result<(), ExecutionError> {
+        self.tracker.as_mut().bytes_runtime = self
             .tracker
-            .as_ref()
-            .fuel
-            .checked_add(fuel)
+            .as_mut()
+            .bytes_runtime
+            .checked_add(size)
             .ok_or(ArithmeticError::Overflow)?;
-        ensure!(
-            self.tracker.as_ref().fuel <= self.policy.maximum_fuel_per_block,
-            ExecutionError::MaximumFuelExceeded
-        );
-        self.update_balance(self.policy.fuel_price(fuel)?)
+        self.update_balance(self.policy.bytes_runtime_price(size)?)
     }
 
     /// Tracks a read operation.
-    pub(crate) fn track_read_operations(&mut self, count: u32) -> Result<(), ExecutionError> {
+    pub(crate) fn track_read_operation(&mut self) -> Result<(), ExecutionError> {
         self.tracker.as_mut().read_operations = self
             .tracker
             .as_mut()
             .read_operations
-            .checked_add(count)
+            .checked_add(1)
             .ok_or(ArithmeticError::Overflow)?;
-        self.update_balance(self.policy.read_operations_price(count)?)
+        self.update_balance(self.policy.read_operations_price(1)?)
     }
 
     /// Tracks a write operation.
@@ -292,9 +676,12 @@ where
     }
 
     /// Tracks a number of blob bytes published.
-    pub fn track_blob_published(&mut self, content: &BlobContent) -> Result<(), ExecutionError> {
-        self.policy.check_blob_size(content)?;
-        let size = content.bytes().len() as u64;
+    pub fn track_blob_published(&mut self, blob: &Blob) -> Result<(), ExecutionError> {
+        self.policy.check_blob_size(blob.content())?;
+        let size = blob.content().bytes().len() as u64;
+        if blob.is_committee_blob() {
+            return Ok(());
+        }
         {
             let tracker = self.tracker.as_mut();
             tracker.blob_bytes_published = tracker
@@ -303,6 +690,44 @@ where
                 .ok_or(ArithmeticError::Overflow)?;
             tracker.blobs_published = tracker
                 .blobs_published
+                .checked_add(1)
+                .ok_or(ArithmeticError::Overflow)?;
+        }
+        self.update_balance(self.policy.blob_published_price(size)?)?;
+        Ok(())
+    }
+
+    /// Tracks a number of event bytes read.
+    pub(crate) fn track_event_read(&mut self, count: u64) -> Result<(), ExecutionError> {
+        {
+            let tracker = self.tracker.as_mut();
+            tracker.event_bytes_read = tracker
+                .event_bytes_read
+                .checked_add(count)
+                .ok_or(ArithmeticError::Overflow)?;
+            tracker.events_read = tracker
+                .events_read
+                .checked_add(1)
+                .ok_or(ArithmeticError::Overflow)?;
+        }
+        self.update_balance(self.policy.blob_read_price(count)?)?;
+        Ok(())
+    }
+
+    /// Tracks a number of event bytes published.
+    pub(crate) fn track_event_published(
+        &mut self,
+        event_bytes: &[u8],
+    ) -> Result<(), ExecutionError> {
+        let size = event_bytes.len() as u64;
+        {
+            let tracker = self.tracker.as_mut();
+            tracker.event_bytes_published = tracker
+                .event_bytes_published
+                .checked_add(size)
+                .ok_or(ArithmeticError::Overflow)?;
+            tracker.events_published = tracker
+                .events_published
                 .checked_add(1)
                 .ok_or(ArithmeticError::Overflow)?;
         }
@@ -368,7 +793,7 @@ where
 
     /// Tracks the size of a response produced by an oracle.
     pub(crate) fn track_service_oracle_response(
-        &mut self,
+        &self,
         response_bytes: usize,
     ) -> Result<(), ExecutionError> {
         ensure!(
@@ -401,6 +826,55 @@ where
             ExecutionError::BlockTooLarge
         );
         Ok(())
+    }
+}
+
+impl ResourceController<Option<AccountOwner>, ResourceTracker> {
+    /// Provides a reference to the current execution state and obtains a temporary object
+    /// where the accounting functions of [`ResourceController`] are available.
+    pub async fn with_state<'a, C>(
+        &mut self,
+        view: &'a mut SystemExecutionStateView<C>,
+    ) -> Result<ResourceController<Sources<'a>, &mut ResourceTracker>, ViewError>
+    where
+        C: Context + Clone + 'static,
+    {
+        self.with_state_and_grant(view, None).await
+    }
+
+    /// Provides a reference to the current execution state as well as an optional grant,
+    /// and obtains a temporary object where the accounting functions of
+    /// [`ResourceController`] are available.
+    pub async fn with_state_and_grant<'a, C>(
+        &mut self,
+        view: &'a mut SystemExecutionStateView<C>,
+        grant: Option<&'a mut Amount>,
+    ) -> Result<ResourceController<Sources<'a>, &mut ResourceTracker>, ViewError>
+    where
+        C: Context + Clone + 'static,
+    {
+        let mut sources = Vec::new();
+        // First, use the grant (e.g. for messages) and otherwise use the chain account
+        // (e.g. for blocks and operations).
+        if let Some(grant) = grant {
+            sources.push(grant);
+        } else {
+            sources.push(view.balance.get_mut());
+        }
+        // Then the local account, if any. Currently, any negative fee (e.g. storage
+        // refund) goes preferably to this account.
+        if let Some(owner) = &self.account {
+            if let Some(balance) = view.balances.get_mut(owner).await? {
+                sources.push(balance);
+            }
+        }
+
+        Ok(ResourceController {
+            policy: self.policy.clone(),
+            tracker: &mut self.tracker,
+            account: Sources { sources },
+            is_free: self.is_free,
+        })
     }
 }
 
@@ -441,7 +915,7 @@ pub struct Sources<'a> {
 impl BalanceHolder for Sources<'_> {
     fn balance(&self) -> Result<Amount, ArithmeticError> {
         let mut amount = Amount::ZERO;
-        for source in self.sources.iter() {
+        for source in &self.sources {
             amount.try_add_assign(**source)?;
         }
         Ok(amount)
@@ -455,7 +929,7 @@ impl BalanceHolder for Sources<'_> {
     }
 
     fn try_sub_assign(&mut self, mut other: Amount) -> Result<(), ArithmeticError> {
-        for source in self.sources.iter_mut() {
+        for source in &mut self.sources {
             if source.try_sub_assign(other).is_ok() {
                 return Ok(());
             }
@@ -467,53 +941,5 @@ impl BalanceHolder for Sources<'_> {
         } else {
             Ok(())
         }
-    }
-}
-
-impl ResourceController<Option<AccountOwner>, ResourceTracker> {
-    /// Provides a reference to the current execution state and obtains a temporary object
-    /// where the accounting functions of [`ResourceController`] are available.
-    pub async fn with_state<'a, C>(
-        &mut self,
-        view: &'a mut SystemExecutionStateView<C>,
-    ) -> Result<ResourceController<Sources<'a>, &mut ResourceTracker>, ViewError>
-    where
-        C: Context + Clone + Send + Sync + 'static,
-    {
-        self.with_state_and_grant(view, None).await
-    }
-
-    /// Provides a reference to the current execution state as well as an optional grant,
-    /// and obtains a temporary object where the accounting functions of
-    /// [`ResourceController`] are available.
-    pub async fn with_state_and_grant<'a, C>(
-        &mut self,
-        view: &'a mut SystemExecutionStateView<C>,
-        grant: Option<&'a mut Amount>,
-    ) -> Result<ResourceController<Sources<'a>, &mut ResourceTracker>, ViewError>
-    where
-        C: Context + Clone + Send + Sync + 'static,
-    {
-        let mut sources = Vec::new();
-        // First, use the grant (e.g. for messages) and otherwise use the chain account
-        // (e.g. for blocks and operations).
-        if let Some(grant) = grant {
-            sources.push(grant);
-        } else {
-            sources.push(view.balance.get_mut());
-        }
-        // Then the local account, if any. Currently, any negative fee (e.g. storage
-        // refund) goes preferably to this account.
-        if let Some(owner) = &self.account {
-            if let Some(balance) = view.balances.get_mut(owner).await? {
-                sources.push(balance);
-            }
-        }
-
-        Ok(ResourceController {
-            policy: self.policy.clone(),
-            tracker: &mut self.tracker,
-            account: Sources { sources },
-        })
     }
 }

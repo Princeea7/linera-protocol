@@ -2,31 +2,28 @@
 source: linera-views-derive/src/lib.rs
 expression: pretty(generate_crypto_hash_code(input))
 ---
-#[linera_views::async_trait]
-impl linera_views::views::CryptoHashView<custom::path::to::ContextType> for TestView
+impl linera_views::views::CryptoHashView for TestView
 where
     RegisterView<
         custom::path::to::ContextType,
         usize,
-    >: linera_views::views::HashableView<custom::path::to::ContextType>,
+    >: linera_views::views::HashableView,
     CollectionView<
         custom::path::to::ContextType,
         usize,
         RegisterView<custom::path::to::ContextType, usize>,
-    >: linera_views::views::HashableView<custom::path::to::ContextType>,
-    Self: Send + Sync,
+    >: linera_views::views::HashableView,
+    Self: linera_views::views::View,
 {
     async fn crypto_hash(
         &self,
-    ) -> Result<linera_base::crypto::CryptoHash, linera_views::views::ViewError> {
+    ) -> Result<linera_base::crypto::CryptoHash, linera_views::ViewError> {
         use linera_base::crypto::{BcsHashable, CryptoHash};
         use linera_views::{
-            batch::Batch, generic_array::GenericArray,
-            sha3::{digest::OutputSizeUser, Sha3_256},
-            views::HashableView,
+            generic_array::GenericArray, sha3::{digest::OutputSizeUser, Sha3_256},
+            views::HashableView as _,
         };
-        use serde::{Serialize, Deserialize};
-        #[derive(Serialize, Deserialize)]
+        #[derive(serde::Serialize, serde::Deserialize)]
         struct TestViewHash(GenericArray<u8, <Sha3_256 as OutputSizeUser>::OutputSize>);
         impl<'de> BcsHashable<'de> for TestViewHash {}
         let hash = self.hash().await?;
@@ -34,15 +31,13 @@ where
     }
     async fn crypto_hash_mut(
         &mut self,
-    ) -> Result<linera_base::crypto::CryptoHash, linera_views::views::ViewError> {
+    ) -> Result<linera_base::crypto::CryptoHash, linera_views::ViewError> {
         use linera_base::crypto::{BcsHashable, CryptoHash};
         use linera_views::{
-            batch::Batch, generic_array::GenericArray,
-            sha3::{digest::OutputSizeUser, Sha3_256},
-            views::HashableView,
+            generic_array::GenericArray, sha3::{digest::OutputSizeUser, Sha3_256},
+            views::HashableView as _,
         };
-        use serde::{Serialize, Deserialize};
-        #[derive(Serialize, Deserialize)]
+        #[derive(serde::Serialize, serde::Deserialize)]
         struct TestViewHash(GenericArray<u8, <Sha3_256 as OutputSizeUser>::OutputSize>);
         impl<'de> BcsHashable<'de> for TestViewHash {}
         let hash = self.hash_mut().await?;

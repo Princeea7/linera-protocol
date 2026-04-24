@@ -2,7 +2,13 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, io, mem, net::SocketAddr, pin::pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    io, mem,
+    net::SocketAddr,
+    pin::{pin, Pin},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use futures::{
@@ -10,6 +16,7 @@ use futures::{
     stream::{self, FuturesUnordered, SplitSink, SplitStream},
     Sink, SinkExt, Stream, StreamExt, TryStreamExt,
 };
+use linera_base::identifiers::ChainId;
 use linera_core::{JoinSetExt as _, TaskHandle};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -79,6 +86,15 @@ pub trait ConnectionPool: Send {
 #[async_trait]
 pub trait MessageHandler: Clone {
     async fn handle_message(&mut self, message: RpcMessage) -> Option<RpcMessage>;
+
+    /// Handle a notification subscription request. Returns a stream of notification
+    /// messages if supported, or `None` if subscriptions are not supported.
+    async fn handle_subscribe(
+        &mut self,
+        _chains: Vec<ChainId>,
+    ) -> Option<Pin<Box<dyn Stream<Item = RpcMessage> + Send>>> {
+        None
+    }
 }
 
 /// The result of spawning a server is oneshot channel to track completion, and the set of
@@ -150,7 +166,7 @@ impl TransportProtocol {
     ) -> Result<Box<dyn ConnectionPool>, std::io::Error> {
         let pool: Box<dyn ConnectionPool> = match self {
             Self::Udp => Box::new(UdpConnectionPool::new().await?),
-            Self::Tcp => Box::new(TcpConnectionPool::new().await?),
+            Self::Tcp => Box::new(TcpConnectionPool::new()),
         };
         Ok(pool)
     }
@@ -301,7 +317,7 @@ where
     /// Gracefully shuts down the server, waiting for existing tasks to finish.
     async fn shutdown(&mut self) {
         let handlers = mem::take(&mut self.active_handlers);
-        let mut handler_results = FuturesUnordered::from_iter(handlers.into_values());
+        let mut handler_results = handlers.into_values().collect::<FuturesUnordered<_>>();
 
         while let Some(result) = handler_results.next().await {
             if let Err(error) = result {
@@ -319,9 +335,9 @@ struct TcpConnectionPool {
 }
 
 impl TcpConnectionPool {
-    async fn new() -> Result<Self, std::io::Error> {
+    fn new() -> Self {
         let streams = HashMap::new();
-        Ok(Self { streams })
+        Self { streams }
     }
 
     async fn get_stream(
@@ -383,7 +399,7 @@ where
     ) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(address).await?;
 
-        let mut accept_stream = stream::try_unfold(listener, |listener| async move {
+        let accept_stream = stream::try_unfold(listener, |listener| async move {
             let (socket, _) = listener.accept().await?;
             Ok::<_, io::Error>(Some((socket, listener)))
         });
@@ -449,16 +465,19 @@ where
                     if let Err(error) = tcp_stream.shutdown().await {
                         let peer = tcp_stream
                             .peer_addr()
-                            .map(|address| address.to_string())
-                            .unwrap_or_else(|_| "an unknown peer".to_owned());
+                            .map_or_else(|_| "an unknown peer".to_owned(), |address| address.to_string());
                         warn!("Failed to close connection to {peer}: {error:?}");
                     }
                     return;
                 }
                 result = self.connection.next() => match result {
+                    Some(Ok(RpcMessage::SubscribeNotifications(chains))) => {
+                        self.handle_subscription(chains).await;
+                        return;
+                    }
                     Some(Ok(message)) => self.handle_message(message).await,
                     Some(Err(error)) => {
-                        self.handle_error(error);
+                        Self::handle_error(&error);
                         return;
                     }
                     None => break,
@@ -476,13 +495,34 @@ where
         }
     }
 
+    /// Handles a notification subscription request by switching to streaming mode.
+    async fn handle_subscription(&mut self, chains: Vec<ChainId>) {
+        let Some(mut stream) = self.handler.handle_subscribe(chains).await else {
+            return;
+        };
+        loop {
+            tokio::select! { biased;
+                _ = self.shutdown_signal.cancelled() => break,
+                msg = stream.next() => match msg {
+                    Some(notification) => {
+                        if let Err(error) = self.connection.send(notification).await {
+                            error!("Failed to send notification: {error}");
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
     /// Handles an error received while attempting to receive from the connection.
     ///
     /// Ignores a successful connection termination, while logging an unexpected connection
     /// termination or any other error.
-    fn handle_error(&self, error: codec::Error) {
+    fn handle_error(error: &codec::Error) {
         if !matches!(
-            &error,
+            error,
             codec::Error::IoError(error)
                 if error.kind() == io::ErrorKind::UnexpectedEof
                 || error.kind() == io::ErrorKind::ConnectionReset

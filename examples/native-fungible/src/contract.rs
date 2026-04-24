@@ -3,8 +3,10 @@
 
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
-use fungible::{FungibleResponse, FungibleTokenAbi, InitialState, Operation, Parameters};
 use linera_sdk::{
+    abis::fungible::{
+        FungibleOperation, FungibleResponse, FungibleTokenAbi, InitialState, Parameters,
+    },
     linera_base_types::{Account, AccountOwner, ChainId, WithContractAbi},
     Contract, ContractRuntime,
 };
@@ -47,14 +49,30 @@ impl Contract for NativeFungibleTokenContract {
 
     async fn execute_operation(&mut self, operation: Self::Operation) -> Self::Response {
         match operation {
-            Operation::Balance { owner } => {
+            FungibleOperation::Balance { owner } => {
+                log::info!("balance check for owner={}", owner);
+
                 let balance = self.runtime.owner_balance(owner);
                 FungibleResponse::Balance(balance)
             }
 
-            Operation::TickerSymbol => FungibleResponse::TickerSymbol(String::from(TICKER_SYMBOL)),
+            FungibleOperation::TickerSymbol => {
+                FungibleResponse::TickerSymbol(String::from(TICKER_SYMBOL))
+            }
 
-            Operation::Transfer {
+            FungibleOperation::Approve {
+                owner,
+                spender,
+                allowance,
+            } => {
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for Approve operation");
+                self.runtime.approve(owner, spender, allowance);
+                FungibleResponse::Ok
+            }
+
+            FungibleOperation::Transfer {
                 owner,
                 amount,
                 target_account,
@@ -64,7 +82,13 @@ impl Contract for NativeFungibleTokenContract {
                     .expect("Permission for Transfer operation");
 
                 let fungible_target_account = target_account;
-                let target_account = self.normalize_account(target_account);
+
+                log::info!(
+                    "transferring tokens from={} to={} amount={}",
+                    owner,
+                    target_account.owner,
+                    amount
+                );
 
                 self.runtime.transfer(owner, target_account, amount);
 
@@ -72,7 +96,24 @@ impl Contract for NativeFungibleTokenContract {
                 FungibleResponse::Ok
             }
 
-            Operation::Claim {
+            FungibleOperation::TransferFrom {
+                owner,
+                spender,
+                amount,
+                target_account,
+            } => {
+                self.runtime
+                    .check_account_permission(spender)
+                    .expect("Permission for TransferFrom operation");
+
+                self.runtime
+                    .transfer_from(owner, spender, target_account, amount);
+
+                self.transfer(target_account.chain_id);
+                FungibleResponse::Ok
+            }
+
+            FungibleOperation::Claim {
                 source_account,
                 amount,
                 target_account,
@@ -83,9 +124,6 @@ impl Contract for NativeFungibleTokenContract {
 
                 let fungible_source_account = source_account;
                 let fungible_target_account = target_account;
-
-                let source_account = self.normalize_account(source_account);
-                let target_account = self.normalize_account(target_account);
 
                 self.runtime.claim(source_account, target_account, amount);
                 self.claim(
@@ -128,13 +166,6 @@ impl NativeFungibleTokenContract {
                 .prepare_message(message)
                 .with_authentication()
                 .send_to(source_chain_id);
-        }
-    }
-
-    fn normalize_account(&self, account: fungible::Account) -> Account {
-        Account {
-            chain_id: account.chain_id,
-            owner: account.owner,
         }
     }
 }
